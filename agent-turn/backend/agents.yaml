@@ -1,0 +1,5 @@
+agents:
+  - name: "kilo"
+    description: "A highly skilled software engineer agent."
+  - name: "assistant"
+    description: "A general purpose assistant."

@@ -1,0 +1,12 @@
+# Gitignore
+node_modules/
+dist/
+build/
+.env
+*.log
+target/
+**/target/
+desktop/src-tauri/target/
+agent-turn/backend/target/
+desktop/src-tauri/debug/
+desktop/src-tauri/release/
