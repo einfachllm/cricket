@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from "react"
 import { BrowserRouter, Routes, Route, Link, useLocation } from "react-router-dom"
-import { LayoutDashboard, MessageSquare, Settings, BarChart3 } from "lucide-react"
+import { MessageSquare, Settings, BarChart3, Radio } from "lucide-react"
 import AnalyticsDashboard from "./components/AnalyticsDashboard"
+import TrafficView from "./components/TrafficView"
 
 function Layout({ children }: { children: React.ReactNode }) {
   const location = useLocation();
@@ -27,6 +28,10 @@ function Layout({ children }: { children: React.ReactNode }) {
           <Link to="/analytics" className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ` + (location.pathname === '/analytics' ? 'bg-blue-600' : 'hover:bg-slate-800')}>
             <BarChart3 size={20} />
             <span>Analytics</span>
+          </Link>
+          <Link to="/traffic" className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ` + (location.pathname === '/traffic' ? 'bg-blue-600' : 'hover:bg-slate-800')}>
+            <Radio size={20} />
+            <span>Traffic</span>
           </Link>
           <Link to="/settings" className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ` + (location.pathname === '/settings' ? 'bg-blue-600' : 'hover:bg-slate-800')}>
             <Settings size={20} />
@@ -77,6 +82,7 @@ function App() {
         <Routes>
           <Route path="/" element={<ChatView />} />
           <Route path="/analytics" element={<AnalyticsDashboard />} />
+          <Route path="/traffic" element={<TrafficView />} />
           <Route path="/settings" element={<SettingsView />} />
         </Routes>
       </Layout>

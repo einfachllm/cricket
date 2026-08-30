@@ -10,3 +10,7 @@ desktop/src-tauri/target/
 agent-turn/backend/target/
 desktop/src-tauri/debug/
 desktop/src-tauri/release/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal

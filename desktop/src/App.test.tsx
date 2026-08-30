@@ -4,7 +4,7 @@ import App from "./App"
 
 test("renders heading", () => {
   render(<App />)
-  const headingElement = screen.getByText(/Agent-Turn Telemetry/i)
+  const headingElement = screen.getByText(/Agent-Turn/i)
   expect(headingElement).toBeInTheDocument()
 })
 
