@@ -72,41 +72,70 @@ page and edit the file to match what you actually use; add or remove models
 freely. A model with no entry (or missing input/output prices) just shows no
 cost estimate rather than a wrong one.
 
-## Testing locally
+## Running it locally
 
-### 1. Start the backend
-```bash
-cd harnesswurm/backend
-cargo run                    # listens on http://127.0.0.1:8081
-```
-State (`harnesswurm.db`, `agents.yaml`, `pricing.yaml`) is written to the
-current directory, so run it from the same place each time.
+### Just the app (one command)
 
-### 2. Start the UI
+The desktop app **embeds the backend in its own process** — there is no
+separate server to start:
+
 ```bash
 cd desktop
 npm install
-npm run dev                  # http://localhost:5173 in a browser
+npm run tauri dev
 ```
-Or `npm run tauri dev` for the real desktop app, which embeds the backend and
-needs no separate `cargo run` (it requires the Tauri system dependencies:
-https://v2.tauri.app/start/prerequisites/).
 
-### 3. See it working — without an API key
+That opens the window with the proxy already listening on
+`127.0.0.1:8081`. State lives in the OS app-data directory (not the current
+working directory), and `agents.yaml` / `pricing.yaml` are seeded there on
+first run.
+
+To get an app you can just double-click, with no toolchain at all:
+
 ```bash
-cd harnesswurm/backend
-python3 ../demo_seed.py      # writes one session per status
+npm run tauri build          # → an installer/bundle in src-tauri/target/release/bundle
 ```
+
+Both need the Tauri system dependencies for your OS —
+https://v2.tauri.app/start/prerequisites/ — plus Rust and Node.
+
+### Backend and UI separately (only for frontend work)
+
+Two terminals is a **development** convenience, not how the app ships: it
+gives you Vite's hot reload in a browser without rebuilding the Rust shell.
+Use it when iterating on the UI; otherwise use `npm run tauri dev` above.
+
+```bash
+cd harnesswurm/backend && cargo run     # http://127.0.0.1:8081
+cd desktop && npm run dev               # http://localhost:5173
+```
+
+Run `cargo run` from the same directory each time — the standalone binary
+keeps its state (`harnesswurm.db`, `agents.yaml`, `pricing.yaml`) in the
+current directory, which is a *different* database from the one the packaged
+app uses. Don't run both at once: whichever grabs port 8081 first wins, and
+the UI will quietly show that one's data.
+
+### See it working — without an API key
+```bash
+python3 harnesswurm/demo_seed.py --db <path-to-harnesswurm.db>
+```
+It writes one session per status. Pass `--db` the database the running app is
+using — for `cargo run` that's `harnesswurm/backend/harnesswurm.db` (the
+default, so `cd harnesswurm/backend && python3 ../demo_seed.py` is enough);
+for the packaged app it's under your OS app-data directory, which the app logs
+on startup.
+
 Open the Agents view and every state should be visible: thinking, running a
 tool, waiting for you, rate limited, auth failed, idle, plus provider quota
-bars. `python3 ../demo_seed.py --clear` removes them again — the demo rows are
-prefixed `demo-` and are never confused with real captured traffic.
+bars. `--clear` removes them again — demo rows are prefixed `demo-` and are
+never confused with real captured traffic.
 
-Seed *after* the backend is running: it closes out open calls on startup, so a
+Seed *after* the app is running: it closes out open calls on startup, so a
 seeded "Thinking" session would otherwise be reaped to *Interrupted* — which
 is itself the reaper working correctly.
 
-### 4. Send a real call through the proxy
+### Send a real call through the proxy
 With an API key, anything that speaks either API works — the proxy forwards
 whatever auth headers you already send:
 ```bash
@@ -120,7 +149,7 @@ Watch the Agents view while it runs: the session appears as **Thinking**, then
 settles to **Waiting for you** once the turn ends. Add `"stream": true` to
 exercise the streaming path.
 
-### 5. Point a real coding agent at it
+### Point a real coding agent at it
 Set the agent's API base URL to the proxy. The two styles differ in how much
 of the path the client appends:
 
