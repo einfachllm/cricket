@@ -18,7 +18,9 @@
 #             and /v1/messages routes — i.e. for clients that cannot set a
 #             custom base path or header. One per api style.
 #
-# Edits take effect on the next start of the app.
+# Hand edits take effect on the next start of the app. The Settings tab edits
+# the same file and applies a save immediately — but rewrites the file, so
+# comments added here do not survive a save from the app.
 providers:
   - name: "openai"
     api: "openai"

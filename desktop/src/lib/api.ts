@@ -201,3 +201,65 @@ export function formatTokens(tokens: number | null | undefined): string {
   if (tokens < 1_000_000) return `${(tokens / 1000).toFixed(1)}k`;
   return `${(tokens / 1_000_000).toFixed(2)}M`;
 }
+
+/// Wire format a provider's endpoint speaks. It decides how the traffic is
+/// parsed, not who is serving it: a local model server speaking the OpenAI
+/// format is `openai` even though nothing about it is OpenAI.
+export type ProviderApiStyle = 'openai' | 'anthropic';
+
+/// One entry of `providers.yaml` as the backend reports it.
+export interface ProviderConfig {
+  name: string;
+  api: ProviderApiStyle;
+  /// What the file says — this is the value edited and saved.
+  base_url: string;
+  /// Where a call to this provider actually goes, base URL plus the path
+  /// its api style appends. Computed by the backend so the editor never has
+  /// to guess at the rule.
+  target_url: string;
+  default: boolean;
+  /// Name of the env var supplying the base URL in effect, when one is set.
+  /// Null normally — non-null means `base_url` below is *not* what the
+  /// traffic is using.
+  env_override: string | null;
+}
+
+/// What an edit sends back: the file is replaced wholesale by this list.
+export interface ProviderDraft {
+  name: string;
+  api: ProviderApiStyle;
+  base_url: string;
+  default: boolean;
+}
+
+export async function fetchProviders(): Promise<ProviderConfig[]> {
+  const body = await fetchJson<{ providers: ProviderConfig[] }>('/v1/providers');
+  return body.providers;
+}
+
+/// Saves the whole provider list. A rejected edit changes nothing, and the
+/// backend's own message says which entry is wrong — so it is surfaced
+/// rather than replaced with a generic failure.
+export async function saveProviders(providers: ProviderDraft[]): Promise<ProviderConfig[]> {
+  const response = await fetch(API_BASE + '/v1/providers', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ providers }),
+  });
+  const body = await response.json().catch(() => null) as
+    | { providers?: ProviderConfig[]; error?: { message?: string } }
+    | null;
+  if (!response.ok) {
+    throw new Error(body?.error?.message || `Saving providers failed (${response.status})`);
+  }
+  return body?.providers ?? [];
+}
+
+/// The base URL to paste into an agent so its calls reach this provider —
+/// the OpenAI style appends `/chat/completions` to what it is given, the
+/// Anthropic style appends `/v1/messages`, which is why they differ by the
+/// trailing `/v1`.
+export function proxyBaseUrl(provider: { name: string; api: ProviderApiStyle }): string {
+  const prefix = `${API_BASE}/p/${provider.name}`;
+  return provider.api === 'openai' ? `${prefix}/v1` : prefix;
+}

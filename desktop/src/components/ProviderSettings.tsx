@@ -1,0 +1,306 @@
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { AlertTriangle, Check, Copy, Plus, RefreshCw, Server, Trash2 } from 'lucide-react';
+import {
+  ProviderApiStyle,
+  ProviderConfig,
+  ProviderDraft,
+  fetchProviders,
+  proxyBaseUrl,
+  saveProviders,
+} from '../lib/api';
+
+/// A row being edited. The `id` exists only to key the list: names are the
+/// identity on the backend, but they change while being typed, so keying on
+/// one would remount the input on every keystroke and lose the cursor.
+interface Row extends ProviderDraft {
+  id: number;
+  envOverride: string | null;
+}
+
+let nextRowId = 1;
+
+function toRow(provider: ProviderConfig): Row {
+  return {
+    id: nextRowId++,
+    name: provider.name,
+    api: provider.api,
+    base_url: provider.base_url,
+    default: provider.default,
+    envOverride: provider.env_override,
+  };
+}
+
+function toDraft(row: Row): ProviderDraft {
+  return { name: row.name, api: row.api, base_url: row.base_url, default: row.default };
+}
+
+/// The frontend twin of `ProviderConfig::target_url`, so a row shows where it
+/// would forward *while being typed* rather than only after a save.
+export function previewTargetUrl(row: { api: ProviderApiStyle; base_url: string }): string {
+  const base = row.base_url.trim().replace(/\/+$/, '');
+  if (!base) return '';
+  const path = row.api === 'openai' ? '/chat/completions' : '/v1/messages';
+  return base.endsWith(path) ? base : base + path;
+}
+
+function CopyButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      title={`Copy ${value}`}
+      aria-label={`Copy ${value}`}
+      onClick={async () => {
+        try {
+          await navigator.clipboard?.writeText(value);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        } catch {
+          // A denied clipboard is not worth an error state: the URL is on
+          // screen and can be selected by hand.
+        }
+      }}
+      className="text-gray-400 hover:text-gray-700"
+    >
+      {copied ? <Check size={14} className="text-green-600" /> : <Copy size={14} />}
+    </button>
+  );
+}
+
+/// Editor for `providers.yaml` — where each proxied call is forwarded to.
+/// The whole list is saved at once, because that is what the file is: a
+/// partial save would need a merge rule the file itself doesn't have.
+export default function ProviderSettings() {
+  const [rows, setRows] = useState<Row[]>([]);
+  const [saved, setSaved] = useState<ProviderDraft[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [justSaved, setJustSaved] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const providers = await fetchProviders();
+      setRows(providers.map(toRow));
+      setSaved(providers.map((p) => ({ name: p.name, api: p.api, base_url: p.base_url, default: p.default })));
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not load providers');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const drafts = useMemo(() => rows.map(toDraft), [rows]);
+  const dirty = useMemo(() => JSON.stringify(drafts) !== JSON.stringify(saved), [drafts, saved]);
+
+  function update(id: number, patch: Partial<Row>) {
+    setJustSaved(false);
+    setRows((current) => current.map((row) => (row.id === id ? { ...row, ...patch } : row)));
+  }
+
+  /// Exactly one default per api style, enforced here rather than only on
+  /// save: a radio that can be switched off would let the bare
+  /// /v1/chat/completions route silently pick for itself.
+  function makeDefault(id: number, api: ProviderApiStyle) {
+    setJustSaved(false);
+    setRows((current) => current.map((row) => (
+      row.api === api ? { ...row, default: row.id === id } : row
+    )));
+  }
+
+  function addRow() {
+    setJustSaved(false);
+    setRows((current) => [...current, {
+      id: nextRowId++,
+      name: '',
+      api: 'openai',
+      base_url: 'http://localhost:11434/v1',
+      default: false,
+      envOverride: null,
+    }]);
+  }
+
+  function removeRow(id: number) {
+    setJustSaved(false);
+    setRows((current) => current.filter((row) => row.id !== id));
+  }
+
+  async function save() {
+    setBusy(true);
+    try {
+      const providers = await saveProviders(drafts);
+      setRows(providers.map(toRow));
+      setSaved(providers.map((p) => ({ name: p.name, api: p.api, base_url: p.base_url, default: p.default })));
+      setError(null);
+      setJustSaved(true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Saving providers failed');
+      setJustSaved(false);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h2 className="text-lg font-semibold text-gray-800 flex items-center gap-2">
+            <Server size={18} /> Providers
+          </h2>
+          <p className="text-sm text-gray-500 mt-1 max-w-3xl">
+            Where each proxied call is forwarded to. Point an agent at the base URL of a
+            provider below and its traffic is captured on the way through — a local model
+            server (Ollama, vLLM, LM Studio, llama.cpp) is just another entry. Saved edits
+            apply to the next call; running calls finish against the provider they started on.
+          </p>
+        </div>
+        <button
+          onClick={() => void load()}
+          className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm bg-white border border-gray-200 hover:bg-gray-50 text-gray-700 shrink-0"
+        >
+          <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
+          Reload
+        </button>
+      </div>
+
+      {error && (
+        <div role="alert" className="flex items-start gap-2 p-3 rounded-lg bg-red-50 border border-red-200 text-sm text-red-800">
+          <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+          <span>{error}</span>
+        </div>
+      )}
+
+      {justSaved && !dirty && (
+        <div className="flex items-center gap-2 p-3 rounded-lg bg-green-50 border border-green-200 text-sm text-green-800">
+          <Check size={16} /> Saved to providers.yaml — new calls use it immediately.
+        </div>
+      )}
+
+      <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 text-gray-500 uppercase text-xs">
+              <tr>
+                <th className="text-left px-4 py-3 font-semibold">Name</th>
+                <th className="text-left px-4 py-3 font-semibold">API</th>
+                <th className="text-left px-4 py-3 font-semibold">Base URL</th>
+                <th className="text-left px-4 py-3 font-semibold">Default</th>
+                <th className="text-left px-4 py-3 font-semibold">Point agents at</th>
+                <th className="px-4 py-3" />
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.id} className="border-t border-gray-100 align-top">
+                  <td className="px-4 py-3">
+                    <input
+                      aria-label="Provider name"
+                      value={row.name}
+                      onChange={(e) => update(row.id, { name: e.target.value })}
+                      placeholder="ollama"
+                      className="w-32 px-2 py-1.5 rounded-lg border border-gray-200 font-mono text-xs"
+                    />
+                  </td>
+                  <td className="px-4 py-3">
+                    <select
+                      aria-label={`API format for ${row.name || 'new provider'}`}
+                      value={row.api}
+                      onChange={(e) => update(row.id, { api: e.target.value as ProviderApiStyle, default: false })}
+                      className="px-2 py-1.5 rounded-lg border border-gray-200 text-xs bg-white"
+                    >
+                      <option value="openai">openai</option>
+                      <option value="anthropic">anthropic</option>
+                    </select>
+                  </td>
+                  <td className="px-4 py-3">
+                    <input
+                      aria-label={`Base URL for ${row.name || 'new provider'}`}
+                      value={row.base_url}
+                      onChange={(e) => update(row.id, { base_url: e.target.value })}
+                      placeholder="http://localhost:11434/v1"
+                      className="w-72 px-2 py-1.5 rounded-lg border border-gray-200 font-mono text-xs"
+                    />
+                    <div className="text-xs text-gray-400 mt-1 font-mono truncate max-w-[22rem]" title={previewTargetUrl(row)}>
+                      → {previewTargetUrl(row) || '–'}
+                    </div>
+                    {row.envOverride && (
+                      <div className="text-xs text-amber-700 mt-1">
+                        Overridden by <span className="font-mono">{row.envOverride}</span> until that
+                        variable is unset — calls go there, not to the URL above.
+                      </div>
+                    )}
+                  </td>
+                  <td className="px-4 py-3">
+                    <label className="inline-flex items-center gap-2 text-xs text-gray-600">
+                      <input
+                        type="radio"
+                        name={`default-${row.api}`}
+                        aria-label={`Default for the ${row.api} API`}
+                        checked={row.default}
+                        onChange={() => makeDefault(row.id, row.api)}
+                      />
+                      for {row.api}
+                    </label>
+                  </td>
+                  <td className="px-4 py-3">
+                    <div className="flex items-center gap-2">
+                      <code className="text-xs text-gray-600">{proxyBaseUrl(row)}</code>
+                      <CopyButton value={proxyBaseUrl(row)} />
+                    </div>
+                  </td>
+                  <td className="px-4 py-3 text-right">
+                    <button
+                      onClick={() => removeRow(row.id)}
+                      aria-label={`Remove ${row.name || 'provider'}`}
+                      className="text-gray-400 hover:text-red-600"
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+              {!loading && rows.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="px-4 py-8 text-center text-gray-400">
+                    No providers configured — add one, or reload to get the defaults back.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-3">
+        <button
+          onClick={addRow}
+          className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm bg-white border border-gray-200 hover:bg-gray-50 text-gray-700"
+        >
+          <Plus size={16} /> Add provider
+        </button>
+        <button
+          onClick={() => void save()}
+          disabled={!dirty || busy}
+          className={`px-4 py-2 rounded-lg text-sm font-medium ${
+            dirty && !busy ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-gray-200 text-gray-500 cursor-not-allowed'
+          }`}
+        >
+          {busy ? 'Saving…' : 'Save providers'}
+        </button>
+        {dirty && <span className="text-xs text-gray-500">Unsaved changes</span>}
+      </div>
+
+      <p className="text-xs text-gray-500 max-w-3xl">
+        A provider is also addressable by header — <span className="font-mono">X-Provider: name</span> —
+        for clients with a fixed base URL. Calls are recorded under the provider name, so a local run
+        shows as itself in Traffic and Analytics; give <span className="font-mono">pricing.yaml</span> an
+        entry with a matching <span className="font-mono">provider:</span> to cost it.
+      </p>
+    </div>
+  );
+}

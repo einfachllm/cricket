@@ -4,6 +4,7 @@ import { MessageSquare, Settings, BarChart3, Radio, Bot } from "lucide-react"
 import AnalyticsDashboard from "./components/AnalyticsDashboard"
 import AgentStatusView from "./components/AgentStatusView"
 import TrafficView from "./components/TrafficView"
+import ProviderSettings from "./components/ProviderSettings"
 import { SessionsProvider, useAttentionCount } from "./hooks/useSessions"
 
 const NAV_ITEMS = [
@@ -81,11 +82,9 @@ function ChatView() {
 
 function SettingsView() {
   return (
-    <div className="p-6">
-      <h1 className="text-2xl font-bold text-gray-800 mb-4">Settings</h1>
-      <div className="bg-white p-8 rounded-xl shadow-sm border border-gray-100 text-center text-gray-500">
-        Settings component under development
-      </div>
+    <div className="p-6 space-y-6">
+      <h1 className="text-2xl font-bold text-gray-800">Settings</h1>
+      <ProviderSettings />
     </div>
   )
 }

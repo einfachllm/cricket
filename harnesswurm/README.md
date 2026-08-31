@@ -8,10 +8,10 @@ Anthropic-compatible agents.
 - **Proxy Mode**: Intercepts requests to LLM providers — OpenAI-style
   (`/v1/chat/completions`) and Anthropic-style (`/v1/messages`) — and forwards
   them unmodified to the real API.
-- **Configurable providers**: Where each call is forwarded to comes from
-  `providers.yaml`, so the hosted APIs, a gateway, or a model server on
-  localhost (Ollama, vLLM, LM Studio, llama.cpp, LiteLLM) are all just
-  entries. See [Providers](#providers).
+- **Configurable providers**: Where each call is forwarded to is edited in the
+  desktop app's Settings tab (or in `providers.yaml`), so the hosted APIs, a
+  gateway, or a model server on localhost (Ollama, vLLM, LM Studio, llama.cpp,
+  LiteLLM) are all just entries. See [Providers](#providers).
 - **Telemetry**: Extracts token usage (including cache read/write tokens),
   tool call counts, and latency, for both unary and streaming responses.
 - **Live agent status**: Derives what each agent session is *doing right now*
@@ -198,8 +198,16 @@ cd desktop && npm test                   # UI, and npm run typecheck
 ## Providers
 
 Every call is forwarded to the URL of the provider it resolved to, and
-`providers.yaml` says what those are. It is seeded on first run and looks like
-this:
+`providers.yaml` says what those are.
+
+**In the app:** Settings → Providers lists them, with the base URL to paste
+into an agent next to each. Add, edit or remove entries and hit *Save
+providers*; the file is rewritten and the next call uses it — no restart. A
+rejected edit (nameless entry, duplicate name, a base URL that isn't one, two
+defaults for one api style) changes nothing on disk or in memory and says
+which entry is wrong.
+
+**In the file:** it is seeded on first run and looks like this:
 
 ```yaml
 providers:
@@ -232,7 +240,9 @@ providers:
 - `default` — the provider the bare `/v1/chat/completions` and `/v1/messages`
   routes use, one per api style.
 
-Edits take effect on the next start. On startup the resolved target of every
+Hand edits take effect on the next start; a save from the app takes effect
+immediately. Note that saving from the app rewrites the file, so comments
+added by hand do not survive one. On startup the resolved target of every
 provider is printed, and `GET /v1/providers` returns the same list, so where a
 call would actually go is never a guess.
 
@@ -287,7 +297,9 @@ than $0.00. If the machine time is worth costing, add an entry to
 
 `HARNESSWURM_OPENAI_BASE_URL` and `HARNESSWURM_ANTHROPIC_BASE_URL` replace the
 `base_url` of the default provider for that style, for a one-off run without
-editing the file. They are deliberately *not* named `OPENAI_BASE_URL` /
+editing the file. The file's own value is left untouched — the Settings tab
+shows the override and keeps editing the saved value, so an override can't
+quietly become permanent. They are deliberately *not* named `OPENAI_BASE_URL` /
 `ANTHROPIC_BASE_URL`: those are usually already set to point a client **at**
 this proxy, and honoring them here would make Harnesswurm forward to itself.
 
@@ -432,7 +444,11 @@ calls are proxied, so traffic captured before this existed shows no tools.
 - `GET /v1/analytics/tasks/:id/traffic` — the full raw request/response body for one call.
 - `GET /v1/analytics/sessions` — one row per agent+session: derived state, totals, spend, and the last question asked.
 - `GET /v1/analytics/limits` — current quota per provider, folded from the most recent reading of each header.
-- `GET /v1/providers` — the configured providers and the URL each one forwards to.
+- `GET /v1/providers` — the configured providers and the URL each one forwards
+  to, plus `env_override` when a variable is supplying the base URL in effect.
+- `PUT /v1/providers` — replace the list (`{"providers": [...]}`), which is
+  what the Settings tab sends: validated, written to `providers.yaml`, and in
+  effect for the next call. Rejected edits change nothing.
 - `GET /v1/analytics/events` — SSE feed pinging on every call start and finish, so a dashboard updates immediately instead of on a poll.
 
 ### Timing

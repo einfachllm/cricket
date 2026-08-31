@@ -117,8 +117,13 @@ pub struct AppState {
     pub pricing: pricing::PricingTable,
     /// Where each provider's API lives, from `providers.yaml`. Read per
     /// call so a request can name its own upstream (path prefix or
-    /// `X-Provider`) instead of everything going to one hardcoded host.
-    pub providers: ProviderTable,
+    /// `X-Provider`) instead of everything going to one hardcoded host,
+    /// and behind a lock so an edit in the app's Settings tab takes effect
+    /// on the next call rather than the next restart.
+    pub providers: std::sync::RwLock<ProviderTable>,
+    /// Where that file lives, so a saved edit lands next to the rest of the
+    /// state instead of in whatever the process's working directory is.
+    pub providers_path: PathBuf,
     /// Fan-out for "something changed" pings to any connected dashboard.
     /// Deliberately carries no state of its own: a subscriber re-reads the
     /// analytics endpoints on a ping, so there is exactly one definition of
@@ -221,7 +226,8 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         client: reqwest::Client::new(),
         agents,
         pricing,
-        providers: provider_table,
+        providers: std::sync::RwLock::new(provider_table),
+        providers_path: providers_path.clone(),
         events,
     });
 
@@ -241,7 +247,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         // client that can only be given a base URL picks its upstream.
         .route("/p/:provider/v1/chat/completions", post(named_openai_proxy_handler))
         .route("/p/:provider/v1/messages", post(named_anthropic_proxy_handler))
-        .route("/v1/providers", get(get_providers))
+        .route("/v1/providers", get(get_providers).put(put_providers))
         .route("/v1/analytics/experiments", get(get_experiments))
         .route("/v1/analytics/experiments/:id/metrics", get(get_experiment_metrics))
         .route("/v1/analytics/experiments/:id/comparison", get(get_experiment_comparison))
@@ -263,14 +269,18 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     println!("State directory: {}", config.data_dir.display());
     // Forwarding to the wrong host is otherwise invisible until a call
     // fails, so say up front where each configured provider actually goes.
-    for provider in state_for_log.providers.all() {
+    for provider in state_for_log.providers.read().unwrap().all() {
         let default_marker = if provider.default { " (default)" } else { "" };
+        let override_marker = provider.env_override
+            .map(|var| format!(" (base URL from {var})"))
+            .unwrap_or_default();
         println!(
-            "Provider {} [{}] -> {}{}",
+            "Provider {} [{}] -> {}{}{}",
             provider.name,
             provider.api.as_str(),
             provider.target_url(),
-            default_marker
+            default_marker,
+            override_marker
         );
     }
     axum::serve(listener, app).await?;
@@ -459,14 +469,60 @@ async fn get_events(State(state): State<Arc<AppState>>) -> Sse<impl futures::Str
 /// The configured providers, so the UI (and `curl`) can show what a call
 /// would be forwarded to without reading the YAML off disk.
 async fn get_providers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let list: Vec<Value> = state.providers.all().iter().map(|p| json!({
+    let list = provider_list(&state);
+    axum::Json(json!({ "providers": list }))
+}
+
+fn provider_list(state: &AppState) -> Vec<Value> {
+    state.providers.read().unwrap().all().iter().map(|p| json!({
         "name": p.name,
         "api": p.api.as_str(),
         "base_url": p.base_url,
         "target_url": p.target_url(),
         "default": p.default,
-    })).collect();
-    axum::Json(json!({ "providers": list }))
+        // Non-null means an env var is supplying the base URL in effect, so
+        // an editor can show that the file's value isn't the one being used
+        // rather than silently disagreeing with the traffic.
+        "env_override": p.env_override,
+    })).collect()
+}
+
+/// Replaces the whole provider list: what the editor sends is the new file.
+/// A rejected edit changes nothing — neither on disk nor in memory — so a
+/// typo can't leave the proxy half-configured.
+async fn put_providers(
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<Value>,
+) -> Result<impl IntoResponse, (StatusCode, axum::Json<Value>)> {
+    let bad_request = |message: String| (
+        StatusCode::BAD_REQUEST,
+        axum::Json(json!({ "error": { "message": message } })),
+    );
+
+    let incoming = body.get("providers").cloned().unwrap_or(Value::Null);
+    let mut providers: Vec<providers::ProviderConfig> = serde_json::from_value(incoming)
+        .map_err(|e| bad_request(format!("Could not read the provider list: {e}")))?;
+
+    for provider in &mut providers {
+        provider.name = provider.name.trim().to_string();
+        provider.base_url = provider.base_url.trim().to_string();
+    }
+
+    ProviderTable::validate(&providers).map_err(bad_request)?;
+
+    // Write first: a table that only ever lived in memory would come back
+    // as the old one on the next start, which is worse than not saving.
+    let mut candidate = ProviderTable::from_list(providers);
+    candidate.apply_env_overrides();
+    candidate.save(&state.providers_path).map_err(|e| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(json!({ "error": { "message": format!(
+            "Could not write {}: {e}", state.providers_path.display()
+        ) } })),
+    ))?;
+
+    *state.providers.write().unwrap() = candidate;
+    Ok(axum::Json(json!({ "providers": provider_list(&state) })))
 }
 
 /// Which upstream this call goes to. A name given explicitly — in the path
@@ -569,7 +625,12 @@ async fn proxy_handler(
 
     // Resolved before anything is recorded: a call that can't be routed is
     // a configuration mistake to report back, not a task to log as failed.
-    let upstream = match resolve_upstream(&state.providers, style, named_provider.as_deref(), &headers) {
+    let resolved = {
+        // Scoped so the lock is released before anything awaits on it.
+        let providers = state.providers.read().unwrap();
+        resolve_upstream(&providers, style, named_provider.as_deref(), &headers)
+    };
+    let upstream = match resolved {
         Ok(upstream) => upstream,
         Err((status, message)) => {
             return Ok((status, axum::Json(json!({ "error": { "message": message } }))).into_response());
