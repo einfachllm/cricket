@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Radio, RefreshCw, X } from 'lucide-react';
+import { Radio, RefreshCw, X, MessageCircleQuestion } from 'lucide-react';
 
 interface TaskSummary {
   task_id: number;
@@ -17,6 +17,8 @@ interface TaskSummary {
   tool_calls_count: number | null;
   latency_ms: number | null;
   cost_estimate: number | null;
+  agent_question_tool: string | null;
+  agent_question_text: string | null;
 }
 
 interface TaskTraffic {
@@ -28,6 +30,8 @@ interface TaskTraffic {
   task_description: string | null;
   request_body: string | null;
   response_body: string | null;
+  agent_question_tool: string | null;
+  agent_question_text: string | null;
 }
 
 const API_BASE = 'http://localhost:8081';
@@ -63,6 +67,7 @@ function ProviderBadge({ provider }: { provider: string | null }) {
 const TrafficView = () => {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [agentFilter, setAgentFilter] = useState<string>('all');
+  const [questionsOnly, setQuestionsOnly] = useState(false);
   const [loading, setLoading] = useState(false);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [traffic, setTraffic] = useState<TaskTraffic | null>(null);
@@ -99,7 +104,9 @@ const TrafficView = () => {
   }, [selectedId]);
 
   const agents = Array.from(new Set(tasks.map((t) => t.agent_name))).sort();
-  const visibleTasks = agentFilter === 'all' ? tasks : tasks.filter((t) => t.agent_name === agentFilter);
+  const visibleTasks = tasks
+    .filter((t) => agentFilter === 'all' || t.agent_name === agentFilter)
+    .filter((t) => !questionsOnly || !!t.agent_question_text);
 
   return (
     <div className="p-6 space-y-6">
@@ -119,6 +126,15 @@ const TrafficView = () => {
               <option key={a} value={a}>{a}</option>
             ))}
           </select>
+          <label className="flex items-center gap-2 text-sm text-gray-600 select-none cursor-pointer">
+            <input
+              type="checkbox"
+              checked={questionsOnly}
+              onChange={(e) => setQuestionsOnly(e.target.checked)}
+              className="rounded border-gray-300"
+            />
+            Questions only
+          </label>
           <button
             onClick={fetchTasks}
             className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm bg-white border border-gray-200 hover:bg-gray-50 text-gray-700"
@@ -161,7 +177,16 @@ const TrafficView = () => {
                   </td>
                   <td className="px-4 py-3 font-medium text-gray-800">{task.agent_name}</td>
                   <td className="px-4 py-3 text-gray-600 max-w-xs truncate" title={task.task_description || ''}>
-                    {task.task_description || <span className="text-gray-300">–</span>}
+                    <span className="inline-flex items-center gap-1.5 max-w-full">
+                      {task.agent_question_text && (
+                        <span title={`Agent asked: ${task.agent_question_text}`} className="shrink-0 text-amber-500">
+                          <MessageCircleQuestion size={14} />
+                        </span>
+                      )}
+                      <span className="truncate">
+                        {task.task_description || <span className="text-gray-300">–</span>}
+                      </span>
+                    </span>
                   </td>
                   <td className="px-4 py-3 text-gray-600 font-mono text-xs">{task.model_name || '–'}</td>
                   <td className="px-4 py-3"><ProviderBadge provider={task.provider} /></td>
@@ -200,6 +225,17 @@ const TrafficView = () => {
               <X size={20} />
             </button>
           </div>
+          {traffic?.agent_question_text && (
+            <div className="flex items-start gap-2 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2">
+              <MessageCircleQuestion size={16} className="text-amber-500 shrink-0 mt-0.5" />
+              <div>
+                <p className="text-xs font-semibold text-amber-700 uppercase">
+                  Agent asked{traffic.agent_question_tool ? ` (${traffic.agent_question_tool})` : ''}
+                </p>
+                <p className="text-sm text-amber-900">{traffic.agent_question_text}</p>
+              </div>
+            </div>
+          )}
           {trafficLoading ? (
             <div className="h-32 flex items-center justify-center">
               <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>

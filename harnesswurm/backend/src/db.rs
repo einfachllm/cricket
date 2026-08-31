@@ -69,6 +69,8 @@ impl Database {
         Self::add_column_if_missing(&pool, "tasks", "provider", "TEXT").await?;
         Self::add_column_if_missing(&pool, "metrics", "cache_creation_tokens", "INTEGER DEFAULT 0").await?;
         Self::add_column_if_missing(&pool, "metrics", "cache_read_tokens", "INTEGER DEFAULT 0").await?;
+        Self::add_column_if_missing(&pool, "traffic", "agent_question_tool", "TEXT").await?;
+        Self::add_column_if_missing(&pool, "traffic", "agent_question_text", "TEXT").await?;
 
         Ok(Self { pool })
     }
@@ -193,6 +195,21 @@ impl Database {
         Ok(())
     }
 
+    pub async fn save_agent_question(&self, task_id: i64, tool_name: &str, question_text: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO traffic (task_id, agent_question_tool, agent_question_text) VALUES (?, ?, ?)
+             ON CONFLICT(task_id) DO UPDATE SET
+                agent_question_tool = excluded.agent_question_tool,
+                agent_question_text = excluded.agent_question_text"
+        )
+        .bind(task_id)
+        .bind(tool_name)
+        .bind(question_text)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn get_all_experiments(&self) -> Result<Vec<(i64, String, Option<String>)>> {
         let rows = sqlx::query("SELECT id, name, description FROM experiments")
             .fetch_all(&self.pool)
@@ -269,11 +286,14 @@ impl Database {
                 MAX(m.cache_read_tokens) as cache_read_tokens,
                 MAX(m.tool_calls_count) as tool_calls_count,
                 MAX(m.latency_ms) as latency_ms,
-                MAX(m.cost_estimate) as cost_estimate
+                MAX(m.cost_estimate) as cost_estimate,
+                MAX(tr.agent_question_tool) as agent_question_tool,
+                MAX(tr.agent_question_text) as agent_question_text
              FROM tasks t
              JOIN agents a ON t.agent_id = a.id
              LEFT JOIN experiments e ON t.experiment_id = e.id
              LEFT JOIN metrics m ON m.task_id = t.id
+             LEFT JOIN traffic tr ON tr.task_id = t.id
              GROUP BY t.id
              ORDER BY t.timestamp DESC
              LIMIT ?"
@@ -299,6 +319,8 @@ impl Database {
                 "tool_calls_count": row.get::<Option<i64>, _>("tool_calls_count"),
                 "latency_ms": row.get::<Option<i64>, _>("latency_ms"),
                 "cost_estimate": row.get::<Option<f64>, _>("cost_estimate"),
+                "agent_question_tool": row.get::<Option<String>, _>("agent_question_tool"),
+                "agent_question_text": row.get::<Option<String>, _>("agent_question_text"),
             })
         }).collect();
 
@@ -315,7 +337,9 @@ impl Database {
                 t.timestamp,
                 t.task_description,
                 tr.request_body,
-                tr.response_body
+                tr.response_body,
+                tr.agent_question_tool,
+                tr.agent_question_text
              FROM tasks t
              JOIN agents a ON t.agent_id = a.id
              LEFT JOIN traffic tr ON tr.task_id = t.id
@@ -334,6 +358,8 @@ impl Database {
             "task_description": row.get::<Option<String>, _>("task_description"),
             "request_body": row.get::<Option<String>, _>("request_body"),
             "response_body": row.get::<Option<String>, _>("response_body"),
+            "agent_question_tool": row.get::<Option<String>, _>("agent_question_tool"),
+            "agent_question_text": row.get::<Option<String>, _>("agent_question_text"),
         })))
     }
 }
@@ -400,11 +426,31 @@ mod tests {
         let agent_id = db.get_or_create_agent("test_agent").await?;
         let task_id = db.create_task(agent_id, None, None, None, Some("gpt-4o".to_string()), Some("openai".to_string())).await?;
         db.log_metric(task_id, 10, 20, 0, 5, 1, 100, Some(0.001)).await?;
+        db.save_agent_question(task_id, "ask_followup_question", "Use TypeScript?").await?;
 
         let tasks = db.get_recent_tasks(10).await?;
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0]["prompt_tokens"], 10);
         assert_eq!(tasks[0]["cache_read_tokens"], 5);
+        assert_eq!(tasks[0]["agent_question_tool"], "ask_followup_question");
+        assert_eq!(tasks[0]["agent_question_text"], "Use TypeScript?");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_save_agent_question_roundtrip() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let agent_id = db.get_or_create_agent("test_agent").await?;
+        let task_id = db.create_task(agent_id, None, None, None, Some("gpt-4o".to_string()), Some("openai".to_string())).await?;
+
+        db.save_traffic_request(task_id, "{\"model\":\"gpt-4o\"}").await?;
+        db.save_agent_question(task_id, "ask_followup_question", "Which file?").await?;
+
+        let traffic = db.get_task_traffic(task_id).await?.expect("traffic row should exist");
+        assert_eq!(traffic["request_body"], "{\"model\":\"gpt-4o\"}");
+        assert_eq!(traffic["agent_question_tool"], "ask_followup_question");
+        assert_eq!(traffic["agent_question_text"], "Which file?");
 
         Ok(())
     }

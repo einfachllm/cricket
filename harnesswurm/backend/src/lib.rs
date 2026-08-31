@@ -14,6 +14,7 @@ use tokio::time::Instant;
 use futures::StreamExt as _;
 use tokio::sync::mpsc;
 
+pub mod agent_question;
 pub mod db;
 pub mod pricing;
 
@@ -343,6 +344,39 @@ fn extract_usage(provider: Provider, json: &Value) -> UsageInfo {
     }
 }
 
+/// Scans the same tool-calls/content a response already carries for one
+/// matching a known "ask the human a question" convention. Unary twin of
+/// the streaming accumulate-then-scan path in handle_streaming.
+fn extract_agent_question(provider: Provider, json: &Value) -> Option<(String, String)> {
+    match provider {
+        Provider::OpenAI => {
+            let tool_calls = json["choices"][0]["message"]["tool_calls"].as_array()?;
+            tool_calls.iter().find_map(|tc| {
+                let name = tc["function"]["name"].as_str().unwrap_or("");
+                if !agent_question::is_agent_question_tool(name) {
+                    return None;
+                }
+                let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
+                let arguments: Value = serde_json::from_str(args_str).ok()?;
+                agent_question::extract_question_text(&arguments).map(|text| (name.to_string(), text))
+            })
+        }
+        Provider::Anthropic => {
+            let content = json["content"].as_array()?;
+            content.iter().find_map(|block| {
+                if block["type"] != "tool_use" {
+                    return None;
+                }
+                let name = block["name"].as_str().unwrap_or("");
+                if !agent_question::is_agent_question_tool(name) {
+                    return None;
+                }
+                agent_question::extract_question_text(&block["input"]).map(|text| (name.to_string(), text))
+            })
+        }
+    }
+}
+
 async fn handle_unary(
     state: Arc<AppState>,
     provider: Provider,
@@ -354,13 +388,19 @@ async fn handle_unary(
 ) -> Response {
     let headers = res.headers().clone();
     let res_bytes = res.bytes().await.unwrap_or_default();
+    let parsed_response: Option<Value> = serde_json::from_slice(&res_bytes).ok();
 
-    let usage = serde_json::from_slice::<Value>(&res_bytes)
-        .map(|json| extract_usage(provider, &json))
+    let usage = parsed_response.as_ref()
+        .map(|json| extract_usage(provider, json))
         .unwrap_or_default();
+    let agent_question = parsed_response.as_ref()
+        .and_then(|json| extract_agent_question(provider, json));
 
     let response_text = String::from_utf8_lossy(&res_bytes).to_string();
     let _ = state.db.save_traffic_response(task_id, &response_text).await;
+    if let Some((tool, text)) = &agent_question {
+        let _ = state.db.save_agent_question(task_id, tool, text).await;
+    }
 
     let cost = model_name.as_deref().and_then(|m| state.pricing.estimate_cost(
         m,
@@ -392,7 +432,12 @@ async fn handle_unary(
 /// boundaries aren't guaranteed to land on line boundaries, so a `data: `
 /// line split across two chunks is missed — acceptable for a best-effort
 /// telemetry sidecar that isn't the billing source of truth.
-fn accumulate_openai_stream_chunk(text: &str, usage: &mut UsageInfo, tool_ids: &mut HashSet<String>) {
+fn accumulate_openai_stream_chunk(
+    text: &str,
+    usage: &mut UsageInfo,
+    tool_ids: &mut HashSet<String>,
+    tool_calls_acc: &mut Vec<(String, agent_question::ToolCallAccumulator)>,
+) {
     for line in text.lines() {
         let Some(data) = line.strip_prefix("data: ") else { continue };
         if data == "[DONE]" {
@@ -416,14 +461,27 @@ fn accumulate_openai_stream_chunk(text: &str, usage: &mut UsageInfo, tool_ids: &
                 let key = tc.get("index").map(|v| v.to_string())
                     .or_else(|| tc.get("id").and_then(|v| v.as_str()).map(String::from));
                 if let Some(key) = key {
-                    tool_ids.insert(key);
+                    tool_ids.insert(key.clone());
+
+                    let entry = agent_question::tool_call_entry(tool_calls_acc, &key);
+                    if let Some(name) = tc["function"]["name"].as_str() {
+                        entry.name = Some(name.to_string());
+                    }
+                    if let Some(args_fragment) = tc["function"]["arguments"].as_str() {
+                        entry.arguments.push_str(args_fragment);
+                    }
                 }
             }
         }
     }
 }
 
-fn accumulate_anthropic_stream_chunk(text: &str, usage: &mut UsageInfo, tool_ids: &mut HashSet<String>) {
+fn accumulate_anthropic_stream_chunk(
+    text: &str,
+    usage: &mut UsageInfo,
+    tool_ids: &mut HashSet<String>,
+    tool_calls_acc: &mut Vec<(String, agent_question::ToolCallAccumulator)>,
+) {
     for line in text.lines() {
         let Some(data) = line.strip_prefix("data: ") else { continue };
         let Ok(json) = serde_json::from_str::<Value>(data) else { continue };
@@ -439,6 +497,22 @@ fn accumulate_anthropic_stream_chunk(text: &str, usage: &mut UsageInfo, tool_ids
                 if json["content_block"]["type"].as_str() == Some("tool_use") {
                     if let Some(id) = json["content_block"]["id"].as_str() {
                         tool_ids.insert(id.to_string());
+                    }
+                    // Keyed by the block's stream index (not its id) so it
+                    // lines up with content_block_delta below, which only
+                    // carries the index, not the id, on each fragment.
+                    if let Some(index) = json["index"].as_i64() {
+                        let entry = agent_question::tool_call_entry(tool_calls_acc, &index.to_string());
+                        if let Some(name) = json["content_block"]["name"].as_str() {
+                            entry.name = Some(name.to_string());
+                        }
+                    }
+                }
+            }
+            Some("content_block_delta") => {
+                if json["delta"]["type"].as_str() == Some("input_json_delta") {
+                    if let (Some(index), Some(fragment)) = (json["index"].as_i64(), json["delta"]["partial_json"].as_str()) {
+                        agent_question::tool_call_entry(tool_calls_acc, &index.to_string()).arguments.push_str(fragment);
                     }
                 }
             }
@@ -478,16 +552,26 @@ async fn handle_streaming(
     tokio::spawn(async move {
         let mut usage = UsageInfo::default();
         let mut tool_ids: HashSet<String> = HashSet::new();
+        let mut tool_calls: Vec<(String, agent_question::ToolCallAccumulator)> = Vec::new();
         let mut raw_text = String::new();
 
         while let Some(chunk_text) = rx.recv().await {
             raw_text.push_str(&chunk_text);
             match provider {
-                Provider::OpenAI => accumulate_openai_stream_chunk(&chunk_text, &mut usage, &mut tool_ids),
-                Provider::Anthropic => accumulate_anthropic_stream_chunk(&chunk_text, &mut usage, &mut tool_ids),
+                Provider::OpenAI => accumulate_openai_stream_chunk(&chunk_text, &mut usage, &mut tool_ids, &mut tool_calls),
+                Provider::Anthropic => accumulate_anthropic_stream_chunk(&chunk_text, &mut usage, &mut tool_ids, &mut tool_calls),
             }
         }
         usage.tool_calls_count = tool_ids.len() as i64;
+
+        let agent_question = tool_calls.iter().find_map(|(_, acc)| {
+            let name = acc.name.as_deref()?;
+            if !agent_question::is_agent_question_tool(name) {
+                return None;
+            }
+            let arguments: Value = serde_json::from_str(&acc.arguments).ok()?;
+            agent_question::extract_question_text(&arguments).map(|text| (name.to_string(), text))
+        });
 
         let cost = model_name.as_deref().and_then(|m| state.pricing.estimate_cost(
             m,
@@ -508,6 +592,9 @@ async fn handle_streaming(
             cost,
         ).await;
         let _ = state.db.save_traffic_response(task_id, &raw_text).await;
+        if let Some((tool, text)) = &agent_question {
+            let _ = state.db.save_agent_question(task_id, tool, text).await;
+        }
     });
 
     Ok(Sse::new(stream).into_response())
@@ -590,24 +677,25 @@ mod tests {
     fn openai_stream_dedupes_tool_call_fragments_by_index() {
         let mut usage = UsageInfo::default();
         let mut tool_ids = HashSet::new();
+        let mut tool_calls = Vec::new();
 
         // First fragment carries `id`; the continuation fragment for the
         // same call only carries `index` — both must resolve to one call.
         accumulate_openai_stream_chunk(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"foo\"}}]}}]}\n\n",
-            &mut usage, &mut tool_ids,
+            &mut usage, &mut tool_ids, &mut tool_calls,
         );
         accumulate_openai_stream_chunk(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n",
-            &mut usage, &mut tool_ids,
+            &mut usage, &mut tool_ids, &mut tool_calls,
         );
         accumulate_openai_stream_chunk(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"function\":{\"name\":\"bar\"}}]}}]}\n\n",
-            &mut usage, &mut tool_ids,
+            &mut usage, &mut tool_ids, &mut tool_calls,
         );
         accumulate_openai_stream_chunk(
             "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":25,\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n\ndata: [DONE]\n\n",
-            &mut usage, &mut tool_ids,
+            &mut usage, &mut tool_ids, &mut tool_calls,
         );
 
         assert_eq!(tool_ids.len(), 2);
@@ -620,18 +708,19 @@ mod tests {
     fn anthropic_stream_accumulates_across_events() {
         let mut usage = UsageInfo::default();
         let mut tool_ids = HashSet::new();
+        let mut tool_calls = Vec::new();
 
         accumulate_anthropic_stream_chunk(
             "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":50,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":5}}}\n\n",
-            &mut usage, &mut tool_ids,
+            &mut usage, &mut tool_ids, &mut tool_calls,
         );
         accumulate_anthropic_stream_chunk(
             "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\"}}\n\n",
-            &mut usage, &mut tool_ids,
+            &mut usage, &mut tool_ids, &mut tool_calls,
         );
         accumulate_anthropic_stream_chunk(
             "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n",
-            &mut usage, &mut tool_ids,
+            &mut usage, &mut tool_ids, &mut tool_calls,
         );
 
         assert_eq!(usage.prompt_tokens, 50);
@@ -639,6 +728,106 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, 5);
         assert_eq!(usage.completion_tokens, 42);
         assert_eq!(tool_ids.len(), 1);
+    }
+
+    #[test]
+    fn openai_unary_agent_question_matches_second_tool_call() {
+        let json: Value = serde_json::from_str(r#"{
+            "choices": [{"message": {"role": "assistant", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}},
+                {"id": "call_2", "type": "function", "function": {"name": "ask_followup_question", "arguments": "{\"question\":\"Which file?\"}"}}
+            ]}}]
+        }"#).unwrap();
+
+        let result = extract_agent_question(Provider::OpenAI, &json);
+        assert_eq!(result, Some(("ask_followup_question".to_string(), "Which file?".to_string())));
+    }
+
+    #[test]
+    fn openai_unary_no_question_tool_yields_none() {
+        let json: Value = serde_json::from_str(r#"{
+            "choices": [{"message": {"role": "assistant", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+            ]}}]
+        }"#).unwrap();
+
+        assert_eq!(extract_agent_question(Provider::OpenAI, &json), None);
+    }
+
+    #[test]
+    fn anthropic_unary_agent_question_from_ask_user_question() {
+        let json: Value = serde_json::from_str(r#"{
+            "content": [
+                {"type": "text", "text": "Let me check."},
+                {"type": "tool_use", "id": "toolu_1", "name": "AskUserQuestion", "input": {
+                    "questions": [{"question": "Use TypeScript?", "header": "Language"}]
+                }}
+            ]
+        }"#).unwrap();
+
+        let result = extract_agent_question(Provider::Anthropic, &json);
+        assert_eq!(result, Some(("AskUserQuestion".to_string(), "Use TypeScript?".to_string())));
+    }
+
+    #[test]
+    fn openai_stream_reconstructs_fragmented_question_arguments() {
+        let mut usage = UsageInfo::default();
+        let mut tool_ids = HashSet::new();
+        let mut tool_calls = Vec::new();
+
+        // Built via json!() rather than hand-escaped string literals — the
+        // "arguments" field is itself a fragment of a *different* JSON
+        // object arriving as plain text, so a literal would need three
+        // layers of escaping (Rust string, this chunk's JSON, the nested
+        // arguments text) at once, which is exactly what to avoid by hand.
+        let chunks = [
+            json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "ask_followup_question", "arguments": ""}}
+            ]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "{\"question\": \"Add "}}
+            ]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "tests?\"}"}}
+            ]}}]}),
+        ];
+
+        for chunk in &chunks {
+            let line = format!("data: {}\n\n", chunk);
+            accumulate_openai_stream_chunk(&line, &mut usage, &mut tool_ids, &mut tool_calls);
+        }
+
+        assert_eq!(tool_calls.len(), 1);
+        let (_, acc) = &tool_calls[0];
+        assert_eq!(acc.name.as_deref(), Some("ask_followup_question"));
+        let arguments: Value = serde_json::from_str(&acc.arguments).unwrap();
+        assert_eq!(agent_question::extract_question_text(&arguments).as_deref(), Some("Add tests?"));
+    }
+
+    #[test]
+    fn anthropic_stream_reconstructs_fragmented_question_input() {
+        let mut usage = UsageInfo::default();
+        let mut tool_ids = HashSet::new();
+        let mut tool_calls = Vec::new();
+
+        accumulate_anthropic_stream_chunk(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"ask_followup_question\"}}\n\n",
+            &mut usage, &mut tool_ids, &mut tool_calls,
+        );
+        accumulate_anthropic_stream_chunk(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"question\\\": \\\"Use \"}}\n\n",
+            &mut usage, &mut tool_ids, &mut tool_calls,
+        );
+        accumulate_anthropic_stream_chunk(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"TypeScript?\\\"}\"}}\n\n",
+            &mut usage, &mut tool_ids, &mut tool_calls,
+        );
+
+        assert_eq!(tool_calls.len(), 1);
+        let (_, acc) = &tool_calls[0];
+        assert_eq!(acc.name.as_deref(), Some("ask_followup_question"));
+        let arguments: Value = serde_json::from_str(&acc.arguments).unwrap();
+        assert_eq!(agent_question::extract_question_text(&arguments).as_deref(), Some("Use TypeScript?"));
     }
 
     #[test]
