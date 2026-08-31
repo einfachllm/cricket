@@ -1,4 +1,4 @@
-# Agent-Turn Backend
+# Harnesswurm Backend
 
 A lightweight proxy server for monitoring coding-agent telemetry (tokens, cache
 usage, tool calls, latency, cost) in real-time, across OpenAI- and
@@ -15,7 +15,7 @@ Anthropic-compatible agents.
 - **Cost estimation**: Prices each call from `pricing.yaml` (per-model $/1M
   tokens). Unpriced models simply show no cost instead of a guessed one.
 - **Persistence**: Stores everything in a local SQLite database
-  (`agent_turn.db`, gitignored — it's local state, not something to commit).
+  (`harnesswurm.db`, gitignored — it's local state, not something to commit).
 - **Multi-Agent Support**: Uses headers to distinguish between different
   agents, sessions, and experiments, so you can compare configurations (e.g.
   the same task with and without a skill enabled) side by side.

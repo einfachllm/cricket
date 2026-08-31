@@ -10,7 +10,7 @@ def run_test():
     # We'll use a separate process.
     process = subprocess.Popen(
         ["cargo", "run"],
-        cwd="agent-turn/backend",
+        cwd="harnesswurm/backend",
         env={**os.environ, "BIND_ADDR": "127.0.0.1:8081"}
     )
     
@@ -44,7 +44,7 @@ def run_test():
             print(response.text)
 
         # Check if database was updated
-        db_path = "agent-turn/backend/agent_turn.db"
+        db_path = "harnesswurm/backend/harnesswurm.db"
         if os.path.exists(db_path):
             conn = sqlite3.connect(db_path)
             cursor = conn.cursor()

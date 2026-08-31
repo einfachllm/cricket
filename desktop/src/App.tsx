@@ -18,7 +18,7 @@ function Layout({ children }: { children: React.ReactNode }) {
       {/* Sidebar */}
       <div className="w-64 bg-slate-900 text-white flex flex-col">
         <div className="p-6 text-xl font-bold border-b border-slate-800">
-          Agent-Turn
+          Harnesswurm
         </div>
         <nav className="flex-1 p-4 space-y-2">
           <Link to="/" className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ` + (location.pathname === '/' ? 'bg-blue-600' : 'hover:bg-slate-800')}>

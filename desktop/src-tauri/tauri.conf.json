@@ -6,7 +6,7 @@
     "distDir": "../dist"
   },
   "package": {
-    "productName": "Agent-Turn Telemetry",
+    "productName": "Harnesswurm",
     "version": "0.1.0"
   },
   "tauri": {
@@ -17,7 +17,7 @@
       "active": true,
       "category": "developer tool",
       "copyright": "",
-      "identifier": "com.agentturn.telemetry",
+      "identifier": "com.harnesswurm.app",
       "icon": [
         "icons/32x32.png",
         "icons/128x128.png",
@@ -28,7 +28,7 @@
     },
     "windows": [
       {
-        "title": "Agent-Turn Telemetry",
+        "title": "Harnesswurm",
         "width": 800,
         "height": 600
       }

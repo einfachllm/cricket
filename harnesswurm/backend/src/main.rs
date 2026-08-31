@@ -73,7 +73,7 @@ pub struct AppState {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let db = db::Database::new("sqlite:agent_turn.db?mode=rwc").await?;
+    let db = db::Database::new("sqlite:harnesswurm.db?mode=rwc").await?;
 
     let agent_config_file = std::path::Path::new("agents.yaml");
     let agents: Vec<AgentConfig> = if agent_config_file.exists() {

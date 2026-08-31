@@ -1,7 +1,7 @@
 [package]
-name = "agent-turn-desktop"
+name = "harnesswurm-desktop"
 version = "0.1.0"
-description = "Tauri desktop app for Agent-Turn telemetry"
+description = "Tauri desktop app for Harnesswurm telemetry"
 edition = "2021"
 
 [build-dependencies]
