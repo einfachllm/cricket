@@ -136,7 +136,9 @@ never confused with real captured traffic.
 
 It also seeds one experiment, `demo-issue-1284`, with four runs across three
 agents — visible under Analytics. It is arranged so that spend alone gives the
-wrong answer: the cheapest run is the one that gave up.
+wrong answer: the cheapest run is the one that gave up. Its turns carry a real
+token arc and per-turn tool calls, so the phase and tool breakdowns have
+something to show.
 
 Seed *after* the app is running: it closes out open calls on startup, so a
 seeded "Thinking" session would otherwise be reaped to *Interrupted* — which
@@ -253,12 +255,39 @@ Three further things the headline number would otherwise hide:
   attempt in three is charged for all three. Run the same task a few times per
   agent and that number, not the cheapest single run, is the one to trust.
 
+### Where the money went
+
+Under the comparison, each run is broken down two ways — both computable only
+because the proxy sees the traffic, not just what an agent chose to log:
+
+- **Across the arc of the task.** A run's calls are cut into five slices of
+  equal length, and each slice is split into the three things billed at
+  different rates: input read fresh, input served from cache (an order of
+  magnitude cheaper), and tokens generated. Early slices are the agent reading
+  its way in; later ones are generation. Two runs that cost the same can have
+  completely different shapes, and the shape says *where* the money went.
+  Panels are scaled to their own peak — compare shapes here, totals above. A
+  run of fewer than five calls fills fewer slices rather than gaining empty
+  ones.
+- **Through which tools.** A turn's tokens are split across the tool calls that
+  turn made, so a turn calling `read_file` twice and `bash` once gives
+  `read_file` two thirds of it. Turns that called no tool are attributed to
+  nothing.
+
+Two honest limits: the real price of a tool's result is paid by the *next*
+turn, which carries that result in its context, so read the tool split as what
+a run leaned on rather than an exact ledger; and tool names are recorded as
+calls are proxied, so traffic captured before this existed shows no tools.
+
 ### Analytics API
 - `GET /v1/analytics/experiments` — list experiments.
 - `GET /v1/analytics/experiments/:id/metrics` — metrics for one experiment, over time.
 - `GET /v1/analytics/experiments/:id/comparison` — one row per run (agent +
   session) in the experiment: totals for cost, tokens, cache reads, tool
   calls, wall clock, failed/rate-limited/still-open calls, and the verdict.
+- `GET /v1/analytics/experiments/:id/breakdown` — `{ phases, tools }`: each
+  run's five phase slices (tokens, cache reads, tool calls, cost per slice) and
+  its spend attributed per tool.
 - `PUT /v1/analytics/sessions/verdict` — mark a run solved or failed:
   `{"agent_name": "kilo", "session_id": "issue-1284-kilo", "verdict": "solved", "note": "tests pass"}`.
   A `verdict` of `null` clears it.

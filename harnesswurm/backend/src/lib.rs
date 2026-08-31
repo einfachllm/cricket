@@ -226,6 +226,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         .route("/v1/analytics/experiments", get(get_experiments))
         .route("/v1/analytics/experiments/:id/metrics", get(get_experiment_metrics))
         .route("/v1/analytics/experiments/:id/comparison", get(get_experiment_comparison))
+        .route("/v1/analytics/experiments/:id/breakdown", get(get_experiment_breakdown))
         .route("/v1/analytics/sessions/verdict", put(put_session_verdict))
         .route("/v1/analytics/tasks", get(get_recent_tasks))
         .route("/v1/analytics/tasks/:id/traffic", get(get_task_traffic))
@@ -284,6 +285,22 @@ async fn get_experiment_comparison(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(axum::Json(runs))
+}
+
+/// Where each run's money went — across the arc of the task, and through
+/// which tools. Both halves answer "why did this run cost that", which the
+/// comparison's single total cannot. Served together because the UI shows
+/// them side by side and one round trip is one loading state.
+async fn get_experiment_breakdown(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let phases = state.db.get_experiment_phases(id).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let tools = state.db.get_experiment_tool_usage(id).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(axum::Json(json!({ "phases": phases, "tools": tools })))
 }
 
 #[derive(serde::Deserialize)]
@@ -598,6 +615,28 @@ fn turn_awaits_human(stop_reason: Option<&str>, has_question: bool) -> bool {
     has_question || matches!(stop_reason, Some("end_turn") | Some("stop"))
 }
 
+/// Every tool name a unary response called, in order and with repeats kept
+/// — the same tool twice in one turn is two calls, and the attribution in
+/// `get_experiment_tool_usage` depends on that count being right.
+///
+/// Unnamed tool calls are skipped rather than recorded as an empty name: a
+/// malformed fragment should not become a phantom tool in the breakdown.
+fn extract_tool_names(provider: Provider, json: &Value) -> Vec<String> {
+    let names: Vec<&str> = match provider {
+        Provider::OpenAI => json["choices"][0]["message"]["tool_calls"].as_array().map(|calls| {
+            calls.iter().filter_map(|tc| tc["function"]["name"].as_str()).collect()
+        }),
+        Provider::Anthropic => json["content"].as_array().map(|blocks| {
+            blocks.iter()
+                .filter(|b| b["type"] == "tool_use")
+                .filter_map(|b| b["name"].as_str())
+                .collect()
+        }),
+    }.unwrap_or_default();
+
+    names.into_iter().map(String::from).collect()
+}
+
 /// Scans the same tool-calls/content a response already carries for one
 /// matching a known "ask the human a question" convention. Unary twin of
 /// the streaming accumulate-then-scan path in handle_streaming.
@@ -657,8 +696,15 @@ async fn handle_unary(
         .map(extract_error_details)
         .unwrap_or((None, None));
 
+    let tool_names = parsed_response.as_ref()
+        .map(|json| extract_tool_names(provider, json))
+        .unwrap_or_default();
+
     let response_text = String::from_utf8_lossy(&res_bytes).to_string();
     let _ = state.db.save_traffic_response(task_id, &response_text).await;
+    if !tool_names.is_empty() {
+        let _ = state.db.save_tool_calls(task_id, &tool_names).await;
+    }
     if let Some((tool, text)) = &agent_question {
         let _ = state.db.save_agent_question(task_id, tool, text).await;
     }
@@ -726,6 +772,13 @@ struct StreamAccumulator {
 }
 
 impl StreamAccumulator {
+    /// Every tool the stream named, in first-seen order and with repeats
+    /// kept. A fragment whose name never arrived is dropped rather than
+    /// recorded blank — see `extract_tool_names` for the unary twin.
+    fn tool_names(&self) -> Vec<String> {
+        self.tool_calls.iter().filter_map(|(_, acc)| acc.name.clone()).collect()
+    }
+
     /// Reconstructs the question the agent asked, if it asked one.
     fn agent_question(&self) -> Option<(String, String)> {
         self.tool_calls.iter().find_map(|(_, acc)| {
@@ -974,6 +1027,10 @@ async fn handle_streaming(
             cost,
         ).await;
         let _ = state.db.save_traffic_response(task_id, &raw_text).await;
+        let tool_names = acc.tool_names();
+        if !tool_names.is_empty() {
+            let _ = state.db.save_tool_calls(task_id, &tool_names).await;
+        }
         if let Some((tool, text)) = &agent_question {
             let _ = state.db.save_agent_question(task_id, tool, text).await;
         }
@@ -1047,6 +1104,64 @@ mod tests {
         assert_eq!(usage.cache_creation_tokens, 0);
         assert_eq!(usage.completion_tokens, 20);
         assert_eq!(usage.tool_calls_count, 2);
+    }
+
+    #[test]
+    fn unary_tool_names_keep_repeats_from_either_provider() {
+        let openai: Value = serde_json::from_str(r#"{
+            "choices": [{"message": {"tool_calls": [
+                {"function": {"name": "read_file"}},
+                {"function": {"name": "read_file"}},
+                {"function": {"name": "bash"}}
+            ]}}]
+        }"#).unwrap();
+        assert_eq!(
+            extract_tool_names(Provider::OpenAI, &openai),
+            vec!["read_file", "read_file", "bash"],
+        );
+
+        let anthropic: Value = serde_json::from_str(r#"{
+            "content": [
+                {"type": "text", "text": "let me look"},
+                {"type": "tool_use", "name": "read_file", "input": {}},
+                {"type": "tool_use", "name": "read_file", "input": {}}
+            ]
+        }"#).unwrap();
+        assert_eq!(
+            extract_tool_names(Provider::Anthropic, &anthropic),
+            vec!["read_file", "read_file"],
+        );
+    }
+
+    #[test]
+    fn unary_tool_names_skip_calls_that_never_named_a_tool() {
+        let json: Value = serde_json::from_str(r#"{
+            "choices": [{"message": {"tool_calls": [
+                {"function": {"arguments": "{}"}},
+                {"function": {"name": "bash"}}
+            ]}}]
+        }"#).unwrap();
+        assert_eq!(extract_tool_names(Provider::OpenAI, &json), vec!["bash"]);
+    }
+
+    #[test]
+    fn a_response_with_no_tools_names_none() {
+        let json: Value = serde_json::from_str(r#"{"choices": [{"message": {"content": "done"}}]}"#).unwrap();
+        assert!(extract_tool_names(Provider::OpenAI, &json).is_empty());
+        assert!(extract_tool_names(Provider::Anthropic, &json).is_empty());
+    }
+
+    #[test]
+    fn streamed_tool_names_come_from_the_accumulated_fragments() {
+        let mut acc = StreamAccumulator::default();
+        for chunk in [
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"c2\",\"function\":{\"name\":\"bash\"}}]}}]}\n\n",
+        ] {
+            accumulate_openai_stream_chunk(chunk, &mut acc);
+        }
+
+        assert_eq!(acc.tool_names(), vec!["read_file", "bash"]);
     }
 
     #[test]

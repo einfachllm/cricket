@@ -186,6 +186,19 @@ impl Database {
             );"
         ).execute(&pool).await?;
 
+        // Which tools a turn actually called. `metrics.tool_calls_count`
+        // knows how many; this knows which, so a run's spend can be
+        // attributed to the tools that drove it.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS task_tools (
+                task_id INTEGER NOT NULL,
+                tool_name TEXT NOT NULL,
+                call_count INTEGER NOT NULL,
+                PRIMARY KEY (task_id, tool_name),
+                FOREIGN KEY(task_id) REFERENCES tasks(id)
+            );"
+        ).execute(&pool).await?;
+
         // Whether a run actually solved what it was given. Keyed by the run
         // (agent + session), not by call, because that is the grain a human
         // can actually judge: individual calls have no notion of success.
@@ -433,6 +446,33 @@ impl Database {
         Ok(())
     }
 
+    /// Records which tools a turn called, deduplicated to one row per name
+    /// with a count. Called with every name the response contained, in the
+    /// order they appeared, so repeats of the same tool in one turn add up.
+    pub async fn save_tool_calls(&self, task_id: i64, tool_names: &[String]) -> Result<()> {
+        let mut counts: Vec<(&str, i64)> = Vec::new();
+        for name in tool_names {
+            match counts.iter_mut().find(|(seen, _)| *seen == name.as_str()) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((name.as_str(), 1)),
+            }
+        }
+
+        for (name, count) in counts {
+            sqlx::query(
+                "INSERT INTO task_tools (task_id, tool_name, call_count) VALUES (?, ?, ?)
+                 ON CONFLICT(task_id, tool_name) DO UPDATE SET call_count = excluded.call_count"
+            )
+            .bind(task_id)
+            .bind(name)
+            .bind(count)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn save_agent_question(&self, task_id: i64, tool_name: &str, question_text: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO traffic (task_id, agent_question_tool, agent_question_text) VALUES (?, ?, ?)
@@ -613,6 +653,159 @@ impl Database {
         }).collect();
 
         Ok(runs)
+    }
+
+    /// How each run's spend was distributed across the arc of the task,
+    /// in five equal slices of its calls.
+    ///
+    /// Worth its own view because the shape differs from the total: early
+    /// calls are context construction (input-heavy, the agent reading its
+    /// way in) and later ones are generation. Two runs that cost the same
+    /// can have entirely different shapes, and the shape is what says
+    /// *where* the money went.
+    ///
+    /// Five slices rather than raw calls so runs of different lengths line
+    /// up against each other. A run of fewer than five calls simply fills
+    /// fewer slices — NTILE gives it 1..n — rather than inventing empty ones.
+    pub async fn get_experiment_phases(&self, experiment_id: i64) -> Result<Vec<Value>> {
+        let rows = sqlx::query(
+            "WITH call AS (
+                SELECT
+                    t.id,
+                    t.agent_id,
+                    COALESCE(t.session_id, '') AS session_key,
+                    COALESCE(mm.prompt_tokens, 0) + COALESCE(mm.cache_creation_tokens, 0)
+                        + COALESCE(mm.cache_read_tokens, 0) AS input_tokens,
+                    COALESCE(mm.completion_tokens, 0) AS output_tokens,
+                    COALESCE(mm.cache_read_tokens, 0) AS cache_read_tokens,
+                    COALESCE(mm.tool_calls_count, 0) AS tool_calls,
+                    COALESCE(mm.cost_estimate, 0) AS cost
+                FROM tasks t
+                LEFT JOIN (
+                    SELECT task_id,
+                           MAX(prompt_tokens) AS prompt_tokens,
+                           MAX(completion_tokens) AS completion_tokens,
+                           MAX(cache_creation_tokens) AS cache_creation_tokens,
+                           MAX(cache_read_tokens) AS cache_read_tokens,
+                           MAX(tool_calls_count) AS tool_calls_count,
+                           MAX(cost_estimate) AS cost_estimate
+                    FROM metrics GROUP BY task_id
+                ) mm ON mm.task_id = t.id
+                WHERE t.experiment_id = ?
+             ),
+             phased AS (
+                SELECT
+                    call.*,
+                    NTILE(5) OVER (PARTITION BY agent_id, session_key ORDER BY id) AS phase
+                FROM call
+             )
+             SELECT
+                a.name AS agent_name,
+                p.session_key AS session_key,
+                p.phase AS phase,
+                COUNT(*) AS calls,
+                SUM(p.input_tokens) AS input_tokens,
+                SUM(p.output_tokens) AS output_tokens,
+                SUM(p.cache_read_tokens) AS cache_read_tokens,
+                SUM(p.tool_calls) AS tool_calls,
+                CAST(SUM(p.cost) AS REAL) AS cost
+             FROM phased p
+             JOIN agents a ON a.id = p.agent_id
+             GROUP BY p.agent_id, p.session_key, p.phase
+             ORDER BY agent_name, session_key, phase"
+        )
+        .bind(experiment_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let phases = rows.iter().map(|row| {
+            json!({
+                "agent_name": row.get::<String, _>("agent_name"),
+                "session_key": row.get::<String, _>("session_key"),
+                "phase": row.get::<i64, _>("phase"),
+                "calls": row.get::<i64, _>("calls"),
+                "input_tokens": row.get::<Option<i64>, _>("input_tokens").unwrap_or(0),
+                "output_tokens": row.get::<Option<i64>, _>("output_tokens").unwrap_or(0),
+                "cache_read_tokens": row.get::<Option<i64>, _>("cache_read_tokens").unwrap_or(0),
+                "tool_calls": row.get::<Option<i64>, _>("tool_calls").unwrap_or(0),
+                "cost": row.get::<Option<f64>, _>("cost").unwrap_or(0.0),
+            })
+        }).collect();
+
+        Ok(phases)
+    }
+
+    /// Which tools a run's spend went through, per run.
+    ///
+    /// A turn's tokens are split across the tool calls that turn made — a
+    /// turn calling `read_file` twice and `bash` once gives `read_file` two
+    /// thirds of it. That keeps the attributed total equal to what the turns
+    /// actually cost instead of counting a multi-tool turn once per tool.
+    ///
+    /// It is a simplification: the real price of a tool result is paid by
+    /// the *next* turn, which carries that result in its context. So read
+    /// these as "which tools this run leaned on", not as an exact ledger.
+    /// Turns that called no tool at all are not attributed to anything and
+    /// simply do not appear here.
+    pub async fn get_experiment_tool_usage(&self, experiment_id: i64) -> Result<Vec<Value>> {
+        let rows = sqlx::query(
+            "WITH call AS (
+                SELECT
+                    t.id,
+                    t.agent_id,
+                    COALESCE(t.session_id, '') AS session_key,
+                    COALESCE(mm.prompt_tokens, 0) + COALESCE(mm.cache_creation_tokens, 0)
+                        + COALESCE(mm.cache_read_tokens, 0) AS input_tokens,
+                    COALESCE(mm.completion_tokens, 0) AS output_tokens,
+                    COALESCE(mm.cost_estimate, 0) AS cost
+                FROM tasks t
+                LEFT JOIN (
+                    SELECT task_id,
+                           MAX(prompt_tokens) AS prompt_tokens,
+                           MAX(completion_tokens) AS completion_tokens,
+                           MAX(cache_creation_tokens) AS cache_creation_tokens,
+                           MAX(cache_read_tokens) AS cache_read_tokens,
+                           MAX(cost_estimate) AS cost_estimate
+                    FROM metrics GROUP BY task_id
+                ) mm ON mm.task_id = t.id
+                WHERE t.experiment_id = ?
+             ),
+             turn_total AS (
+                SELECT task_id, SUM(call_count) AS tools_in_turn
+                FROM task_tools GROUP BY task_id
+             )
+             SELECT
+                a.name AS agent_name,
+                c.session_key AS session_key,
+                tt.tool_name AS tool_name,
+                SUM(tt.call_count) AS call_count,
+                SUM(c.input_tokens * tt.call_count / CAST(turn_total.tools_in_turn AS REAL)) AS input_tokens,
+                SUM(c.output_tokens * tt.call_count / CAST(turn_total.tools_in_turn AS REAL)) AS output_tokens,
+                CAST(SUM(c.cost * tt.call_count / CAST(turn_total.tools_in_turn AS REAL)) AS REAL) AS cost
+             FROM call c
+             JOIN task_tools tt ON tt.task_id = c.id
+             JOIN turn_total ON turn_total.task_id = c.id
+             JOIN agents a ON a.id = c.agent_id
+             GROUP BY c.agent_id, c.session_key, tt.tool_name
+             ORDER BY agent_name, session_key, input_tokens DESC"
+        )
+        .bind(experiment_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let tools = rows.iter().map(|row| {
+            json!({
+                "agent_name": row.get::<String, _>("agent_name"),
+                "session_key": row.get::<String, _>("session_key"),
+                "tool_name": row.get::<String, _>("tool_name"),
+                "call_count": row.get::<i64, _>("call_count"),
+                "input_tokens": row.get::<Option<f64>, _>("input_tokens").unwrap_or(0.0).round() as i64,
+                "output_tokens": row.get::<Option<f64>, _>("output_tokens").unwrap_or(0.0).round() as i64,
+                "cost": row.get::<Option<f64>, _>("cost").unwrap_or(0.0),
+            })
+        }).collect();
+
+        Ok(tools)
     }
 
     /// Records whether a run actually solved the task it was given.
@@ -1525,6 +1718,156 @@ mod tests {
         assert_eq!(runs[0]["session_id"], Value::Null);
         assert_eq!(runs[0]["session_key"], "");
         assert_eq!(runs[0]["verdict"], "solved");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phases_split_a_run_into_five_slices_of_its_calls() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+
+        // Ten calls: two per slice. Output climbs while input falls, the
+        // shape the phase view exists to show.
+        let agent_id = db.get_or_create_agent("kilo").await?;
+        for i in 0..10 {
+            let task_id = db.create_task(agent_id, Some(experiment_id), None,
+                Some("run-a".to_string()), None, None).await?;
+            db.log_metric(task_id, 1000 - i * 100, 100 + i * 100, 0, 0, 1, 100, Some(0.01)).await?;
+        }
+
+        let phases = db.get_experiment_phases(experiment_id).await?;
+        assert_eq!(phases.len(), 5);
+        assert_eq!(phases[0]["phase"], 1);
+        assert_eq!(phases[0]["calls"], 2);
+        assert_eq!(phases[4]["phase"], 5);
+
+        // Input-heavy at the start, output-heavy at the end.
+        let first_in = phases[0]["input_tokens"].as_i64().unwrap();
+        let first_out = phases[0]["output_tokens"].as_i64().unwrap();
+        let last_in = phases[4]["input_tokens"].as_i64().unwrap();
+        let last_out = phases[4]["output_tokens"].as_i64().unwrap();
+        assert!(first_in > first_out);
+        assert!(last_out > last_in);
+
+        Ok(())
+    }
+
+    /// A short run must fill fewer slices rather than have empty ones
+    /// invented for it — three calls is three phases, not five.
+    #[tokio::test]
+    async fn a_run_shorter_than_five_calls_fills_fewer_phases() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        for _ in 0..3 {
+            seed_run_call(&db, experiment_id, "kilo", "run-a", Some(0.01)).await?;
+        }
+
+        let phases = db.get_experiment_phases(experiment_id).await?;
+        assert_eq!(phases.len(), 3);
+        assert_eq!(phases.iter().map(|p| p["phase"].as_i64().unwrap()).collect::<Vec<_>>(), vec![1, 2, 3]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phases_are_computed_per_run_not_across_the_experiment() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        for _ in 0..5 {
+            seed_run_call(&db, experiment_id, "kilo", "run-a", Some(0.01)).await?;
+            seed_run_call(&db, experiment_id, "opencode", "run-b", Some(0.01)).await?;
+        }
+
+        let phases = db.get_experiment_phases(experiment_id).await?;
+        // Five slices each, not five shared between them.
+        assert_eq!(phases.len(), 10);
+        assert_eq!(phases.iter().filter(|p| p["agent_name"] == "kilo").count(), 5);
+        assert_eq!(phases.iter().filter(|p| p["agent_name"] == "opencode").count(), 5);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_calls_are_deduplicated_into_counts() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let agent_id = db.get_or_create_agent("kilo").await?;
+        let task_id = db.create_task(agent_id, None, None, None, None, None).await?;
+
+        db.save_tool_calls(task_id, &[
+            "read_file".to_string(), "bash".to_string(), "read_file".to_string(),
+        ]).await?;
+
+        let rows: Vec<(String, i64)> = sqlx::query(
+            "SELECT tool_name, call_count FROM task_tools WHERE task_id = ? ORDER BY tool_name"
+        )
+        .bind(task_id)
+        .fetch_all(&db.pool).await?
+        .iter().map(|r| (r.get("tool_name"), r.get("call_count"))).collect();
+
+        assert_eq!(rows, vec![("bash".to_string(), 1), ("read_file".to_string(), 2)]);
+
+        // Re-saving the same turn replaces rather than doubling — a retry of
+        // the write must not inflate the attribution.
+        db.save_tool_calls(task_id, &["read_file".to_string(), "read_file".to_string()]).await?;
+        let count: i64 = sqlx::query("SELECT call_count FROM task_tools WHERE task_id = ? AND tool_name = 'read_file'")
+            .bind(task_id).fetch_one(&db.pool).await?.get(0);
+        assert_eq!(count, 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_usage_splits_a_turn_across_the_tools_it_called() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        let agent_id = db.get_or_create_agent("kilo").await?;
+
+        // One turn, 900 input tokens, three tool calls: two read_file, one bash.
+        let task_id = db.create_task(agent_id, Some(experiment_id), None,
+            Some("run-a".to_string()), None, None).await?;
+        db.log_metric(task_id, 900, 90, 0, 0, 3, 100, Some(0.09)).await?;
+        db.save_tool_calls(task_id, &[
+            "read_file".to_string(), "read_file".to_string(), "bash".to_string(),
+        ]).await?;
+
+        let tools = db.get_experiment_tool_usage(experiment_id).await?;
+        assert_eq!(tools.len(), 2);
+
+        // Ordered by input tokens, so the two-thirds share comes first.
+        assert_eq!(tools[0]["tool_name"], "read_file");
+        assert_eq!(tools[0]["call_count"], 2);
+        assert_eq!(tools[0]["input_tokens"], 600);
+        assert_eq!(tools[1]["tool_name"], "bash");
+        assert_eq!(tools[1]["input_tokens"], 300);
+
+        // The split is exhaustive: nothing is counted twice, nothing lost.
+        let attributed: i64 = tools.iter().map(|t| t["input_tokens"].as_i64().unwrap()).sum();
+        assert_eq!(attributed, 900);
+
+        Ok(())
+    }
+
+    /// A turn that called no tool is attributed to nothing rather than
+    /// smeared over whichever tools the run used elsewhere.
+    #[tokio::test]
+    async fn tool_usage_ignores_turns_with_no_tool_calls() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        let agent_id = db.get_or_create_agent("kilo").await?;
+
+        let with_tool = db.create_task(agent_id, Some(experiment_id), None,
+            Some("run-a".to_string()), None, None).await?;
+        db.log_metric(with_tool, 100, 10, 0, 0, 1, 100, Some(0.01)).await?;
+        db.save_tool_calls(with_tool, &["bash".to_string()]).await?;
+
+        let no_tool = db.create_task(agent_id, Some(experiment_id), None,
+            Some("run-a".to_string()), None, None).await?;
+        db.log_metric(no_tool, 9999, 999, 0, 0, 0, 100, Some(9.99)).await?;
+
+        let tools = db.get_experiment_tool_usage(experiment_id).await?;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["input_tokens"], 100);
 
         Ok(())
     }

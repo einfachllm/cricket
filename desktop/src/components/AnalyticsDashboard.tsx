@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, BarChart, Bar } from 'recharts';
 import { Activity, TrendingUp, AlertCircle, DollarSign } from 'lucide-react';
 import ExperimentComparison from './ExperimentComparison';
+import RunBreakdown from './RunBreakdown';
 
 interface MetricData {
   timestamp: string;
@@ -141,6 +142,7 @@ const AnalyticsDashboard = () => {
 
         <div className="lg:col-span-3 space-y-6">
           {selectedExperiment && <ExperimentComparison experimentId={selectedExperiment} />}
+          {selectedExperiment && <RunBreakdown experimentId={selectedExperiment} />}
 
           <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
           {loading ? (

@@ -45,8 +45,9 @@ def clear(db):
     ids = [row[0] for row in db.execute(
         "SELECT id FROM tasks WHERE session_id LIKE ?", (SESSION_PREFIX + "%",)
     )]
-    for table in ("metrics", "traffic", "rate_limits"):
-        db.executemany(f"DELETE FROM {table} WHERE task_id = ?", [(i,) for i in ids])
+    for table in ("metrics", "traffic", "rate_limits", "task_tools"):
+        if table_exists(db, table):
+            db.executemany(f"DELETE FROM {table} WHERE task_id = ?", [(i,) for i in ids])
     db.execute("DELETE FROM tasks WHERE session_id LIKE ?", (SESSION_PREFIX + "%",))
     # Verdicts outlive the calls they judge (they key on agent + session, not
     # task id), so they need clearing by the same prefix or a re-seed would
@@ -88,7 +89,7 @@ def add_call(db, agent, session, *, status, model, provider, task, started_ago,
              finished_ago=None, http_status=200, stop_reason=None, awaiting=0,
              question=None, error_type=None, error_message=None,
              tokens=(0, 0, 0, 0), cost=None, quota=None, duration_ms=3800,
-             experiment=None, tool_calls=3):
+             experiment=None, tool_calls=3, tools=None):
     """Writes one completed (or still-running) call, exactly as the proxy would."""
     finished = "NULL" if finished_ago is None else f"datetime('now', '-{finished_ago} seconds')"
     db.execute(
@@ -109,6 +110,11 @@ def add_call(db, agent, session, *, status, model, provider, task, started_ago,
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (task_id, prompt, completion, cache_write, cache_read, tool_calls, 380, cost),
     )
+    # Which tools the turn called, so the breakdown can attribute its spend.
+    for name, count in (tools or {}).items():
+        db.execute(
+            "INSERT INTO task_tools (task_id, tool_name, call_count) VALUES (?, ?, ?)",
+            (task_id, name, count))
     if question:
         db.execute(
             "INSERT INTO traffic (task_id, agent_question_tool, agent_question_text)"
@@ -183,37 +189,72 @@ def seed_comparison(db):
 
     # A first attempt that went nowhere. It is still kilo's money, so the
     # per-agent roll-up charges it to kilo's eventual success.
-    add_call(db, "kilo", "cmp-kilo-1st", status="ok", model="gpt-4o", provider="openai",
-             task=issue, started_ago=1200, finished_ago=1180, stop_reason="stop", awaiting=1,
-             tokens=(8000, 600, 0, 15000), cost=0.022, experiment=experiment, tool_calls=3)
+    seed_run(db, experiment, issue, "kilo", "cmp-kilo-1st", "gpt-4o", "openai",
+             started_ago=1200, turns=[
+                 # (prompt, completion, cache_write, cache_read), cost, tools
+                 ((8000, 600, 0, 15000), 0.022, {"read_file": 2, "grep": 1}),
+             ])
     set_verdict(db, "kilo", "cmp-kilo-1st", "failed", "Chased a red herring in the CSRF filter")
 
-    # Cheap and correct: small model, heavy cache reuse, few turns.
-    for turn, (cost, ago) in enumerate([(0.021, 900), (0.028, 840), (0.019, 780)]):
-        add_call(db, "kilo", "cmp-kilo", status="ok", model="gpt-4o", provider="openai",
-                 task=issue, started_ago=ago, finished_ago=ago - 20,
-                 stop_reason="stop" if turn == 2 else "tool_calls",
-                 tokens=(9000, 700, 0, 42000), cost=cost, experiment=experiment, tool_calls=4)
+    # Cheap and correct: small model, heavy cache reuse, few turns. The token
+    # mix walks the arc the phase view exists to show — a cold, input-heavy
+    # read-in, then a warm cache and progressively more generation.
+    seed_run(db, experiment, issue, "kilo", "cmp-kilo", "gpt-4o", "openai",
+             started_ago=900, turns=[
+                 ((9000, 200, 6000, 0), 0.012, {"read_file": 3, "grep": 2}),
+                 ((2000, 300, 0, 14000), 0.010, {"read_file": 2, "grep": 1}),
+                 ((1500, 500, 0, 16000), 0.010, {"read_file": 1, "bash": 1}),
+                 ((1200, 900, 0, 18000), 0.011, {"edit_file": 1}),
+                 ((1000, 1400, 0, 20000), 0.012, {"edit_file": 1, "bash": 1}),
+                 # No tools on the last turn: it answered. Turns like this are
+                 # deliberately attributed to nothing in the tool breakdown.
+                 ((800, 1800, 0, 21000), 0.013, {}),
+             ])
     set_verdict(db, "kilo", "cmp-kilo", "solved", "Cookie set on the callback; e2e green")
 
-    # Also correct, but it read far more of the repo to get there.
-    for turn, (cost, ago) in enumerate([(0.28, 880), (0.34, 800), (0.31, 700), (0.26, 610)]):
-        add_call(db, "claude-code", "cmp-claude", status="ok", model="claude-opus-5",
-                 provider="anthropic", task=issue, started_ago=ago, finished_ago=ago - 30,
-                 stop_reason="end_turn" if turn == 3 else "tool_use",
-                 tokens=(30000, 2200, 12000, 180000), cost=cost, experiment=experiment,
-                 tool_calls=9)
+    # Also correct, but it read far more of the repo to get there — the same
+    # arc an order of magnitude wider.
+    seed_run(db, experiment, issue, "claude-code", "cmp-claude", "claude-opus-5", "anthropic",
+             started_ago=880, turns=[
+                 ((30000, 400, 20000, 0), 0.20, {"read_file": 6, "grep": 4}),
+                 ((5000, 600, 0, 60000), 0.14, {"read_file": 5, "grep": 3}),
+                 ((4000, 800, 0, 80000), 0.15, {"read_file": 4, "bash": 1}),
+                 ((3500, 1000, 0, 95000), 0.15, {"read_file": 2, "edit_file": 1}),
+                 ((3000, 1500, 0, 110000), 0.16, {"edit_file": 2, "bash": 1}),
+                 ((2500, 2200, 0, 120000), 0.16, {"edit_file": 1, "run_tests": 1}),
+                 ((2000, 2800, 0, 130000), 0.15, {"run_tests": 2}),
+                 ((1500, 3000, 0, 135000), 0.08, {}),
+             ])
     set_verdict(db, "claude-code", "cmp-claude", "solved", "Same fix, plus a regression test")
 
     # The trap: cheapest of the three, because it stopped after two turns
-    # without a working fix.
-    add_call(db, "cursor", "cmp-cursor", status="ok", model="gpt-4o", provider="openai",
-             task=issue, started_ago=870, finished_ago=850, stop_reason="tool_calls",
-             tokens=(6000, 400, 0, 9000), cost=0.008, experiment=experiment, tool_calls=2)
-    add_call(db, "cursor", "cmp-cursor", status="ok", model="gpt-4o", provider="openai",
-             task=issue, started_ago=845, finished_ago=830, stop_reason="stop", awaiting=1,
-             tokens=(7000, 500, 0, 11000), cost=0.009, experiment=experiment, tool_calls=1)
+    # without a working fix. Two calls means two phase slices, not five.
+    seed_run(db, experiment, issue, "cursor", "cmp-cursor", "gpt-4o", "openai",
+             started_ago=870, turns=[
+                 ((6000, 400, 0, 9000), 0.008, {"read_file": 2}),
+                 ((7000, 500, 0, 11000), 0.009, {"edit_file": 1}),
+             ])
     set_verdict(db, "cursor", "cmp-cursor", "failed", "Edited the wrong middleware, gave up")
+
+
+def seed_run(db, experiment, task, agent, session, model, provider, *, started_ago, turns):
+    """Writes one run as a sequence of turns, 30s apart, newest last.
+
+    Taking the turns as a list rather than one repeated call is what lets the
+    seeded data have a *shape* — the phase breakdown has nothing to show if
+    every turn of a run is identical.
+    """
+    anthropic = provider == "anthropic"
+    for index, (tokens, cost, tools) in enumerate(turns):
+        last = index == len(turns) - 1
+        ago = started_ago - index * 30
+        add_call(db, agent, session, status="ok", model=model, provider=provider,
+                 task=task, started_ago=ago, finished_ago=ago - 20,
+                 stop_reason=("end_turn" if anthropic else "stop") if last
+                 else ("tool_use" if anthropic else "tool_calls"),
+                 awaiting=1 if last else 0,
+                 tokens=tokens, cost=cost, experiment=experiment,
+                 tool_calls=sum(tools.values()), tools=tools)
 
 
 def main():

@@ -86,6 +86,39 @@ export interface RunComparison {
   verdict_note: string | null;
 }
 
+/// One of the five equal slices a run's calls are cut into, so runs of
+/// different lengths line up against each other. `phase` is 1-based; a run
+/// with fewer than five calls fills fewer slices rather than gaining empty
+/// ones.
+export interface PhaseSlice {
+  agent_name: string;
+  session_key: string;
+  phase: number;
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  tool_calls: number;
+  cost: number;
+}
+
+/// One tool's share of a run's spend. Tokens are the turn's totals split
+/// across the tools that turn called — see `get_experiment_tool_usage`.
+export interface ToolUsage {
+  agent_name: string;
+  session_key: string;
+  tool_name: string;
+  call_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost: number;
+}
+
+export interface ExperimentBreakdown {
+  phases: PhaseSlice[];
+  tools: ToolUsage[];
+}
+
 export interface ProviderLimits {
   provider: string | null;
   requests_limit: number | null;
