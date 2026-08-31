@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Radio, RefreshCw, X, MessageCircleQuestion } from 'lucide-react';
+import { API_BASE, formatCost } from '../lib/api';
 
 interface TaskSummary {
   task_id: number;
@@ -19,6 +20,14 @@ interface TaskSummary {
   cost_estimate: number | null;
   agent_question_tool: string | null;
   agent_question_text: string | null;
+  status: string | null;
+  http_status: number | null;
+  error_type: string | null;
+  error_message: string | null;
+  stop_reason: string | null;
+  awaiting_input: boolean;
+  ttfb_ms: number | null;
+  duration_ms: number | null;
 }
 
 interface TaskTraffic {
@@ -34,12 +43,40 @@ interface TaskTraffic {
   agent_question_text: string | null;
 }
 
-const API_BASE = 'http://localhost:8081';
+/// Per-call outcome, colored so a screen of traffic reads at a glance: red
+/// is a call that failed, amber is one that stopped to ask you something.
+const STATUS_STYLES: Record<string, { color: string; label: string }> = {
+  ok: { color: 'bg-emerald-100 text-emerald-800', label: 'ok' },
+  in_flight: { color: 'bg-blue-100 text-blue-800', label: 'running' },
+  rate_limited: { color: 'bg-red-100 text-red-800', label: 'rate limited' },
+  overloaded: { color: 'bg-orange-100 text-orange-800', label: 'overloaded' },
+  error: { color: 'bg-red-100 text-red-800', label: 'error' },
+  interrupted: { color: 'bg-slate-100 text-slate-700', label: 'cut off' },
+};
 
-function formatCost(cost: number | null): string {
-  if (cost === null || cost === undefined) return '–';
-  if (cost === 0) return '$0.00';
-  return cost < 0.01 ? `$${cost.toFixed(5)}` : `$${cost.toFixed(4)}`;
+function StatusBadge({ task }: { task: TaskSummary }) {
+  if (!task.status) return <span className="text-gray-300">–</span>;
+  const style = STATUS_STYLES[task.status] ?? { color: 'bg-gray-100 text-gray-600', label: task.status };
+  // The provider's own message is the fastest way to understand a failure,
+  // so it rides along as the tooltip rather than needing a click-through.
+  const title = [task.error_type, task.error_message, task.http_status ? `HTTP ${task.http_status}` : null]
+    .filter(Boolean)
+    .join(' — ');
+
+  return (
+    <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${style.color}`} title={title || undefined}>
+      {style.label}
+    </span>
+  );
+}
+
+/// How long the call actually took. `duration_ms` is preferred over
+/// `latency_ms` because the latter is only time-to-headers — on a streamed
+/// call that excludes the entire generation, which is most of the wait.
+/// Older rows predate `duration_ms` and fall back to what they have.
+function formatDuration(task: TaskSummary): string {
+  const ms = task.duration_ms ?? task.latency_ms;
+  return ms === null || ms === undefined ? '–' : `${ms}ms`;
 }
 
 function formatJson(raw: string | null): string {
@@ -170,6 +207,7 @@ const TrafficView = () => {
                 <th className="text-left px-4 py-3 font-semibold">Time</th>
                 <th className="text-left px-4 py-3 font-semibold">Agent</th>
                 <th className="text-left px-4 py-3 font-semibold">Task</th>
+                <th className="text-left px-4 py-3 font-semibold">Status</th>
                 <th className="text-left px-4 py-3 font-semibold">Model</th>
                 <th className="text-left px-4 py-3 font-semibold">Provider</th>
                 <th className="text-right px-4 py-3 font-semibold">Input</th>
@@ -205,6 +243,7 @@ const TrafficView = () => {
                       </span>
                     </span>
                   </td>
+                  <td className="px-4 py-3"><StatusBadge task={task} /></td>
                   <td className="px-4 py-3 text-gray-600 font-mono text-xs">{task.model_name || '–'}</td>
                   <td className="px-4 py-3"><ProviderBadge provider={task.provider} /></td>
                   <td className="px-4 py-3 text-right text-gray-700">{(task.prompt_tokens ?? 0).toLocaleString()}</td>
@@ -213,7 +252,12 @@ const TrafficView = () => {
                   </td>
                   <td className="px-4 py-3 text-right text-gray-700">{(task.completion_tokens ?? 0).toLocaleString()}</td>
                   <td className="px-4 py-3 text-right text-gray-700">{task.tool_calls_count ?? 0}</td>
-                  <td className="px-4 py-3 text-right text-gray-500">{task.latency_ms !== null ? `${task.latency_ms}ms` : '–'}</td>
+                  <td
+                    className="px-4 py-3 text-right text-gray-500"
+                    title={task.ttfb_ms !== null ? `${task.ttfb_ms}ms to first byte` : undefined}
+                  >
+                    {formatDuration(task)}
+                  </td>
                   <td className="px-4 py-3 text-right font-semibold text-gray-800">{formatCost(task.cost_estimate)}</td>
                 </tr>
               ))}
