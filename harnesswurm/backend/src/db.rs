@@ -30,6 +30,64 @@ pub struct TaskOutcome {
 /// nearly every successful call.
 const RATE_LIMIT_SCAN_ROWS: i64 = 200;
 
+/// The run did what it was asked: the change works, the issue is fixed.
+pub const VERDICT_SOLVED: &str = "solved";
+/// The run did not — it gave up, went in circles, or produced something wrong.
+pub const VERDICT_FAILED: &str = "failed";
+
+/// Whether a string is a verdict the comparison understands. Checked at the
+/// edge so an unrecognised value is a 400 rather than a row that quietly
+/// matches nothing when the comparison later filters on it.
+pub fn is_valid_verdict(verdict: &str) -> bool {
+    verdict == VERDICT_SOLVED || verdict == VERDICT_FAILED
+}
+
+/// What counts as one *run* — the unit the comparison ranks and the phase
+/// breakdown slices.
+///
+/// There is no single right answer, because `X-Session-ID` means different
+/// things to different agents:
+///
+/// - `Session` trusts it to mark one attempt at the task. Right when it is
+///   stable for the length of a task, and the only way to sit several
+///   deliberate repeats of the same task side by side under one experiment —
+///   which is the whole point of taking more than one sample.
+/// - `Agent` treats everything one agent did under the experiment as a single
+///   run. Some agents mint a fresh session id per *session* rather than per
+///   task — a restart, a context compaction, reopening the editor — and under
+///   `Session` that shatters one attempt into a row per fragment, then
+///   crowns the cheapest fragment as the winner.
+///
+/// So it is a choice the caller makes, not something to infer: only the
+/// person running the agent knows which their session ids are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RunGrouping {
+    #[default]
+    Session,
+    Agent,
+}
+
+impl RunGrouping {
+    /// Anything unrecognised falls back to per-session, the narrower reading:
+    /// it over-reports runs rather than silently merging attempts that were
+    /// meant to stay apart.
+    pub fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("agent") => RunGrouping::Agent,
+            _ => RunGrouping::Session,
+        }
+    }
+
+    /// The SQL expression that identifies a run within an agent. Not caller
+    /// input — it comes from this enum — so interpolating it is safe.
+    fn run_key_sql(self) -> &'static str {
+        match self {
+            RunGrouping::Session => "COALESCE(t.session_id, '')",
+            RunGrouping::Agent => "''",
+        }
+    }
+}
+
 /// One stored quota reading, with when it was taken.
 #[derive(Debug, Clone)]
 struct RateLimitReading {
@@ -174,6 +232,34 @@ impl Database {
             );"
         ).execute(&pool).await?;
 
+        // Which tools a turn actually called. `metrics.tool_calls_count`
+        // knows how many; this knows which, so a run's spend can be
+        // attributed to the tools that drove it.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS task_tools (
+                task_id INTEGER NOT NULL,
+                tool_name TEXT NOT NULL,
+                call_count INTEGER NOT NULL,
+                PRIMARY KEY (task_id, tool_name),
+                FOREIGN KEY(task_id) REFERENCES tasks(id)
+            );"
+        ).execute(&pool).await?;
+
+        // Whether a run actually solved what it was given. Keyed by the run
+        // (agent + session), not by call, because that is the grain a human
+        // can actually judge: individual calls have no notion of success.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS session_verdicts (
+                agent_id INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                verdict TEXT NOT NULL,
+                note TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (agent_id, session_id),
+                FOREIGN KEY(agent_id) REFERENCES agents(id)
+            );"
+        ).execute(&pool).await?;
+
         // Older on-disk databases predate these columns; add them in place so
         // existing installs upgrade without losing history.
         Self::add_column_if_missing(&pool, "tasks", "provider", "TEXT").await?;
@@ -198,6 +284,8 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(agent_id, session_id, id)")
             .execute(&pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_tasks_timestamp ON tasks(timestamp DESC)")
+            .execute(&pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_tasks_experiment ON tasks(experiment_id, agent_id, session_id)")
             .execute(&pool).await?;
 
         Ok(Self { pool })
@@ -404,6 +492,33 @@ impl Database {
         Ok(())
     }
 
+    /// Records which tools a turn called, deduplicated to one row per name
+    /// with a count. Called with every name the response contained, in the
+    /// order they appeared, so repeats of the same tool in one turn add up.
+    pub async fn save_tool_calls(&self, task_id: i64, tool_names: &[String]) -> Result<()> {
+        let mut counts: Vec<(&str, i64)> = Vec::new();
+        for name in tool_names {
+            match counts.iter_mut().find(|(seen, _)| *seen == name.as_str()) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((name.as_str(), 1)),
+            }
+        }
+
+        for (name, count) in counts {
+            sqlx::query(
+                "INSERT INTO task_tools (task_id, tool_name, call_count) VALUES (?, ?, ?)
+                 ON CONFLICT(task_id, tool_name) DO UPDATE SET call_count = excluded.call_count"
+            )
+            .bind(task_id)
+            .bind(name)
+            .bind(count)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn save_agent_question(&self, task_id: i64, tool_name: &str, question_text: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO traffic (task_id, agent_question_tool, agent_question_text) VALUES (?, ?, ?)
@@ -473,6 +588,398 @@ impl Database {
         }).collect();
 
         Ok(metrics)
+    }
+
+    /// One row per *run* in an experiment — see `RunGrouping` for what a run
+    /// is, which depends on whether the agent's session ids mark attempts or
+    /// merely sessions.
+    ///
+    /// This is the grain that answers "which agent solved it cheaper", and
+    /// the reason `get_experiment_metrics` cannot: that returns a per-call
+    /// time series with no agent on it, so two agents pointed at the same
+    /// experiment are indistinguishable once their calls interleave.
+    ///
+    /// Cost is summed with unpriced calls counted separately rather than
+    /// treated as free — a run on a model missing from `pricing.yaml` would
+    /// otherwise total $0.00 and win the comparison outright.
+    pub async fn get_experiment_comparison(&self, experiment_id: i64, grouping: RunGrouping) -> Result<Vec<Value>> {
+        let rows = sqlx::query(&format!(
+            "WITH call AS (
+                SELECT
+                    t.agent_id,
+                    -- What identifies a run within this agent, per the caller's
+                    -- grouping. Verdicts stay keyed to the real session below,
+                    -- so they still aggregate correctly when runs are merged.
+                    {run_key} AS run_key,
+                    -- session_id is nullable on tasks, but a verdict needs a
+                    -- stable key; '' is that key for calls sent without one.
+                    COALESCE(t.session_id, '') AS session_key,
+                    t.session_id,
+                    t.timestamp,
+                    t.status,
+                    t.model_name,
+                    t.provider,
+                    t.duration_ms,
+                    COALESCE(mm.prompt_tokens, 0) + COALESCE(mm.cache_creation_tokens, 0)
+                        + COALESCE(mm.cache_read_tokens, 0) AS input_tokens,
+                    COALESCE(mm.completion_tokens, 0) AS output_tokens,
+                    COALESCE(mm.cache_read_tokens, 0) AS cache_read_tokens,
+                    COALESCE(mm.tool_calls_count, 0) AS tool_calls,
+                    mm.cost_estimate
+                FROM tasks t
+                LEFT JOIN (
+                    SELECT task_id,
+                           MAX(prompt_tokens) AS prompt_tokens,
+                           MAX(completion_tokens) AS completion_tokens,
+                           MAX(cache_creation_tokens) AS cache_creation_tokens,
+                           MAX(cache_read_tokens) AS cache_read_tokens,
+                           MAX(tool_calls_count) AS tool_calls_count,
+                           MAX(cost_estimate) AS cost_estimate
+                    FROM metrics GROUP BY task_id
+                ) mm ON mm.task_id = t.id
+                WHERE t.experiment_id = ?
+             )
+             SELECT
+                a.name AS agent_name,
+                c.run_key AS session_key,
+                -- A run covering exactly one session still has an id worth
+                -- showing, however the caller grouped. Above one it has none:
+                -- naming an arbitrary member would read as the whole.
+                CASE WHEN COUNT(DISTINCT c.session_key) = 1 THEN MAX(c.session_id) END AS session_id,
+                COUNT(DISTINCT c.session_key) AS sessions,
+                COUNT(*) AS call_count,
+                MIN(c.timestamp) AS first_seen,
+                MAX(c.timestamp) AS last_seen,
+                CAST(strftime('%s', MAX(c.timestamp)) AS INTEGER)
+                    - CAST(strftime('%s', MIN(c.timestamp)) AS INTEGER) AS wall_clock_seconds,
+                SUM(c.input_tokens) AS input_tokens,
+                SUM(c.output_tokens) AS output_tokens,
+                SUM(c.cache_read_tokens) AS cache_read_tokens,
+                SUM(c.tool_calls) AS tool_calls,
+                -- CAST because SQLite infers INTEGER for this SUM when every
+                -- call is unpriced, which then fails to decode as an f64.
+                CAST(SUM(COALESCE(c.cost_estimate, 0)) AS REAL) AS total_cost,
+                SUM(CASE WHEN c.cost_estimate IS NULL THEN 1 ELSE 0 END) AS unpriced_calls,
+                SUM(COALESCE(c.duration_ms, 0)) AS busy_ms,
+                SUM(CASE WHEN c.status = 'rate_limited' THEN 1 ELSE 0 END) AS rate_limited_calls,
+                SUM(CASE WHEN c.status IN ('error', 'overloaded') THEN 1 ELSE 0 END) AS error_calls,
+                -- A run with a call still open has not finished spending, so
+                -- its total is a running tally rather than a result.
+                SUM(CASE WHEN c.status = 'in_flight' THEN 1 ELSE 0 END) AS in_flight_calls,
+                GROUP_CONCAT(DISTINCT c.model_name) AS models,
+                GROUP_CONCAT(DISTINCT c.provider) AS providers,
+                -- Ranked rather than alphabetical: when a merged run covers
+                -- several judged sessions, one success makes the attempt a
+                -- success. Both notes are carried so the one belonging to the
+                -- verdict that won can be shown beside it.
+                MAX(CASE v.verdict WHEN 'solved' THEN 2 WHEN 'failed' THEN 1 ELSE 0 END) AS verdict_rank,
+                MAX(CASE WHEN v.verdict = 'solved' THEN v.note END) AS solved_note,
+                MAX(CASE WHEN v.verdict = 'failed' THEN v.note END) AS failed_note
+             FROM call c
+             JOIN agents a ON a.id = c.agent_id
+             LEFT JOIN session_verdicts v
+                    ON v.agent_id = c.agent_id AND v.session_id = c.session_key
+             GROUP BY c.agent_id, c.run_key
+             ORDER BY total_cost ASC, agent_name ASC",
+            run_key = grouping.run_key_sql(),
+        ))
+        .bind(experiment_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let runs = rows.iter().map(|row| {
+            let verdict = match row.get::<Option<i64>, _>("verdict_rank").unwrap_or(0) {
+                2 => Some(VERDICT_SOLVED),
+                1 => Some(VERDICT_FAILED),
+                _ => None,
+            };
+            json!({
+                "agent_name": row.get::<String, _>("agent_name"),
+                "session_key": row.get::<String, _>("session_key"),
+                "session_id": row.get::<Option<String>, _>("session_id"),
+                "sessions": row.get::<i64, _>("sessions"),
+                "call_count": row.get::<i64, _>("call_count"),
+                "first_seen": row.get::<Option<String>, _>("first_seen"),
+                "last_seen": row.get::<Option<String>, _>("last_seen"),
+                "wall_clock_seconds": row.get::<Option<i64>, _>("wall_clock_seconds").unwrap_or(0),
+                "input_tokens": row.get::<Option<i64>, _>("input_tokens").unwrap_or(0),
+                "output_tokens": row.get::<Option<i64>, _>("output_tokens").unwrap_or(0),
+                "cache_read_tokens": row.get::<Option<i64>, _>("cache_read_tokens").unwrap_or(0),
+                "tool_calls": row.get::<Option<i64>, _>("tool_calls").unwrap_or(0),
+                "total_cost": row.get::<Option<f64>, _>("total_cost").unwrap_or(0.0),
+                "unpriced_calls": row.get::<Option<i64>, _>("unpriced_calls").unwrap_or(0),
+                "busy_ms": row.get::<Option<i64>, _>("busy_ms").unwrap_or(0),
+                "rate_limited_calls": row.get::<Option<i64>, _>("rate_limited_calls").unwrap_or(0),
+                "error_calls": row.get::<Option<i64>, _>("error_calls").unwrap_or(0),
+                "in_flight_calls": row.get::<Option<i64>, _>("in_flight_calls").unwrap_or(0),
+                "models": row.get::<Option<String>, _>("models"),
+                "providers": row.get::<Option<String>, _>("providers"),
+                "verdict": verdict,
+                "verdict_note": match verdict {
+                    Some(VERDICT_SOLVED) => row.get::<Option<String>, _>("solved_note"),
+                    Some(VERDICT_FAILED) => row.get::<Option<String>, _>("failed_note"),
+                    _ => None,
+                },
+            })
+        }).collect();
+
+        Ok(runs)
+    }
+
+    /// How each run's spend was distributed across the arc of the task,
+    /// in five equal slices of its calls.
+    ///
+    /// Worth its own view because the shape differs from the total: early
+    /// calls are context construction (input-heavy, the agent reading its
+    /// way in) and later ones are generation. Two runs that cost the same
+    /// can have entirely different shapes, and the shape is what says
+    /// *where* the money went.
+    ///
+    /// Five slices rather than raw calls so runs of different lengths line
+    /// up against each other. A run of fewer than five calls simply fills
+    /// fewer slices — NTILE gives it 1..n — rather than inventing empty ones.
+    pub async fn get_experiment_phases(&self, experiment_id: i64, grouping: RunGrouping) -> Result<Vec<Value>> {
+        let rows = sqlx::query(&format!(
+            "WITH call AS (
+                SELECT
+                    t.id,
+                    t.agent_id,
+                    {run_key} AS run_key,
+                    COALESCE(mm.prompt_tokens, 0) + COALESCE(mm.cache_creation_tokens, 0)
+                        + COALESCE(mm.cache_read_tokens, 0) AS input_tokens,
+                    COALESCE(mm.completion_tokens, 0) AS output_tokens,
+                    COALESCE(mm.cache_read_tokens, 0) AS cache_read_tokens,
+                    COALESCE(mm.tool_calls_count, 0) AS tool_calls,
+                    COALESCE(mm.cost_estimate, 0) AS cost
+                FROM tasks t
+                LEFT JOIN (
+                    SELECT task_id,
+                           MAX(prompt_tokens) AS prompt_tokens,
+                           MAX(completion_tokens) AS completion_tokens,
+                           MAX(cache_creation_tokens) AS cache_creation_tokens,
+                           MAX(cache_read_tokens) AS cache_read_tokens,
+                           MAX(tool_calls_count) AS tool_calls_count,
+                           MAX(cost_estimate) AS cost_estimate
+                    FROM metrics GROUP BY task_id
+                ) mm ON mm.task_id = t.id
+                WHERE t.experiment_id = ?
+             ),
+             phased AS (
+                SELECT
+                    call.*,
+                    NTILE(5) OVER (PARTITION BY agent_id, run_key ORDER BY id) AS phase
+                FROM call
+             )
+             SELECT
+                a.name AS agent_name,
+                p.run_key AS session_key,
+                p.phase AS phase,
+                COUNT(*) AS calls,
+                SUM(p.input_tokens) AS input_tokens,
+                SUM(p.output_tokens) AS output_tokens,
+                SUM(p.cache_read_tokens) AS cache_read_tokens,
+                SUM(p.tool_calls) AS tool_calls,
+                CAST(SUM(p.cost) AS REAL) AS cost
+             FROM phased p
+             JOIN agents a ON a.id = p.agent_id
+             GROUP BY p.agent_id, p.run_key, p.phase
+             ORDER BY agent_name, session_key, phase",
+            run_key = grouping.run_key_sql(),
+        ))
+        .bind(experiment_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let phases = rows.iter().map(|row| {
+            json!({
+                "agent_name": row.get::<String, _>("agent_name"),
+                "session_key": row.get::<String, _>("session_key"),
+                "phase": row.get::<i64, _>("phase"),
+                "calls": row.get::<i64, _>("calls"),
+                "input_tokens": row.get::<Option<i64>, _>("input_tokens").unwrap_or(0),
+                "output_tokens": row.get::<Option<i64>, _>("output_tokens").unwrap_or(0),
+                "cache_read_tokens": row.get::<Option<i64>, _>("cache_read_tokens").unwrap_or(0),
+                "tool_calls": row.get::<Option<i64>, _>("tool_calls").unwrap_or(0),
+                "cost": row.get::<Option<f64>, _>("cost").unwrap_or(0.0),
+            })
+        }).collect();
+
+        Ok(phases)
+    }
+
+    /// Which tools a run's spend went through, per run.
+    ///
+    /// A turn's tokens are split across the tool calls that turn made — a
+    /// turn calling `read_file` twice and `bash` once gives `read_file` two
+    /// thirds of it. That keeps the attributed total equal to what the turns
+    /// actually cost instead of counting a multi-tool turn once per tool.
+    ///
+    /// It is a simplification: the real price of a tool result is paid by
+    /// the *next* turn, which carries that result in its context. So read
+    /// these as "which tools this run leaned on", not as an exact ledger.
+    /// Turns that called no tool at all are not attributed to anything and
+    /// simply do not appear here.
+    pub async fn get_experiment_tool_usage(&self, experiment_id: i64, grouping: RunGrouping) -> Result<Vec<Value>> {
+        let rows = sqlx::query(&format!(
+            "WITH call AS (
+                SELECT
+                    t.id,
+                    t.agent_id,
+                    {run_key} AS run_key,
+                    COALESCE(mm.prompt_tokens, 0) + COALESCE(mm.cache_creation_tokens, 0)
+                        + COALESCE(mm.cache_read_tokens, 0) AS input_tokens,
+                    COALESCE(mm.completion_tokens, 0) AS output_tokens,
+                    COALESCE(mm.cost_estimate, 0) AS cost
+                FROM tasks t
+                LEFT JOIN (
+                    SELECT task_id,
+                           MAX(prompt_tokens) AS prompt_tokens,
+                           MAX(completion_tokens) AS completion_tokens,
+                           MAX(cache_creation_tokens) AS cache_creation_tokens,
+                           MAX(cache_read_tokens) AS cache_read_tokens,
+                           MAX(cost_estimate) AS cost_estimate
+                    FROM metrics GROUP BY task_id
+                ) mm ON mm.task_id = t.id
+                WHERE t.experiment_id = ?
+             ),
+             turn_total AS (
+                SELECT task_id, SUM(call_count) AS tools_in_turn
+                FROM task_tools GROUP BY task_id
+             )
+             SELECT
+                a.name AS agent_name,
+                c.run_key AS session_key,
+                tt.tool_name AS tool_name,
+                SUM(tt.call_count) AS call_count,
+                SUM(c.input_tokens * tt.call_count / CAST(turn_total.tools_in_turn AS REAL)) AS input_tokens,
+                SUM(c.output_tokens * tt.call_count / CAST(turn_total.tools_in_turn AS REAL)) AS output_tokens,
+                CAST(SUM(c.cost * tt.call_count / CAST(turn_total.tools_in_turn AS REAL)) AS REAL) AS cost
+             FROM call c
+             JOIN task_tools tt ON tt.task_id = c.id
+             JOIN turn_total ON turn_total.task_id = c.id
+             JOIN agents a ON a.id = c.agent_id
+             GROUP BY c.agent_id, c.run_key, tt.tool_name
+             ORDER BY agent_name, session_key, input_tokens DESC",
+            run_key = grouping.run_key_sql(),
+        ))
+        .bind(experiment_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let tools = rows.iter().map(|row| {
+            json!({
+                "agent_name": row.get::<String, _>("agent_name"),
+                "session_key": row.get::<String, _>("session_key"),
+                "tool_name": row.get::<String, _>("tool_name"),
+                "call_count": row.get::<i64, _>("call_count"),
+                "input_tokens": row.get::<Option<f64>, _>("input_tokens").unwrap_or(0.0).round() as i64,
+                "output_tokens": row.get::<Option<f64>, _>("output_tokens").unwrap_or(0.0).round() as i64,
+                "cost": row.get::<Option<f64>, _>("cost").unwrap_or(0.0),
+            })
+        }).collect();
+
+        Ok(tools)
+    }
+
+    /// The same judgement as `set_session_verdict`, applied to every session
+    /// one agent has under an experiment.
+    ///
+    /// This is what marking a merged run means: with `RunGrouping::Agent` the
+    /// row on screen has no single session behind it, so the verdict lands on
+    /// all of them. Reading it back the other way round still agrees —
+    /// `get_experiment_comparison` resolves a merged run to the best verdict
+    /// among its sessions.
+    ///
+    /// Returns false when the agent has no calls in that experiment, so a
+    /// stale row can't silently write nothing.
+    pub async fn set_experiment_verdict(
+        &self,
+        agent_name: &str,
+        experiment_id: i64,
+        verdict: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        let sessions: Vec<String> = sqlx::query(
+            "SELECT DISTINCT COALESCE(t.session_id, '') AS session_key
+             FROM tasks t
+             JOIN agents a ON a.id = t.agent_id
+             WHERE a.name = ? AND t.experiment_id = ?"
+        )
+        .bind(agent_name)
+        .bind(experiment_id)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|row| row.get::<String, _>("session_key"))
+        .collect();
+
+        if sessions.is_empty() {
+            return Ok(false);
+        }
+
+        for session in sessions {
+            self.set_session_verdict(agent_name, Some(&session), verdict, note).await?;
+        }
+
+        Ok(true)
+    }
+
+    /// Records whether a run actually solved the task it was given.
+    ///
+    /// The proxy can measure what a run *cost* but not whether it was any
+    /// good — nothing in the traffic says the patch compiles. That judgement
+    /// is a human's, and without it "cheapest" would crown whichever agent
+    /// gave up first.
+    ///
+    /// A `verdict` of `None` clears a previous call, so a misclick is
+    /// undoable. Returns `false` if no agent by that name exists, which the
+    /// caller turns into a 404 rather than inventing an agent from a typo.
+    pub async fn set_session_verdict(
+        &self,
+        agent_name: &str,
+        session_id: Option<&str>,
+        verdict: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        let agent_id: Option<i64> = sqlx::query("SELECT id FROM agents WHERE name = ?")
+            .bind(agent_name)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| row.get(0));
+
+        let agent_id = match agent_id {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let session_key = session_id.unwrap_or("");
+
+        match verdict {
+            Some(verdict) => {
+                sqlx::query(
+                    "INSERT INTO session_verdicts (agent_id, session_id, verdict, note)
+                     VALUES (?, ?, ?, ?)
+                     ON CONFLICT(agent_id, session_id) DO UPDATE SET
+                        verdict = excluded.verdict,
+                        note = excluded.note,
+                        updated_at = CURRENT_TIMESTAMP"
+                )
+                .bind(agent_id)
+                .bind(session_key)
+                .bind(verdict)
+                .bind(note)
+                .execute(&self.pool)
+                .await?;
+            }
+            None => {
+                sqlx::query("DELETE FROM session_verdicts WHERE agent_id = ? AND session_id = ?")
+                    .bind(agent_id)
+                    .bind(session_key)
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+
+        Ok(true)
     }
 
     /// One row per task, aggregated across its metric rows (a streaming task
@@ -1141,5 +1648,508 @@ mod tests {
         assert_eq!(traffic["agent_question_text"], "Which file?");
 
         Ok(())
+    }
+
+    /// One completed call by `agent` in `session`, attributed to `experiment`.
+    async fn seed_run_call(
+        db: &Database,
+        experiment_id: i64,
+        agent: &str,
+        session: &str,
+        cost: Option<f64>,
+    ) -> Result<i64> {
+        let agent_id = db.get_or_create_agent(agent).await?;
+        let task_id = db.create_task(
+            agent_id,
+            Some(experiment_id),
+            None,
+            Some(session.to_string()),
+            Some("gpt-4o".to_string()),
+            Some("openai".to_string()),
+        ).await?;
+        db.log_metric(task_id, 1000, 200, 0, 500, 2, 300, cost).await?;
+        db.finish_task(task_id, &ok_outcome("stop", false)).await?;
+        Ok(task_id)
+    }
+
+    #[tokio::test]
+    async fn comparison_folds_an_experiment_into_one_row_per_agent_and_session() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+
+        // Two calls from one agent, one from the other: the run is the unit,
+        // not the call, so this must come back as two rows.
+        seed_run_call(&db, experiment_id, "kilo", "run-a", Some(0.10)).await?;
+        seed_run_call(&db, experiment_id, "kilo", "run-a", Some(0.05)).await?;
+        seed_run_call(&db, experiment_id, "opencode", "run-b", Some(0.40)).await?;
+
+        let runs = db.get_experiment_comparison(experiment_id, RunGrouping::Session).await?;
+        assert_eq!(runs.len(), 2);
+
+        // Cheapest first.
+        assert_eq!(runs[0]["agent_name"], "kilo");
+        assert_eq!(runs[0]["call_count"], 2);
+        assert!((runs[0]["total_cost"].as_f64().unwrap() - 0.15).abs() < 1e-9);
+        assert_eq!(runs[0]["input_tokens"], 3000);
+        assert_eq!(runs[0]["output_tokens"], 400);
+        assert_eq!(runs[0]["cache_read_tokens"], 1000);
+        assert_eq!(runs[0]["tool_calls"], 4);
+        assert_eq!(runs[0]["unpriced_calls"], 0);
+        assert_eq!(runs[0]["models"], "gpt-4o");
+
+        assert_eq!(runs[1]["agent_name"], "opencode");
+        assert_eq!(runs[1]["total_cost"], 0.4);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn comparison_ignores_calls_from_other_experiments() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let mine = db.get_or_create_experiment("issue-1284", None).await?;
+        let theirs = db.get_or_create_experiment("issue-9000", None).await?;
+
+        seed_run_call(&db, mine, "kilo", "run-a", Some(0.10)).await?;
+        seed_run_call(&db, theirs, "kilo", "run-c", Some(0.90)).await?;
+
+        let runs = db.get_experiment_comparison(mine, RunGrouping::Session).await?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["session_id"], "run-a");
+
+        Ok(())
+    }
+
+    /// A run on a model missing from `pricing.yaml` totals $0.00, which would
+    /// otherwise read as "free" and win. The count of unpriced calls is what
+    /// lets the UI say "unknown" instead.
+    #[tokio::test]
+    async fn comparison_counts_unpriced_calls_rather_than_treating_them_as_free() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+
+        seed_run_call(&db, experiment_id, "kilo", "run-a", None).await?;
+        seed_run_call(&db, experiment_id, "kilo", "run-a", Some(0.20)).await?;
+
+        let runs = db.get_experiment_comparison(experiment_id, RunGrouping::Session).await?;
+        assert_eq!(runs[0]["unpriced_calls"], 1);
+        assert_eq!(runs[0]["total_cost"], 0.2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn comparison_surfaces_failed_calls_per_run() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        let agent_id = db.get_or_create_agent("cursor").await?;
+
+        let task_id = db.create_task(agent_id, Some(experiment_id), None,
+            Some("run-a".to_string()), None, Some("openai".to_string())).await?;
+        db.finish_task(task_id, &TaskOutcome {
+            status: session_state::STATUS_RATE_LIMITED.to_string(),
+            http_status: Some(429),
+            ..Default::default()
+        }).await?;
+
+        let runs = db.get_experiment_comparison(experiment_id, RunGrouping::Session).await?;
+        assert_eq!(runs[0]["rate_limited_calls"], 1);
+        assert_eq!(runs[0]["error_calls"], 0);
+        // No metric row at all, so nothing was priced.
+        assert_eq!(runs[0]["unpriced_calls"], 1);
+
+        Ok(())
+    }
+
+    /// A run still mid-call has not finished spending; its total is a running
+    /// tally, and the comparison has to be able to say so.
+    #[tokio::test]
+    async fn comparison_flags_a_run_that_is_still_in_flight() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        let agent_id = db.get_or_create_agent("kilo").await?;
+
+        seed_run_call(&db, experiment_id, "kilo", "run-a", Some(0.10)).await?;
+        db.create_task(agent_id, Some(experiment_id), None, Some("run-a".to_string()), None, None).await?;
+
+        let runs = db.get_experiment_comparison(experiment_id, RunGrouping::Session).await?;
+        assert_eq!(runs[0]["in_flight_calls"], 1);
+        assert_eq!(runs[0]["call_count"], 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_verdict_attaches_to_its_run_and_can_be_cleared() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        seed_run_call(&db, experiment_id, "kilo", "run-a", Some(0.10)).await?;
+        seed_run_call(&db, experiment_id, "opencode", "run-b", Some(0.40)).await?;
+
+        assert!(db.set_session_verdict("kilo", Some("run-a"), Some(VERDICT_SOLVED), Some("tests pass")).await?);
+
+        let runs = db.get_experiment_comparison(experiment_id, RunGrouping::Session).await?;
+        assert_eq!(runs[0]["verdict"], "solved");
+        assert_eq!(runs[0]["verdict_note"], "tests pass");
+        // The other run is untouched — a verdict is per run, not per agent.
+        assert_eq!(runs[1]["verdict"], Value::Null);
+
+        // Re-marking overwrites rather than erroring on the primary key.
+        assert!(db.set_session_verdict("kilo", Some("run-a"), Some(VERDICT_FAILED), None).await?);
+        let runs = db.get_experiment_comparison(experiment_id, RunGrouping::Session).await?;
+        assert_eq!(runs[0]["verdict"], "failed");
+        assert_eq!(runs[0]["verdict_note"], Value::Null);
+
+        assert!(db.set_session_verdict("kilo", Some("run-a"), None, None).await?);
+        let runs = db.get_experiment_comparison(experiment_id, RunGrouping::Session).await?;
+        assert_eq!(runs[0]["verdict"], Value::Null);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_verdict_for_an_unknown_agent_is_rejected_rather_than_inventing_one() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+
+        assert!(!db.set_session_verdict("typo", Some("run-a"), Some(VERDICT_SOLVED), None).await?);
+        let agents: i64 = sqlx::query("SELECT COUNT(*) FROM agents")
+            .fetch_one(&db.pool).await?.get(0);
+        assert_eq!(agents, 0);
+
+        Ok(())
+    }
+
+    /// Calls sent without an `X-Session-ID` land in one bucket keyed by '',
+    /// and a verdict has to be able to name that bucket too.
+    #[tokio::test]
+    async fn a_run_with_no_session_id_still_takes_a_verdict() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        let agent_id = db.get_or_create_agent("kilo").await?;
+        let task_id = db.create_task(agent_id, Some(experiment_id), None, None, None, None).await?;
+        db.log_metric(task_id, 10, 20, 0, 0, 0, 100, Some(0.01)).await?;
+
+        assert!(db.set_session_verdict("kilo", None, Some(VERDICT_SOLVED), None).await?);
+
+        let runs = db.get_experiment_comparison(experiment_id, RunGrouping::Session).await?;
+        assert_eq!(runs[0]["session_id"], Value::Null);
+        assert_eq!(runs[0]["session_key"], "");
+        assert_eq!(runs[0]["verdict"], "solved");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phases_split_a_run_into_five_slices_of_its_calls() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+
+        // Ten calls: two per slice. Output climbs while input falls, the
+        // shape the phase view exists to show.
+        let agent_id = db.get_or_create_agent("kilo").await?;
+        for i in 0..10 {
+            let task_id = db.create_task(agent_id, Some(experiment_id), None,
+                Some("run-a".to_string()), None, None).await?;
+            db.log_metric(task_id, 1000 - i * 100, 100 + i * 100, 0, 0, 1, 100, Some(0.01)).await?;
+        }
+
+        let phases = db.get_experiment_phases(experiment_id, RunGrouping::Session).await?;
+        assert_eq!(phases.len(), 5);
+        assert_eq!(phases[0]["phase"], 1);
+        assert_eq!(phases[0]["calls"], 2);
+        assert_eq!(phases[4]["phase"], 5);
+
+        // Input-heavy at the start, output-heavy at the end.
+        let first_in = phases[0]["input_tokens"].as_i64().unwrap();
+        let first_out = phases[0]["output_tokens"].as_i64().unwrap();
+        let last_in = phases[4]["input_tokens"].as_i64().unwrap();
+        let last_out = phases[4]["output_tokens"].as_i64().unwrap();
+        assert!(first_in > first_out);
+        assert!(last_out > last_in);
+
+        Ok(())
+    }
+
+    /// A short run must fill fewer slices rather than have empty ones
+    /// invented for it — three calls is three phases, not five.
+    #[tokio::test]
+    async fn a_run_shorter_than_five_calls_fills_fewer_phases() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        for _ in 0..3 {
+            seed_run_call(&db, experiment_id, "kilo", "run-a", Some(0.01)).await?;
+        }
+
+        let phases = db.get_experiment_phases(experiment_id, RunGrouping::Session).await?;
+        assert_eq!(phases.len(), 3);
+        assert_eq!(phases.iter().map(|p| p["phase"].as_i64().unwrap()).collect::<Vec<_>>(), vec![1, 2, 3]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phases_are_computed_per_run_not_across_the_experiment() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        for _ in 0..5 {
+            seed_run_call(&db, experiment_id, "kilo", "run-a", Some(0.01)).await?;
+            seed_run_call(&db, experiment_id, "opencode", "run-b", Some(0.01)).await?;
+        }
+
+        let phases = db.get_experiment_phases(experiment_id, RunGrouping::Session).await?;
+        // Five slices each, not five shared between them.
+        assert_eq!(phases.len(), 10);
+        assert_eq!(phases.iter().filter(|p| p["agent_name"] == "kilo").count(), 5);
+        assert_eq!(phases.iter().filter(|p| p["agent_name"] == "opencode").count(), 5);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_calls_are_deduplicated_into_counts() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let agent_id = db.get_or_create_agent("kilo").await?;
+        let task_id = db.create_task(agent_id, None, None, None, None, None).await?;
+
+        db.save_tool_calls(task_id, &[
+            "read_file".to_string(), "bash".to_string(), "read_file".to_string(),
+        ]).await?;
+
+        let rows: Vec<(String, i64)> = sqlx::query(
+            "SELECT tool_name, call_count FROM task_tools WHERE task_id = ? ORDER BY tool_name"
+        )
+        .bind(task_id)
+        .fetch_all(&db.pool).await?
+        .iter().map(|r| (r.get("tool_name"), r.get("call_count"))).collect();
+
+        assert_eq!(rows, vec![("bash".to_string(), 1), ("read_file".to_string(), 2)]);
+
+        // Re-saving the same turn replaces rather than doubling — a retry of
+        // the write must not inflate the attribution.
+        db.save_tool_calls(task_id, &["read_file".to_string(), "read_file".to_string()]).await?;
+        let count: i64 = sqlx::query("SELECT call_count FROM task_tools WHERE task_id = ? AND tool_name = 'read_file'")
+            .bind(task_id).fetch_one(&db.pool).await?.get(0);
+        assert_eq!(count, 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_usage_splits_a_turn_across_the_tools_it_called() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        let agent_id = db.get_or_create_agent("kilo").await?;
+
+        // One turn, 900 input tokens, three tool calls: two read_file, one bash.
+        let task_id = db.create_task(agent_id, Some(experiment_id), None,
+            Some("run-a".to_string()), None, None).await?;
+        db.log_metric(task_id, 900, 90, 0, 0, 3, 100, Some(0.09)).await?;
+        db.save_tool_calls(task_id, &[
+            "read_file".to_string(), "read_file".to_string(), "bash".to_string(),
+        ]).await?;
+
+        let tools = db.get_experiment_tool_usage(experiment_id, RunGrouping::Session).await?;
+        assert_eq!(tools.len(), 2);
+
+        // Ordered by input tokens, so the two-thirds share comes first.
+        assert_eq!(tools[0]["tool_name"], "read_file");
+        assert_eq!(tools[0]["call_count"], 2);
+        assert_eq!(tools[0]["input_tokens"], 600);
+        assert_eq!(tools[1]["tool_name"], "bash");
+        assert_eq!(tools[1]["input_tokens"], 300);
+
+        // The split is exhaustive: nothing is counted twice, nothing lost.
+        let attributed: i64 = tools.iter().map(|t| t["input_tokens"].as_i64().unwrap()).sum();
+        assert_eq!(attributed, 900);
+
+        Ok(())
+    }
+
+    /// A turn that called no tool is attributed to nothing rather than
+    /// smeared over whichever tools the run used elsewhere.
+    #[tokio::test]
+    async fn tool_usage_ignores_turns_with_no_tool_calls() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        let agent_id = db.get_or_create_agent("kilo").await?;
+
+        let with_tool = db.create_task(agent_id, Some(experiment_id), None,
+            Some("run-a".to_string()), None, None).await?;
+        db.log_metric(with_tool, 100, 10, 0, 0, 1, 100, Some(0.01)).await?;
+        db.save_tool_calls(with_tool, &["bash".to_string()]).await?;
+
+        let no_tool = db.create_task(agent_id, Some(experiment_id), None,
+            Some("run-a".to_string()), None, None).await?;
+        db.log_metric(no_tool, 9999, 999, 0, 0, 0, 100, Some(9.99)).await?;
+
+        let tools = db.get_experiment_tool_usage(experiment_id, RunGrouping::Session).await?;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["input_tokens"], 100);
+
+        Ok(())
+    }
+
+    /// The case that motivates `RunGrouping::Agent`: an agent that mints a
+    /// fresh session id per session turns one attempt into a row per
+    /// fragment, and per-session the cheapest fragment reads as the whole run.
+    #[tokio::test]
+    async fn agent_grouping_merges_sessions_the_agent_split_by_itself() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+
+        // One attempt, three session ids, because the agent restarted twice.
+        for session in ["kilo-s1", "kilo-s2", "kilo-s3"] {
+            seed_run_call(&db, experiment_id, "kilo", session, Some(0.10)).await?;
+        }
+        seed_run_call(&db, experiment_id, "opencode", "oc-1", Some(0.25)).await?;
+
+        let per_session = db.get_experiment_comparison(experiment_id, RunGrouping::Session).await?;
+        assert_eq!(per_session.len(), 4);
+        // Each fragment reads as a $0.10 run, none of which is the attempt.
+        assert!((per_session[0]["total_cost"].as_f64().unwrap() - 0.10).abs() < 1e-9);
+
+        let per_agent = db.get_experiment_comparison(experiment_id, RunGrouping::Agent).await?;
+        assert_eq!(per_agent.len(), 2);
+
+        let kilo = per_agent.iter().find(|r| r["agent_name"] == "kilo").unwrap();
+        assert_eq!(kilo["sessions"], 3);
+        assert_eq!(kilo["call_count"], 3);
+        assert!((kilo["total_cost"].as_f64().unwrap() - 0.30).abs() < 1e-9);
+        // A merged run spans many session ids, so it reports none as its own.
+        assert_eq!(kilo["session_id"], Value::Null);
+        assert_eq!(kilo["session_key"], "");
+
+        // …but an agent with only one session keeps the id it does have.
+        let opencode = per_agent.iter().find(|r| r["agent_name"] == "opencode").unwrap();
+        assert_eq!(opencode["sessions"], 1);
+        assert_eq!(opencode["session_id"], "oc-1");
+
+        // Merged, kilo is the dearer of the two — the opposite of what the
+        // per-session view said.
+        assert_eq!(per_agent[0]["agent_name"], "opencode");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_merged_run_counts_as_solved_when_any_of_its_sessions_did() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        seed_run_call(&db, experiment_id, "kilo", "kilo-s1", Some(0.10)).await?;
+        seed_run_call(&db, experiment_id, "kilo", "kilo-s2", Some(0.10)).await?;
+
+        // The agent gave up in its first session and got there in the second.
+        db.set_session_verdict("kilo", Some("kilo-s1"), Some(VERDICT_FAILED), Some("wrong file")).await?;
+        db.set_session_verdict("kilo", Some("kilo-s2"), Some(VERDICT_SOLVED), Some("tests pass")).await?;
+
+        let merged = db.get_experiment_comparison(experiment_id, RunGrouping::Agent).await?;
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["verdict"], "solved");
+        // The note shown is the one belonging to the verdict that won.
+        assert_eq!(merged[0]["verdict_note"], "tests pass");
+        // …and the attempt is charged for both sessions.
+        assert!((merged[0]["total_cost"].as_f64().unwrap() - 0.20).abs() < 1e-9);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn judging_a_merged_run_marks_every_session_under_it() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        for session in ["kilo-s1", "kilo-s2"] {
+            seed_run_call(&db, experiment_id, "kilo", session, Some(0.10)).await?;
+        }
+        // Another experiment's session by the same agent must be left alone.
+        let other = db.get_or_create_experiment("issue-9000", None).await?;
+        seed_run_call(&db, other, "kilo", "kilo-elsewhere", Some(0.10)).await?;
+
+        assert!(db.set_experiment_verdict("kilo", experiment_id, Some(VERDICT_SOLVED), None).await?);
+
+        let per_session = db.get_experiment_comparison(experiment_id, RunGrouping::Session).await?;
+        assert_eq!(per_session.len(), 2);
+        assert!(per_session.iter().all(|r| r["verdict"] == "solved"));
+
+        let elsewhere = db.get_experiment_comparison(other, RunGrouping::Session).await?;
+        assert_eq!(elsewhere[0]["verdict"], Value::Null);
+
+        // Clearing works the same way round.
+        assert!(db.set_experiment_verdict("kilo", experiment_id, None, None).await?);
+        let cleared = db.get_experiment_comparison(experiment_id, RunGrouping::Session).await?;
+        assert!(cleared.iter().all(|r| r["verdict"] == Value::Null));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn judging_a_merged_run_for_an_agent_with_no_calls_here_is_rejected() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        db.get_or_create_agent("kilo").await?;
+
+        assert!(!db.set_experiment_verdict("kilo", experiment_id, Some(VERDICT_SOLVED), None).await?);
+
+        Ok(())
+    }
+
+    /// The phase arc must be cut across the whole merged attempt, not
+    /// restarted per fragment — five slices of the run, however many session
+    /// ids the agent happened to mint along the way.
+    #[tokio::test]
+    async fn agent_grouping_slices_phases_across_the_whole_attempt() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        for session in ["s1", "s2", "s3"] {
+            for _ in 0..4 {
+                seed_run_call(&db, experiment_id, "kilo", session, Some(0.01)).await?;
+            }
+        }
+
+        let per_session = db.get_experiment_phases(experiment_id, RunGrouping::Session).await?;
+        // Three fragments, four calls each: 4 slices apiece.
+        assert_eq!(per_session.len(), 12);
+
+        let merged = db.get_experiment_phases(experiment_id, RunGrouping::Agent).await?;
+        assert_eq!(merged.len(), 5);
+        assert_eq!(merged.iter().map(|p| p["calls"].as_i64().unwrap()).sum::<i64>(), 12);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_grouping_pools_tool_usage_across_the_attempt() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        let agent_id = db.get_or_create_agent("kilo").await?;
+
+        for session in ["s1", "s2"] {
+            let task_id = db.create_task(agent_id, Some(experiment_id), None,
+                Some(session.to_string()), None, None).await?;
+            db.log_metric(task_id, 100, 10, 0, 0, 1, 100, Some(0.01)).await?;
+            db.save_tool_calls(task_id, &["read_file".to_string()]).await?;
+        }
+
+        let merged = db.get_experiment_tool_usage(experiment_id, RunGrouping::Agent).await?;
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["call_count"], 2);
+        assert_eq!(merged[0]["input_tokens"], 200);
+
+        Ok(())
+    }
+
+    #[test]
+    fn run_grouping_defaults_to_the_narrower_per_session_reading() {
+        assert_eq!(RunGrouping::parse(Some("agent")), RunGrouping::Agent);
+        assert_eq!(RunGrouping::parse(Some("session")), RunGrouping::Session);
+        assert_eq!(RunGrouping::parse(None), RunGrouping::Session);
+        // Never silently merges attempts on a value it doesn't recognise.
+        assert_eq!(RunGrouping::parse(Some("nonsense")), RunGrouping::Session);
+    }
+
+    #[test]
+    fn only_the_two_known_verdicts_are_accepted() {
+        assert!(is_valid_verdict(VERDICT_SOLVED));
+        assert!(is_valid_verdict(VERDICT_FAILED));
+        assert!(!is_valid_verdict("maybe"));
+        assert!(!is_valid_verdict(""));
     }
 }

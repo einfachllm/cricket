@@ -51,6 +51,86 @@ export interface SessionSummary {
   tokens_limit: number | null;
 }
 
+/// Whether a run actually solved what it was given. Nothing in the proxied
+/// traffic can answer this, so it comes from whoever read the diff — see
+/// `set_session_verdict` in the backend for why the comparison needs it.
+export type Verdict = 'solved' | 'failed';
+
+/// What counts as one *run*. `session` trusts the agent's `X-Session-ID` to
+/// mark one attempt — right when it is stable for the length of a task, and
+/// the only way to compare several deliberate repeats side by side. `agent`
+/// treats everything one agent did under the experiment as a single run, for
+/// agents that mint a fresh session id per session rather than per task.
+export type RunGrouping = 'session' | 'agent';
+
+/// One *run* folded down from its calls — see `RunGrouping` for what a run
+/// is. The unit the experiment comparison ranks on.
+export interface RunComparison {
+  agent_name: string;
+  /// Identifies the run within its agent: the session id under `session`
+  /// grouping, `''` under `agent` grouping and for calls sent without one.
+  session_key: string;
+  /// Null for a merged run, which spans more than one session id.
+  session_id: string | null;
+  /// How many distinct session ids the run covers. Above one under `agent`
+  /// grouping means the agent split the attempt by itself.
+  sessions: number;
+  call_count: number;
+  first_seen: string | null;
+  last_seen: string | null;
+  wall_clock_seconds: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  tool_calls: number;
+  total_cost: number;
+  unpriced_calls: number;
+  busy_ms: number;
+  rate_limited_calls: number;
+  error_calls: number;
+  /// Calls still open. Non-zero means the run is still spending, so its
+  /// total is a running tally rather than a result.
+  in_flight_calls: number;
+  /// Comma-separated, since a run may switch models mid-task.
+  models: string | null;
+  providers: string | null;
+  verdict: Verdict | null;
+  verdict_note: string | null;
+}
+
+/// One of the five equal slices a run's calls are cut into, so runs of
+/// different lengths line up against each other. `phase` is 1-based; a run
+/// with fewer than five calls fills fewer slices rather than gaining empty
+/// ones.
+export interface PhaseSlice {
+  agent_name: string;
+  session_key: string;
+  phase: number;
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  tool_calls: number;
+  cost: number;
+}
+
+/// One tool's share of a run's spend. Tokens are the turn's totals split
+/// across the tools that turn called — see `get_experiment_tool_usage`.
+export interface ToolUsage {
+  agent_name: string;
+  session_key: string;
+  tool_name: string;
+  call_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost: number;
+}
+
+export interface ExperimentBreakdown {
+  phases: PhaseSlice[];
+  tools: ToolUsage[];
+}
+
 export interface ProviderLimits {
   provider: string | null;
   requests_limit: number | null;
@@ -72,6 +152,26 @@ export async function fetchJson<T>(path: string, init?: RequestInit): Promise<T>
     throw new Error(`${path} responded ${response.status}`);
   }
   return response.json() as Promise<T>;
+}
+
+/// Marks (or, with `verdict: null`, un-marks) whether a run solved its task.
+///
+/// A merged run has no single session behind it, so it is judged by
+/// experiment instead and the verdict lands on every session under it.
+export async function setVerdict(
+  run: Pick<RunComparison, 'agent_name' | 'session_id'>,
+  verdict: Verdict | null,
+  scope: { grouping: RunGrouping; experimentId: string },
+): Promise<void> {
+  const target = scope.grouping === 'agent'
+    ? { experiment_id: Number(scope.experimentId) }
+    : { session_id: run.session_id };
+
+  await fetchJson<{ ok: boolean }>('/v1/analytics/sessions/verdict', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agent_name: run.agent_name, ...target, verdict }),
+  });
 }
 
 /// Coarse, glanceable durations — the frontend twin of the backend's

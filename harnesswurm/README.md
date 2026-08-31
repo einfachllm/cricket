@@ -24,6 +24,9 @@ Anthropic-compatible agents.
 - **Multi-Agent Support**: Uses headers to distinguish between different
   agents, sessions, and experiments, so you can compare configurations (e.g.
   the same task with and without a skill enabled) side by side.
+- **Run comparison**: Two agents on the same issue, folded to one row each and
+  ranked on what solving it actually cost. See [Comparing two agents on the
+  same task](#comparing-two-agents-on-the-same-task).
 
 ## Setup
 
@@ -131,6 +134,12 @@ tool, waiting for you, rate limited, auth failed, idle, plus provider quota
 bars. `--clear` removes them again — demo rows are prefixed `demo-` and are
 never confused with real captured traffic.
 
+It also seeds one experiment, `demo-issue-1284`, with four runs across three
+agents — visible under Analytics. It is arranged so that spend alone gives the
+wrong answer: the cheapest run is the one that gave up. Its turns carry a real
+token arc and per-turn tool calls, so the phase and tool breakdowns have
+something to show.
+
 Seed *after* the app is running: it closes out open calls on startup, so a
 seeded "Thinking" session would otherwise be reaped to *Interrupted* — which
 is itself the reaper working correctly.
@@ -211,9 +220,105 @@ Two caveats worth knowing:
 Calls left open by a killed process are closed out as *Interrupted* on the
 next startup, so nothing shows as permanently "Thinking".
 
+## Comparing two agents on the same task
+
+Point both agents at the proxy with the **same** `X-Experiment-ID` and a
+different `X-Agent-ID` / `X-Session-ID`:
+
+```bash
+# terminal 1
+X-Agent-ID: kilo         X-Session-ID: issue-1284-kilo    X-Experiment-ID: issue-1284
+# terminal 2
+X-Agent-ID: claude-code  X-Session-ID: issue-1284-claude  X-Experiment-ID: issue-1284
+```
+
+Open **Analytics → the experiment**. Each agent+session becomes one *run*, and
+the table shows what each spent, in tokens, calls, tool calls and wall clock.
+
+### What counts as one run
+
+`X-Session-ID` does not mean the same thing to every agent, so the comparison
+lets you say which it is:
+
+- **Per session** (default) — one run per session id. Right when that id is
+  stable for the length of a task, and the only way to sit several deliberate
+  repeats of the same task side by side, which is what taking more than one
+  sample needs.
+- **Per agent** — everything one agent did under the experiment is a single
+  run. Right for agents that mint a fresh session id per *session* rather than
+  per task: a restart, a context compaction, reopening the editor. Per-session
+  those shatter one attempt into a row per fragment, and the cheapest fragment
+  gets crowned.
+
+The view spots the second case for you: if an agent has more than one run in an
+experiment it says so and offers the switch, rather than leaving you to notice.
+Merging changes the unit everywhere — the ranking, the roll-up, the phase
+slices and the tool split all recount. Verdicts stay attached to real sessions
+underneath, so a merged run counts as solved when any of its sessions did, and
+judging a merged run marks every session under it.
+
+Both are also available on the API as `?group=session` (default) or
+`?group=agent`.
+
+### Cost alone answers the wrong question
+
+The proxy sees what a run cost. It cannot see whether the diff works — so
+ranking on spend rewards the agent that gave up after two calls, which is
+reliably the cheapest run of a hard task. Mark each run **Solved** or
+**Failed** yourself (the toggle in the table); only solved runs are ranked,
+and until at least one is marked, the view declines to name a winner.
+
+Three further things the headline number would otherwise hide:
+
+- **Unpriced models.** A model with no entry in `pricing.yaml` contributes
+  $0.00, so a run that touched one shows as `≥ $x` and is kept out of the
+  ranking rather than winning on an understated total.
+- **Runs still going.** A run with a call still open shows `$x so far` and is
+  not ranked against runs that have finished spending.
+- **One run each is a sample size of one.** The **Per agent** roll-up divides
+  everything an agent spent by the runs it solved, so an agent that lands one
+  attempt in three is charged for all three. Run the same task a few times per
+  agent and that number, not the cheapest single run, is the one to trust.
+
+### Where the money went
+
+Under the comparison, each run is broken down two ways — both computable only
+because the proxy sees the traffic, not just what an agent chose to log:
+
+- **Across the arc of the task.** A run's calls are cut into five slices of
+  equal length, and each slice is split into the three things billed at
+  different rates: input read fresh, input served from cache (an order of
+  magnitude cheaper), and tokens generated. Early slices are the agent reading
+  its way in; later ones are generation. Two runs that cost the same can have
+  completely different shapes, and the shape says *where* the money went.
+  Panels are scaled to their own peak — compare shapes here, totals above. A
+  run of fewer than five calls fills fewer slices rather than gaining empty
+  ones.
+- **Through which tools.** A turn's tokens are split across the tool calls that
+  turn made, so a turn calling `read_file` twice and `bash` once gives
+  `read_file` two thirds of it. Turns that called no tool are attributed to
+  nothing.
+
+Two honest limits: the real price of a tool's result is paid by the *next*
+turn, which carries that result in its context, so read the tool split as what
+a run leaned on rather than an exact ledger; and tool names are recorded as
+calls are proxied, so traffic captured before this existed shows no tools.
+
 ### Analytics API
 - `GET /v1/analytics/experiments` — list experiments.
 - `GET /v1/analytics/experiments/:id/metrics` — metrics for one experiment, over time.
+- `GET /v1/analytics/experiments/:id/comparison[?group=session|agent]` — one
+  row per run in the experiment: totals for cost, tokens, cache reads, tool
+  calls, wall clock, failed/rate-limited/still-open calls, how many session ids
+  the run covers, and the verdict.
+- `GET /v1/analytics/experiments/:id/breakdown[?group=session|agent]` — `{ phases, tools }`: each
+  run's five phase slices (tokens, cache reads, tool calls, cost per slice) and
+  its spend attributed per tool.
+- `PUT /v1/analytics/sessions/verdict` — mark a run solved or failed:
+  `{"agent_name": "kilo", "session_id": "issue-1284-kilo", "verdict": "solved", "note": "tests pass"}`.
+  Send `experiment_id` instead of `session_id` to judge a merged run, which
+  applies the verdict to every session that agent has in the experiment;
+  sending both is a 400. A `verdict` of `null` clears it.
 - `GET /v1/analytics/tasks` — most recent calls across all agents (model, provider, tokens, cache tokens, tool calls, latency, cost, call status, and a short preview of what was asked).
 - `GET /v1/analytics/tasks/:id/traffic` — the full raw request/response body for one call.
 - `GET /v1/analytics/sessions` — one row per agent+session: derived state, totals, spend, and the last question asked.
