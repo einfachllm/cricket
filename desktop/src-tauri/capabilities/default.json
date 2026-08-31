@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Baseline window/core permissions for the main window. The app talks to its embedded backend over plain HTTP fetch from the webview, not Tauri commands, so nothing beyond core defaults is granted here yet — add plugin permissions here if/when the frontend starts calling into Rust directly.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

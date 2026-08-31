@@ -1,13 +1,18 @@
 import React, { useEffect, useState } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, BarChart, Bar } from 'recharts';
-import { Activity, Database, TrendingUp, AlertCircle } from 'lucide-react';
+import { Activity, TrendingUp, AlertCircle, DollarSign } from 'lucide-react';
 
 interface MetricData {
   timestamp: string;
+  model_name: string | null;
+  provider: string | null;
   prompt_tokens: number;
   completion_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
   tool_calls_count: number;
   latency_ms: number;
+  cost_estimate: number | null;
 }
 
 interface Experiment {
@@ -56,11 +61,13 @@ const AnalyticsDashboard = () => {
   };
 
   const getSummary = () => {
-    if (metrics.length === 0) return { totalPrompt: 0, totalCompletion: 0, avgLatency: 0 };
-    const totalPrompt = metrics.reduce((sum, m) => sum + m.prompt_tokens, 0);
+    if (metrics.length === 0) return { totalPrompt: 0, totalCompletion: 0, avgLatency: 0, totalCost: 0, pricedCount: 0 };
+    const totalPrompt = metrics.reduce((sum, m) => sum + m.prompt_tokens + m.cache_creation_tokens + m.cache_read_tokens, 0);
     const totalCompletion = metrics.reduce((sum, m) => sum + m.completion_tokens, 0);
     const avgLatency = metrics.reduce((sum, m) => sum + m.latency_ms, 0) / metrics.length;
-    return { totalPrompt, totalCompletion, avgLatency };
+    const priced = metrics.filter((m) => m.cost_estimate !== null);
+    const totalCost = priced.reduce((sum, m) => sum + (m.cost_estimate ?? 0), 0);
+    return { totalPrompt, totalCompletion, avgLatency, totalCost, pricedCount: priced.length };
   };
 
   const summary = getSummary();
@@ -81,7 +88,7 @@ const AnalyticsDashboard = () => {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
         <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
           <p className="text-sm text-gray-500 uppercase font-semibold">Total Prompt Tokens</p>
           <p className="text-2xl font-bold text-gray-800">{summary.totalPrompt.toLocaleString()}</p>
@@ -89,6 +96,19 @@ const AnalyticsDashboard = () => {
         <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
           <p className="text-sm text-gray-500 uppercase font-semibold">Total Completion Tokens</p>
           <p className="text-2xl font-bold text-gray-800">{summary.totalCompletion.toLocaleString()}</p>
+        </div>
+        <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+          <p className="text-sm text-gray-500 uppercase font-semibold flex items-center gap-1">
+            <DollarSign size={14} /> Total Cost
+          </p>
+          <p className="text-2xl font-bold text-gray-800">
+            {summary.totalCost < 0.01 ? `$${summary.totalCost.toFixed(5)}` : `$${summary.totalCost.toFixed(4)}`}
+          </p>
+          {summary.pricedCount < metrics.length && (
+            <p className="text-xs text-gray-400 mt-1">
+              {metrics.length - summary.pricedCount} task(s) on an unpriced model, excluded
+            </p>
+          )}
         </div>
         <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
           <p className="text-sm text-gray-500 uppercase font-semibold">Total Requests</p>

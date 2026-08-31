@@ -1,5 +1,5 @@
 [package]
-name = "agent-turn-backend"
+name = "harnesswurm-backend"
 version = "0.1.0"
 edition = "2021"
 
@@ -11,7 +11,7 @@ serde_json = "1.0"
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 chrono = { version = "0.4", features = ["serde"] }
-tower-http = { version = "0.5", features = ["trace"] }
+tower-http = { version = "0.5", features = ["trace", "cors"] }
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"

@@ -7,6 +7,11 @@ build/
 target/
 **/target/
 desktop/src-tauri/target/
-agent-turn/backend/target/
+harnesswurm/backend/target/
 desktop/src-tauri/debug/
 desktop/src-tauri/release/
+desktop/src-tauri/gen/schemas/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
