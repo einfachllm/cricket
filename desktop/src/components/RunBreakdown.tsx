@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { AlertCircle, Wrench } from 'lucide-react';
-import { ExperimentBreakdown, PhaseSlice, ToolUsage, fetchJson, formatCost, formatTokens } from '../lib/api';
+import { ExperimentBreakdown, PhaseSlice, RunGrouping, ToolUsage, fetchJson, formatTokens } from '../lib/api';
 
 /// The five slices a run's calls are cut into, named for where in the task
 /// they fall. Index matches the backend's 1-based `phase`.
@@ -213,10 +213,12 @@ function RunPanel({
   run,
   phases,
   tools,
+  grouping,
 }: {
   run: RunKey;
   phases: PhaseSlice[];
   tools: ToolUsage[];
+  grouping: RunGrouping;
 }) {
   const stacks = phases.filter((slice) => sameRun(slice, run)).map(toStack);
   const shift = outputShareShift(stacks);
@@ -228,7 +230,7 @@ function RunPanel({
       <div className="flex items-baseline justify-between gap-2">
         <span className="font-semibold text-gray-800 text-sm">{run.agent_name}</span>
         <span className="text-xs text-gray-400 font-mono truncate max-w-[10rem]" title={run.session_key}>
-          {run.session_key || 'no session id'}
+          {run.session_key || (grouping === 'agent' ? 'all sessions' : 'no session id')}
         </span>
       </div>
 
@@ -272,21 +274,29 @@ function Legend() {
 /// Both are computable only from proxied traffic — a tool reading an agent's
 /// own logs sees neither the per-call token split over time nor which tool
 /// each turn actually called.
-const RunBreakdown = ({ experimentId }: { experimentId: string }) => {
+const RunBreakdown = ({
+  experimentId,
+  grouping,
+}: {
+  experimentId: string;
+  grouping: RunGrouping;
+}) => {
   const [breakdown, setBreakdown] = useState<ExperimentBreakdown>({ phases: [], tools: [] });
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
 
   const load = useCallback(async () => {
     try {
-      setBreakdown(await fetchJson<ExperimentBreakdown>(`/v1/analytics/experiments/${experimentId}/breakdown`));
+      setBreakdown(await fetchJson<ExperimentBreakdown>(
+        `/v1/analytics/experiments/${experimentId}/breakdown?group=${grouping}`,
+      ));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoaded(true);
     }
-  }, [experimentId]);
+  }, [experimentId, grouping]);
 
   useEffect(() => {
     setLoaded(false);
@@ -327,6 +337,7 @@ const RunBreakdown = ({ experimentId }: { experimentId: string }) => {
               run={run}
               phases={breakdown.phases}
               tools={breakdown.tools}
+              grouping={grouping}
             />
           ))}
         </div>

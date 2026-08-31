@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import ExperimentComparison, {
   costIsKnown,
+  fragmentedAgents,
   rankRuns,
   rollUpByAgent,
   runIsFinal,
@@ -28,6 +29,7 @@ function run(overrides: Partial<RunComparison>): RunComparison {
     rate_limited_calls: 0,
     error_calls: 0,
     in_flight_calls: 0,
+    sessions: 1,
     models: 'gpt-4o',
     providers: 'openai',
     verdict: null,
@@ -186,6 +188,24 @@ describe('rollUpByAgent', () => {
   })
 })
 
+describe('fragmentedAgents', () => {
+  test('spots an agent whose attempt is spread over several runs', () => {
+    expect(fragmentedAgents([
+      run({ agent_name: 'kilo', session_key: 's1' }),
+      run({ agent_name: 'kilo', session_key: 's2' }),
+      run({ agent_name: 'kilo', session_key: 's3' }),
+      run({ agent_name: 'aider', session_key: 'a1' }),
+    ])).toEqual([{ agent_name: 'kilo', runs: 3 }])
+  })
+
+  test('says nothing when every agent has exactly one run', () => {
+    expect(fragmentedAgents([
+      run({ agent_name: 'kilo', session_key: 's1' }),
+      run({ agent_name: 'aider', session_key: 'a1' }),
+    ])).toEqual([])
+  })
+})
+
 describe('costIsKnown', () => {
   test('is false while any call in the run went unpriced', () => {
     expect(costIsKnown(run({ unpriced_calls: 0 }))).toBe(true)
@@ -208,7 +228,7 @@ describe('ExperimentComparison', () => {
       run({ agent_name: 'kilo', session_key: 'a', total_cost: 0.4, verdict: 'solved' }),
     ])
 
-    render(<ExperimentComparison experimentId="1" />)
+    render(<ExperimentComparison experimentId="1" grouping="session" onGroupingChange={() => {}} />)
 
     // Sub-dollar totals keep four decimals.
     expect(await screen.findByText(/3\.1× cheaper/)).toBeInTheDocument()
@@ -220,7 +240,7 @@ describe('ExperimentComparison', () => {
   test('asks for a verdict rather than ranking unjudged runs on spend alone', async () => {
     mockBackend([run({ session_key: 'a' }), run({ agent_name: 'aider', session_key: 'b', total_cost: 1.1 })])
 
-    render(<ExperimentComparison experimentId="1" />)
+    render(<ExperimentComparison experimentId="1" grouping="session" onGroupingChange={() => {}} />)
 
     expect(await screen.findByText(/Nothing is marked solved yet/i)).toBeInTheDocument()
   })
@@ -228,7 +248,7 @@ describe('ExperimentComparison', () => {
   test('marks a run solved through the backend and reloads', async () => {
     const fetchMock = mockBackend([run({ agent_name: 'kilo', session_key: 'a', session_id: 'a' })])
 
-    render(<ExperimentComparison experimentId="1" />)
+    render(<ExperimentComparison experimentId="1" grouping="session" onGroupingChange={() => {}} />)
 
     fireEvent.click(await screen.findByTitle('Mark this run solved'))
 
@@ -243,10 +263,78 @@ describe('ExperimentComparison', () => {
     })
   })
 
+  test('offers per-agent grouping when one agent has several runs', async () => {
+    const onGroupingChange = vi.fn()
+    mockBackend([
+      run({ agent_name: 'kilo', session_key: 's1' }),
+      run({ agent_name: 'kilo', session_key: 's2' }),
+    ])
+
+    render(
+      <ExperimentComparison experimentId="1" grouping="session" onGroupingChange={onGroupingChange} />,
+    )
+
+    expect(await screen.findByText(/kilo has 2 runs here/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'one run per agent' }))
+    expect(onGroupingChange).toHaveBeenCalledWith('agent')
+  })
+
+  test('does not nag about fragmentation once runs are already merged', async () => {
+    mockBackend([
+      run({ agent_name: 'kilo', session_key: 's1' }),
+      run({ agent_name: 'kilo', session_key: 's2' }),
+    ])
+
+    render(<ExperimentComparison experimentId="1" grouping="agent" onGroupingChange={() => {}} />)
+
+    await screen.findByRole('table', { name: 'Runs' })
+    expect(screen.queryByText(/has 2 runs here/)).not.toBeInTheDocument()
+  })
+
+  test('asks the backend for the grouping it was given', async () => {
+    const fetchMock = mockBackend([run({})])
+
+    render(<ExperimentComparison experimentId="7" grouping="agent" onGroupingChange={() => {}} />)
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/v1/analytics/experiments/7/comparison?group=agent'),
+        undefined,
+      ),
+    )
+  })
+
+  test('judges a merged run by experiment, since it has no single session', async () => {
+    const fetchMock = mockBackend([
+      run({ agent_name: 'kilo', session_key: '', session_id: null, sessions: 3 }),
+    ])
+
+    render(<ExperimentComparison experimentId="7" grouping="agent" onGroupingChange={() => {}} />)
+
+    fireEvent.click(await screen.findByTitle('Mark this run solved'))
+
+    await waitFor(() => {
+      const put = fetchMock.mock.calls.find(([, init]: any[]) => init?.method === 'PUT')
+      expect(JSON.parse((put as any[])[1].body)).toEqual({
+        agent_name: 'kilo',
+        experiment_id: 7,
+        verdict: 'solved',
+      })
+    })
+  })
+
+  test('names the merged session count in place of an id it does not have', async () => {
+    mockBackend([run({ agent_name: 'kilo', session_key: '', session_id: null, sessions: 4 })])
+
+    render(<ExperimentComparison experimentId="1" grouping="agent" onGroupingChange={() => {}} />)
+
+    expect(await screen.findByText('4 sessions merged')).toBeInTheDocument()
+  })
+
   test('tells you how to attribute runs when the experiment has none', async () => {
     mockBackend([])
 
-    render(<ExperimentComparison experimentId="1" />)
+    render(<ExperimentComparison experimentId="1" grouping="session" onGroupingChange={() => {}} />)
 
     expect(await screen.findByText(/No calls recorded under this experiment yet/i)).toBeInTheDocument()
     expect(screen.getByText('X-Experiment-ID')).toBeInTheDocument()
@@ -255,7 +343,7 @@ describe('ExperimentComparison', () => {
   test('shows a running total as provisional rather than a result', async () => {
     mockBackend([run({ agent_name: 'kilo', session_key: 'a', total_cost: 0.2, in_flight_calls: 1 })])
 
-    render(<ExperimentComparison experimentId="1" />)
+    render(<ExperimentComparison experimentId="1" grouping="session" onGroupingChange={() => {}} />)
 
     expect(await screen.findByText('$0.2000 so far')).toBeInTheDocument()
   })
@@ -266,7 +354,7 @@ describe('ExperimentComparison', () => {
       run({ agent_name: 'kilo', session_key: 'b', total_cost: 0.4, verdict: 'solved' }),
     ])
 
-    render(<ExperimentComparison experimentId="1" />)
+    render(<ExperimentComparison experimentId="1" grouping="session" onGroupingChange={() => {}} />)
 
     const rollup = within(await screen.findByRole('table', { name: 'Per agent' }))
     // $0.80 spent for one fix, not the $0.40 the winning run shows — as both
@@ -278,7 +366,7 @@ describe('ExperimentComparison', () => {
   test('shows an incomplete cost as a floor rather than a total', async () => {
     mockBackend([run({ agent_name: 'kilo', session_key: 'a', total_cost: 0.3, unpriced_calls: 2 })])
 
-    render(<ExperimentComparison experimentId="1" />)
+    render(<ExperimentComparison experimentId="1" grouping="session" onGroupingChange={() => {}} />)
 
     expect(await screen.findByText('≥ $0.3000')).toBeInTheDocument()
   })

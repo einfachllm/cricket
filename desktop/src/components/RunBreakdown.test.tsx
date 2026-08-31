@@ -120,7 +120,7 @@ describe('RunBreakdown', () => {
       tools: [tool({})],
     })
 
-    render(<RunBreakdown experimentId="1" />)
+    render(<RunBreakdown experimentId="1" grouping="session" />)
 
     expect(await screen.findByText('Where the money went')).toBeInTheDocument()
     expect(screen.getByText('kilo')).toBeInTheDocument()
@@ -136,7 +136,7 @@ describe('RunBreakdown', () => {
       ],
     })
 
-    render(<RunBreakdown experimentId="1" />)
+    render(<RunBreakdown experimentId="1" grouping="session" />)
 
     expect(await screen.findByText('read_file')).toBeInTheDocument()
     expect(screen.getByText('75%')).toBeInTheDocument()
@@ -152,7 +152,7 @@ describe('RunBreakdown', () => {
       ),
     })
 
-    render(<RunBreakdown experimentId="1" />)
+    render(<RunBreakdown experimentId="1" grouping="session" />)
 
     expect(await screen.findByText('Other (3)')).toBeInTheDocument()
     expect(screen.queryByText('tool_8')).not.toBeInTheDocument()
@@ -161,7 +161,7 @@ describe('RunBreakdown', () => {
   test('says so when a run has no tool calls instead of drawing an empty chart', async () => {
     mockBackend({ phases: [slice({})], tools: [] })
 
-    render(<RunBreakdown experimentId="1" />)
+    render(<RunBreakdown experimentId="1" grouping="session" />)
 
     expect(await screen.findByText(/No tool calls recorded/i)).toBeInTheDocument()
   })
@@ -169,7 +169,7 @@ describe('RunBreakdown', () => {
   test('renders nothing at all for an experiment with no calls', async () => {
     mockBackend({ phases: [], tools: [] })
 
-    const { container } = render(<RunBreakdown experimentId="1" />)
+    const { container } = render(<RunBreakdown experimentId="1" grouping="session" />)
 
     await vi.waitFor(() => expect(container).toBeEmptyDOMElement())
   })
@@ -177,7 +177,7 @@ describe('RunBreakdown', () => {
   test('names the three billed parts in a legend, so identity is never colour alone', async () => {
     mockBackend({ phases: [slice({})], tools: [tool({})] })
 
-    render(<RunBreakdown experimentId="1" />)
+    render(<RunBreakdown experimentId="1" grouping="session" />)
 
     const chart = await screen.findByRole('img', { name: /fresh input/i })
     expect(chart).toBeInTheDocument()
@@ -189,7 +189,7 @@ describe('RunBreakdown', () => {
   test('labels every phase slot, including ones the run never reached', async () => {
     mockBackend({ phases: [slice({ phase: 1 })], tools: [] })
 
-    render(<RunBreakdown experimentId="1" />)
+    render(<RunBreakdown experimentId="1" grouping="session" />)
 
     const chart = await screen.findByRole('img', { name: /fresh input/i })
     for (const label of ['Early', 'Early-mid', 'Mid', 'Late-mid', 'Late']) {
@@ -200,7 +200,7 @@ describe('RunBreakdown', () => {
   test('surfaces a backend error instead of an empty panel', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('Failed to fetch') }))
 
-    render(<RunBreakdown experimentId="1" />)
+    render(<RunBreakdown experimentId="1" grouping="session" />)
 
     expect(await screen.findByText(/Couldn't load the breakdown/i)).toBeInTheDocument()
   })

@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Path, State, Request},
+    extract::{Path, Query, State, Request},
     http::{HeaderMap, Method, StatusCode},
     response::{sse::{Event, Sse}, IntoResponse, Response},
     routing::{get, post, put},
@@ -280,11 +280,26 @@ async fn get_experiment_metrics(
 async fn get_experiment_comparison(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    Query(query): Query<GroupingQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let runs = state.db.get_experiment_comparison(id).await
+    let runs = state.db.get_experiment_comparison(id, query.grouping()).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(axum::Json(runs))
+}
+
+/// `?group=session` (the default) or `?group=agent` — see `db::RunGrouping`.
+/// Shared by the comparison and the breakdown so the two never disagree
+/// about what a run is.
+#[derive(serde::Deserialize, Default)]
+struct GroupingQuery {
+    group: Option<String>,
+}
+
+impl GroupingQuery {
+    fn grouping(&self) -> db::RunGrouping {
+        db::RunGrouping::parse(self.group.as_deref())
+    }
 }
 
 /// Where each run's money went — across the arc of the task, and through
@@ -294,10 +309,12 @@ async fn get_experiment_comparison(
 async fn get_experiment_breakdown(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    Query(query): Query<GroupingQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let phases = state.db.get_experiment_phases(id).await
+    let grouping = query.grouping();
+    let phases = state.db.get_experiment_phases(id, grouping).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let tools = state.db.get_experiment_tool_usage(id).await
+    let tools = state.db.get_experiment_tool_usage(id, grouping).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(axum::Json(json!({ "phases": phases, "tools": tools })))
@@ -307,6 +324,10 @@ async fn get_experiment_breakdown(
 struct VerdictRequest {
     agent_name: String,
     session_id: Option<String>,
+    /// Set instead of `session_id` to judge a *merged* run: the verdict lands
+    /// on every session this agent has under the experiment. Sending both is
+    /// rejected rather than silently picking one.
+    experiment_id: Option<i64>,
     /// `"solved"`, `"failed"`, or null to clear a previous verdict.
     verdict: Option<String>,
     note: Option<String>,
@@ -324,12 +345,21 @@ async fn put_session_verdict(
         }
     }
 
-    let updated = state.db.set_session_verdict(
-        &request.agent_name,
-        request.session_id.as_deref(),
-        request.verdict.as_deref(),
-        request.note.as_deref(),
-    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let updated = match request.experiment_id {
+        Some(_) if request.session_id.is_some() => return Err(StatusCode::BAD_REQUEST),
+        Some(experiment_id) => state.db.set_experiment_verdict(
+            &request.agent_name,
+            experiment_id,
+            request.verdict.as_deref(),
+            request.note.as_deref(),
+        ).await,
+        None => state.db.set_session_verdict(
+            &request.agent_name,
+            request.session_id.as_deref(),
+            request.verdict.as_deref(),
+            request.note.as_deref(),
+        ).await,
+    }.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if !updated {
         return Err(StatusCode::NOT_FOUND);

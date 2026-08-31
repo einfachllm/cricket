@@ -56,13 +56,25 @@ export interface SessionSummary {
 /// `set_session_verdict` in the backend for why the comparison needs it.
 export type Verdict = 'solved' | 'failed';
 
-/// One *run* — one agent working one session — folded down from its calls.
-/// The unit the experiment comparison ranks on.
+/// What counts as one *run*. `session` trusts the agent's `X-Session-ID` to
+/// mark one attempt — right when it is stable for the length of a task, and
+/// the only way to compare several deliberate repeats side by side. `agent`
+/// treats everything one agent did under the experiment as a single run, for
+/// agents that mint a fresh session id per session rather than per task.
+export type RunGrouping = 'session' | 'agent';
+
+/// One *run* folded down from its calls — see `RunGrouping` for what a run
+/// is. The unit the experiment comparison ranks on.
 export interface RunComparison {
   agent_name: string;
-  /// Stable key for the run, `''` for calls sent without an `X-Session-ID`.
+  /// Identifies the run within its agent: the session id under `session`
+  /// grouping, `''` under `agent` grouping and for calls sent without one.
   session_key: string;
+  /// Null for a merged run, which spans more than one session id.
   session_id: string | null;
+  /// How many distinct session ids the run covers. Above one under `agent`
+  /// grouping means the agent split the attempt by itself.
+  sessions: number;
   call_count: number;
   first_seen: string | null;
   last_seen: string | null;
@@ -143,18 +155,22 @@ export async function fetchJson<T>(path: string, init?: RequestInit): Promise<T>
 }
 
 /// Marks (or, with `verdict: null`, un-marks) whether a run solved its task.
+///
+/// A merged run has no single session behind it, so it is judged by
+/// experiment instead and the verdict lands on every session under it.
 export async function setVerdict(
   run: Pick<RunComparison, 'agent_name' | 'session_id'>,
   verdict: Verdict | null,
+  scope: { grouping: RunGrouping; experimentId: string },
 ): Promise<void> {
+  const target = scope.grouping === 'agent'
+    ? { experiment_id: Number(scope.experimentId) }
+    : { session_id: run.session_id };
+
   await fetchJson<{ ok: boolean }>('/v1/analytics/sessions/verdict', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      agent_name: run.agent_name,
-      session_id: run.session_id,
-      verdict,
-    }),
+    body: JSON.stringify({ agent_name: run.agent_name, ...target, verdict }),
   });
 }
 

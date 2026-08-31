@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { AlertTriangle, Check, CircleDot, Clock, HelpCircle, Trophy, X } from 'lucide-react';
+import { AlertTriangle, Check, CircleDot, Clock, HelpCircle, Split, Trophy, X } from 'lucide-react';
 import {
   RunComparison,
+  RunGrouping,
   Verdict,
   fetchJson,
   formatCost,
@@ -141,6 +142,20 @@ export function rollUpByAgent(runs: RunComparison[]): AgentRollup[] {
   });
 }
 
+/// Runs that cover more than one session id. Under per-session grouping
+/// that is the tell-tale of an agent minting a fresh id per session rather
+/// than per task, which shatters one attempt across several rows — so the
+/// view offers the fix rather than leaving the reader to notice.
+export function fragmentedAgents(runs: RunComparison[]): { agent_name: string; runs: number }[] {
+  const counts = new Map<string, number>();
+  for (const run of runs) {
+    counts.set(run.agent_name, (counts.get(run.agent_name) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([agent_name, runs]) => ({ agent_name, runs }));
+}
+
 const VERDICT_STYLES: Record<Verdict, { chip: string; label: string; icon: typeof Check }> = {
   solved: { chip: 'bg-emerald-100 text-emerald-800 border-emerald-200', label: 'Solved', icon: Check },
   failed: { chip: 'bg-red-100 text-red-800 border-red-200', label: 'Failed', icon: X },
@@ -178,6 +193,41 @@ function VerdictToggle({
           </button>
         );
       })}
+    </div>
+  );
+}
+
+/// Which unit the whole card counts in. Framed by what the reader is
+/// choosing between — repeats of a task versus one attempt the agent split —
+/// rather than by the header name behind it.
+function GroupingToggle({
+  grouping,
+  onChange,
+}: {
+  grouping: RunGrouping;
+  onChange: (grouping: RunGrouping) => void;
+}) {
+  const options: { value: RunGrouping; label: string; hint: string }[] = [
+    { value: 'session', label: 'Per session', hint: "One run per X-Session-ID the agent sent — right when that id marks one attempt" },
+    { value: 'agent', label: 'Per agent', hint: 'Everything an agent did here counts as one run — right when it mints a fresh session id per session' },
+  ];
+
+  return (
+    <div className="inline-flex rounded-lg border border-gray-200 overflow-hidden shrink-0">
+      {options.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          aria-pressed={grouping === option.value}
+          title={option.hint}
+          onClick={() => onChange(option.value)}
+          className={`px-3 py-1 text-xs font-semibold transition-colors ${
+            grouping === option.value ? 'bg-blue-600 text-white' : 'bg-white text-gray-500 hover:bg-gray-50'
+          }`}
+        >
+          {option.label}
+        </button>
+      ))}
     </div>
   );
 }
@@ -351,7 +401,7 @@ function RunRow({
           <span className="font-semibold text-gray-800">{run.agent_name}</span>
         </div>
         <p className="text-xs text-gray-400 font-mono truncate max-w-[16rem]" title={run.session_id ?? ''}>
-          {run.session_id ?? 'no session id'}
+          {run.sessions > 1 ? `${run.sessions} sessions merged` : (run.session_id ?? 'no session id')}
         </p>
         <p className="text-xs text-gray-400 truncate max-w-[16rem]" title={run.models ?? ''}>
           {run.models ?? 'unknown model'}
@@ -427,21 +477,31 @@ const COLUMNS = [
 /// answers "what did this experiment cost"; this answers the question that
 /// actually decides which agent to reach for next time — who solved it, and
 /// what did solving it cost each of them.
-const ExperimentComparison = ({ experimentId }: { experimentId: string }) => {
+const ExperimentComparison = ({
+  experimentId,
+  grouping,
+  onGroupingChange,
+}: {
+  experimentId: string;
+  grouping: RunGrouping;
+  onGroupingChange: (grouping: RunGrouping) => void;
+}) => {
   const [runs, setRuns] = useState<RunComparison[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
 
   const load = useCallback(async () => {
     try {
-      setRuns(await fetchJson<RunComparison[]>(`/v1/analytics/experiments/${experimentId}/comparison`));
+      setRuns(await fetchJson<RunComparison[]>(
+        `/v1/analytics/experiments/${experimentId}/comparison?group=${grouping}`,
+      ));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoaded(true);
     }
-  }, [experimentId]);
+  }, [experimentId, grouping]);
 
   useEffect(() => {
     setLoaded(false);
@@ -458,26 +518,50 @@ const ExperimentComparison = ({ experimentId }: { experimentId: string }) => {
         ),
       );
       try {
-        await setVerdict(run, verdict);
+        await setVerdict(run, verdict, { grouping, experimentId });
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       }
       load();
     },
-    [load],
+    [load, grouping, experimentId],
   );
 
   const ordered = sortRuns(runs);
   const ranking = rankRuns(runs);
+  const fragmented = fragmentedAgents(runs);
 
   return (
     <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
       <div className="p-6 pb-4 space-y-3">
-        <h3 className="text-lg font-semibold text-gray-700">Which run solved it cheaper?</h3>
+        <div className="flex items-start justify-between gap-4 flex-wrap">
+          <h3 className="text-lg font-semibold text-gray-700">Which run solved it cheaper?</h3>
+          <GroupingToggle grouping={grouping} onChange={onGroupingChange} />
+        </div>
         {error ? (
           <p className="text-sm text-red-700">Couldn't load the comparison: {error}</p>
         ) : loaded ? (
-          <Headline ranking={ranking} runCount={runs.length} />
+          <>
+            <Headline ranking={ranking} runCount={runs.length} />
+            {grouping === 'session' && fragmented.length > 0 && (
+              <div className="flex items-start gap-2 text-xs text-gray-600 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2">
+                <Split size={13} className="text-amber-500 shrink-0 mt-0.5" />
+                <p>
+                  {fragmented.map((a) => `${a.agent_name} has ${a.runs} runs`).join(', ')} here. If those
+                  are repeats of the task, this is the view you want. If the agent split one attempt
+                  across several session ids, switch to{' '}
+                  <button
+                    type="button"
+                    className="font-semibold text-amber-800 underline underline-offset-2"
+                    onClick={() => onGroupingChange('agent')}
+                  >
+                    one run per agent
+                  </button>
+                  {' '}— otherwise the cheapest fragment gets crowned.
+                </p>
+              </div>
+            )}
+          </>
         ) : (
           <p className="text-sm text-gray-400">Loading runs…</p>
         )}
