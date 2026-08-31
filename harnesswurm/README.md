@@ -72,6 +72,78 @@ page and edit the file to match what you actually use; add or remove models
 freely. A model with no entry (or missing input/output prices) just shows no
 cost estimate rather than a wrong one.
 
+## Testing locally
+
+### 1. Start the backend
+```bash
+cd harnesswurm/backend
+cargo run                    # listens on http://127.0.0.1:8081
+```
+State (`harnesswurm.db`, `agents.yaml`, `pricing.yaml`) is written to the
+current directory, so run it from the same place each time.
+
+### 2. Start the UI
+```bash
+cd desktop
+npm install
+npm run dev                  # http://localhost:5173 in a browser
+```
+Or `npm run tauri dev` for the real desktop app, which embeds the backend and
+needs no separate `cargo run` (it requires the Tauri system dependencies:
+https://v2.tauri.app/start/prerequisites/).
+
+### 3. See it working — without an API key
+```bash
+cd harnesswurm/backend
+python3 ../demo_seed.py      # writes one session per status
+```
+Open the Agents view and every state should be visible: thinking, running a
+tool, waiting for you, rate limited, auth failed, idle, plus provider quota
+bars. `python3 ../demo_seed.py --clear` removes them again — the demo rows are
+prefixed `demo-` and are never confused with real captured traffic.
+
+Seed *after* the backend is running: it closes out open calls on startup, so a
+seeded "Thinking" session would otherwise be reaped to *Interrupted* — which
+is itself the reaper working correctly.
+
+### 4. Send a real call through the proxy
+With an API key, anything that speaks either API works — the proxy forwards
+whatever auth headers you already send:
+```bash
+curl http://localhost:8081/v1/chat/completions \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "X-Agent-ID: manual-test" -H "X-Session-ID: my-first-session" \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"say hi"}]}'
+```
+Watch the Agents view while it runs: the session appears as **Thinking**, then
+settles to **Waiting for you** once the turn ends. Add `"stream": true` to
+exercise the streaming path.
+
+### 5. Point a real coding agent at it
+Set the agent's API base URL to the proxy. The two styles differ in how much
+of the path the client appends:
+
+| Client style | Base URL to configure |
+| --- | --- |
+| OpenAI-compatible (appends `/chat/completions`) | `http://localhost:8081/v1` |
+| Anthropic-compatible (appends `/v1/messages`) | `http://localhost:8081` |
+
+Most agents expose this as an environment variable or a config field
+(`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, a `baseUrl` setting…); the exact name
+varies per tool.
+
+**Known gap:** `X-Agent-ID` and `X-Session-ID` are how calls are attributed,
+and most agents send neither — those calls all collapse into a single
+`unknown_agent` / `default_session` bucket. If your agent can set custom
+headers, set them; if not, per-agent attribution isn't available yet.
+
+### Running the tests
+```bash
+cd harnesswurm/backend && cargo test     # parsing, pricing, DB, state rules
+cd desktop && npm test                   # UI, and npm run typecheck
+```
+
 ## Agent status
 
 Different agents (Claude Code, Kilo, opencode, aider, Cursor…) share no
