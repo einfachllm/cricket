@@ -95,12 +95,29 @@ const TrafficView = () => {
       setTraffic(null);
       return;
     }
+    // A newly selected task can resolve before an older, larger one still
+    // in flight; without a staleness guard the older response would land
+    // last and overwrite `traffic` for a task that's no longer selected.
+    let cancelled = false;
+    const controller = new AbortController();
     setTrafficLoading(true);
-    fetch(`${API_BASE}/v1/analytics/tasks/${selectedId}/traffic`)
+    fetch(`${API_BASE}/v1/analytics/tasks/${selectedId}/traffic`, { signal: controller.signal })
       .then((res) => (res.ok ? res.json() : Promise.reject(res.status)))
-      .then((data) => setTraffic(data))
-      .catch((error) => console.error('Error fetching traffic:', error))
-      .finally(() => setTrafficLoading(false));
+      .then((data) => {
+        if (!cancelled) setTraffic(data);
+      })
+      .catch((error) => {
+        if (!cancelled && error?.name !== 'AbortError') {
+          console.error('Error fetching traffic:', error);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setTrafficLoading(false);
+      });
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [selectedId]);
 
   const agents = Array.from(new Set(tasks.map((t) => t.agent_name))).sort();

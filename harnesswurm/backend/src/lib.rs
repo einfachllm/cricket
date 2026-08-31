@@ -1,7 +1,8 @@
 use axum::{
+    body::Body,
     extract::{Path, State, Request},
     http::{HeaderMap, Method, StatusCode},
-    response::{IntoResponse, Response, Sse},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
@@ -94,6 +95,19 @@ fn seed_default_file(path: &std::path::Path, contents: &str) -> std::io::Result<
     Ok(())
 }
 
+/// One-time upgrade for installs from before the project (and its db file)
+/// were renamed from agent-turn: if `db_path` doesn't exist yet but the old
+/// `agent_turn.db` does, rename it into place so `Database::new`'s
+/// schema-upgrade logic runs against the caller's existing agents,
+/// experiments, tasks, and metrics instead of silently starting empty.
+fn migrate_legacy_db(data_dir: &std::path::Path, db_path: &std::path::Path) -> std::io::Result<()> {
+    let legacy_path = data_dir.join("agent_turn.db");
+    if !db_path.exists() && legacy_path.exists() {
+        std::fs::rename(&legacy_path, db_path)?;
+    }
+    Ok(())
+}
+
 pub async fn run(config: ServerConfig) -> Result<()> {
     std::fs::create_dir_all(&config.data_dir)?;
 
@@ -103,6 +117,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     seed_default_file(&pricing_path, DEFAULT_PRICING_YAML)?;
 
     let db_path = config.data_dir.join("harnesswurm.db");
+    migrate_legacy_db(&config.data_dir, &db_path)?;
     let db = db::Database::new(&format!("sqlite:{}?mode=rwc", db_path.display())).await?;
 
     let agents: Vec<AgentConfig> = {
@@ -125,6 +140,13 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         pricing,
     });
 
+    // Permissive: this server only ever binds to loopback, and its callers
+    // are the Vite dev server (http://localhost:5173) and the Tauri webview
+    // (whose origin varies by OS/version) fetching analytics data — without
+    // this, both send cross-origin requests the browser blocks outright, so
+    // the Traffic tab and Analytics dashboard stay empty.
+    let cors = tower_http::cors::CorsLayer::permissive();
+
     let app = Router::new()
         .route("/v1/chat/completions", post(openai_proxy_handler))
         .route("/v1/messages", post(anthropic_proxy_handler))
@@ -132,6 +154,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         .route("/v1/analytics/experiments/:id/metrics", get(get_experiment_metrics))
         .route("/v1/analytics/tasks", get(get_recent_tasks))
         .route("/v1/analytics/tasks/:id/traffic", get(get_task_traffic))
+        .layer(cors)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
@@ -284,7 +307,7 @@ async fn proxy_handler(
     let latency = start.elapsed().as_millis() as i64;
 
     if is_streaming {
-        handle_streaming(state, provider, response, task_id, model_name, latency).await
+        handle_streaming(state, provider, response, task_id, model_name, latency, status).await
     } else {
         Ok(handle_unary(state, provider, response, task_id, model_name, latency, status).await)
     }
@@ -404,6 +427,7 @@ async fn handle_unary(
 
     let cost = model_name.as_deref().and_then(|m| state.pricing.estimate_cost(
         m,
+        provider.as_str(),
         usage.prompt_tokens,
         usage.cache_creation_tokens,
         usage.cache_read_tokens,
@@ -533,17 +557,25 @@ async fn handle_streaming(
     task_id: i64,
     model_name: Option<String>,
     latency: i64,
+    status: StatusCode,
 ) -> Result<Response, StatusCode> {
+    let headers = res.headers().clone();
+
     // Unbounded and non-blocking so a slow telemetry consumer can never add
     // latency to (or drop chunks from) the response the caller actually sees.
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
+    // Forward each chunk's raw bytes unchanged: both providers already frame
+    // a streaming body as SSE `event:`/`data:` lines, so re-encoding a chunk
+    // through `Event::data` would prefix every one of those lines with
+    // `data:` again, producing nested, undecodable frames such as
+    // `data: event: message_start` and `data: data: {...}`.
     let stream = res.bytes_stream().map(move |chunk_result| {
         match chunk_result {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes).to_string();
-                let _ = tx.send(text.clone());
-                Ok(axum::response::sse::Event::default().data(text))
+                let _ = tx.send(text);
+                Ok(bytes)
             }
             Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
         }
@@ -575,6 +607,7 @@ async fn handle_streaming(
 
         let cost = model_name.as_deref().and_then(|m| state.pricing.estimate_cost(
             m,
+            provider.as_str(),
             usage.prompt_tokens,
             usage.cache_creation_tokens,
             usage.cache_read_tokens,
@@ -597,7 +630,17 @@ async fn handle_streaming(
         }
     });
 
-    Ok(Sse::new(stream).into_response())
+    // Preserve the upstream status/headers rather than always answering 200:
+    // a rejected streaming request (bad key, invalid model, rate limit) gets
+    // its provider status and error body forwarded as-is instead of looking
+    // like a successful stream to the client SDK.
+    let mut response_builder = Response::builder().status(status);
+    for (key, value) in headers.iter() {
+        response_builder = response_builder.header(key, value);
+    }
+    response_builder
+        .body(Body::from_stream(stream))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 #[cfg(test)]
@@ -839,6 +882,39 @@ mod tests {
         std::fs::write(&path, "custom user content").unwrap();
         seed_default_file(&path, "default content").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "custom user content");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_legacy_db_renames_when_new_db_absent() {
+        let dir = std::env::temp_dir().join(format!("harnesswurm-test-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy_path = dir.join("agent_turn.db");
+        let db_path = dir.join("harnesswurm.db");
+        std::fs::write(&legacy_path, "legacy telemetry").unwrap();
+
+        migrate_legacy_db(&dir, &db_path).unwrap();
+
+        assert!(!legacy_path.exists());
+        assert_eq!(std::fs::read_to_string(&db_path).unwrap(), "legacy telemetry");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_legacy_db_does_not_overwrite_an_existing_new_db() {
+        let dir = std::env::temp_dir().join(format!("harnesswurm-test-migrate2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy_path = dir.join("agent_turn.db");
+        let db_path = dir.join("harnesswurm.db");
+        std::fs::write(&legacy_path, "legacy telemetry").unwrap();
+        std::fs::write(&db_path, "current telemetry").unwrap();
+
+        migrate_legacy_db(&dir, &db_path).unwrap();
+
+        assert!(legacy_path.exists());
+        assert_eq!(std::fs::read_to_string(&db_path).unwrap(), "current telemetry");
 
         std::fs::remove_dir_all(&dir).ok();
     }
