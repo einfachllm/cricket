@@ -2,22 +2,32 @@ use axum::{
     body::Body,
     extract::{Path, State, Request},
     http::{HeaderMap, Method, StatusCode},
-    response::{IntoResponse, Response},
+    response::{sse::{Event, Sse}, IntoResponse, Response},
     routing::{get, post},
     Router,
 };
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::time::Instant;
+use tokio::time::{Duration, Instant};
 use futures::StreamExt as _;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 pub mod agent_question;
 pub mod db;
 pub mod pricing;
+pub mod rate_limits;
+pub mod session_state;
+
+use db::TaskOutcome;
+
+/// Capacity of the live-event fan-out. A slow dashboard that falls this far
+/// behind gets lagged out rather than holding memory: it only ever misses
+/// change *pings*, and its next poll re-reads the true state anyway.
+const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 const DEFAULT_AGENTS_YAML: &str = include_str!("../agents.yaml");
 const DEFAULT_PRICING_YAML: &str = include_str!("../pricing.yaml");
@@ -68,11 +78,62 @@ struct UsageInfo {
     tool_calls_count: i64,
 }
 
+/// Identity and timing of one proxied call, carried through the response
+/// handlers so they can close the task out and announce it without threading
+/// four more positional arguments through every signature.
+#[derive(Clone)]
+struct CallContext {
+    task_id: i64,
+    agent_name: String,
+    session_id: String,
+    /// When the request was forwarded. `Instant::elapsed()` on this is the
+    /// full call duration; the `latency` passed around separately is only
+    /// time-to-headers, which for a stream is a fraction of the real wait.
+    started: Instant,
+}
+
+impl CallContext {
+    fn notify(&self, state: &AppState, kind: &str, status: &str) {
+        state.notify(kind, self.task_id, &self.agent_name, &self.session_id, status);
+    }
+
+    /// Stores the provider's quota headers, if it sent any. Skipping empty
+    /// snapshots keeps the table to actual readings, so "no data" and
+    /// "unlimited" stay distinguishable.
+    async fn record_rate_limits(&self, state: &AppState, provider: Provider, headers: &HeaderMap) {
+        let snapshot = rate_limits::extract(headers);
+        if !snapshot.is_empty() {
+            let _ = state.db.save_rate_limits(self.task_id, provider.as_str(), &snapshot).await;
+        }
+    }
+}
+
 pub struct AppState {
     pub db: db::Database,
     pub client: reqwest::Client,
     pub agents: Vec<AgentConfig>,
     pub pricing: pricing::PricingTable,
+    /// Fan-out for "something changed" pings to any connected dashboard.
+    /// Deliberately carries no state of its own: a subscriber re-reads the
+    /// analytics endpoints on a ping, so there is exactly one definition of
+    /// each number (the SQL) instead of a second one drifting in here.
+    pub events: broadcast::Sender<String>,
+}
+
+impl AppState {
+    /// Publishes a change ping. Sending fails only when nobody is listening,
+    /// which is the normal case for a headless proxy — hence the ignored
+    /// result rather than an error path.
+    fn notify(&self, kind: &str, task_id: i64, agent: &str, session: &str, status: &str) {
+        let payload = json!({
+            "type": kind,
+            "task_id": task_id,
+            "agent_name": agent,
+            "session_id": session,
+            "status": status,
+        });
+        let _ = self.events.send(payload.to_string());
+    }
 }
 
 /// Where this run's server should listen and where it should keep its state
@@ -133,11 +194,23 @@ pub async fn run(config: ServerConfig) -> Result<()> {
 
     let pricing = pricing::PricingTable::load(&pricing_path);
 
+    // Any call still marked in-flight belongs to a previous process and can
+    // never complete, so close those out before serving — otherwise they'd
+    // show as agents perpetually "Thinking".
+    match db.reap_in_flight_tasks().await {
+        Ok(0) => {}
+        Ok(n) => println!("Closed out {n} call(s) left in-flight by a previous run"),
+        Err(e) => eprintln!("Could not reap in-flight calls: {e}"),
+    }
+
+    let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+
     let state = Arc::new(AppState {
         db,
         client: reqwest::Client::new(),
         agents,
         pricing,
+        events,
     });
 
     // Permissive: this server only ever binds to loopback, and its callers
@@ -154,6 +227,9 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         .route("/v1/analytics/experiments/:id/metrics", get(get_experiment_metrics))
         .route("/v1/analytics/tasks", get(get_recent_tasks))
         .route("/v1/analytics/tasks/:id/traffic", get(get_task_traffic))
+        .route("/v1/analytics/sessions", get(get_sessions))
+        .route("/v1/analytics/limits", get(get_rate_limits))
+        .route("/v1/analytics/events", get(get_events))
         .layer(cors)
         .with_state(state);
 
@@ -211,6 +287,41 @@ async fn get_task_traffic(
         Some(t) => Ok(axum::Json(t)),
         None => Err(StatusCode::NOT_FOUND),
     }
+}
+
+async fn get_sessions(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let sessions = state.db.get_sessions(100).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(axum::Json(sessions))
+}
+
+async fn get_rate_limits(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let limits = state.db.get_latest_rate_limits().await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(axum::Json(limits))
+}
+
+/// Live change feed, so the dashboard reflects a call starting or finishing
+/// the moment it happens instead of on the next poll — the difference
+/// between a report and a monitor when the question is "is it stuck?".
+///
+/// A lagged subscriber (dashboard tabbed away, then back) is not an error
+/// worth ending the stream over: it re-reads full state on the next ping, so
+/// the missed pings cost nothing and the stream is kept alive.
+async fn get_events(State(state): State<Arc<AppState>>) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let stream = tokio_stream::wrappers::BroadcastStream::new(state.events.subscribe())
+        .filter_map(|msg| async move { msg.ok() })
+        .map(|msg| Ok(Event::default().data(msg)));
+
+    // Without a keep-alive an idle feed looks indistinguishable from a dead
+    // one to any proxy or browser in between.
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
 async fn openai_proxy_handler(
@@ -274,8 +385,16 @@ async fn proxy_handler(
         Some(provider.as_str().to_string()),
     ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let call = CallContext {
+        task_id,
+        agent_name: agent_name.to_string(),
+        session_id: session_id.to_string(),
+        started: start,
+    };
+
     let request_text = String::from_utf8_lossy(&body_bytes).to_string();
     let _ = state.db.save_traffic_request(task_id, &request_text).await;
+    call.notify(&state, "task_started", session_state::STATUS_IN_FLIGHT);
 
     let forward_body: Vec<u8> = match (&parsed_body, provider, is_streaming) {
         (Some(json), Provider::OpenAI, true) => {
@@ -298,18 +417,34 @@ async fn proxy_handler(
         .header("Content-Type", "application/json")
         .body(forward_body);
 
-    let response = proxy_req.send().await.map_err(|e| {
-        eprintln!("Proxy error: {}", e);
-        StatusCode::BAD_GATEWAY
-    })?;
+    let response = match proxy_req.send().await {
+        Ok(response) => response,
+        Err(e) => {
+            // The provider was never reached (DNS, TLS, connection refused,
+            // timeout). Close the task out rather than returning early and
+            // leaving it in-flight forever — an unreachable provider is
+            // exactly the kind of stuck the dashboard exists to surface.
+            eprintln!("Proxy error: {}", e);
+            let _ = state.db.finish_task(task_id, &TaskOutcome {
+                status: session_state::STATUS_ERROR.to_string(),
+                error_type: Some("upstream_unreachable".to_string()),
+                error_message: Some(e.to_string().chars().take(500).collect()),
+                ttfb_ms: Some(start.elapsed().as_millis() as i64),
+                duration_ms: Some(start.elapsed().as_millis() as i64),
+                ..Default::default()
+            }).await;
+            call.notify(&state, "task_finished", session_state::STATUS_ERROR);
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
 
     let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let latency = start.elapsed().as_millis() as i64;
 
     if is_streaming {
-        handle_streaming(state, provider, response, task_id, model_name, latency, status).await
+        handle_streaming(state, provider, response, task_id, model_name, latency, status, call).await
     } else {
-        Ok(handle_unary(state, provider, response, task_id, model_name, latency, status).await)
+        Ok(handle_unary(state, provider, response, task_id, model_name, latency, status, call).await)
     }
 }
 
@@ -367,6 +502,48 @@ fn extract_usage(provider: Provider, json: &Value) -> UsageInfo {
     }
 }
 
+/// Maps an upstream HTTP status onto the call outcome the dashboard keys
+/// off. The distinction that matters most is 429 vs everything else: a rate
+/// limit is a wait, an auth or request error is a thing the human must go
+/// fix, and an overload is the provider's problem that the agent will
+/// usually retry through on its own.
+fn classify_http_status(status: u16) -> &'static str {
+    match status {
+        200..=299 => session_state::STATUS_OK,
+        429 => session_state::STATUS_RATE_LIMITED,
+        503 | 529 => session_state::STATUS_OVERLOADED,
+        _ => session_state::STATUS_ERROR,
+    }
+}
+
+/// Pulls `type` and `message` out of the error envelope both providers use
+/// (`{"error": {"type": ..., "message": ...}}`), falling back to OpenAI's
+/// `code` when it sends that instead of a type.
+fn extract_error_details(json: &Value) -> (Option<String>, Option<String>) {
+    let error = &json["error"];
+    let error_type = error["type"].as_str().or_else(|| error["code"].as_str()).map(String::from);
+    let message = error["message"].as_str().map(|m| m.chars().take(500).collect());
+    (error_type, message)
+}
+
+/// Why the model stopped — the single most informative field for telling
+/// "the agent went off to run a tool" apart from "the agent is done and
+/// waiting for you". OpenAI calls it `finish_reason`, Anthropic
+/// `stop_reason`, with different vocabularies for the same three outcomes.
+fn extract_stop_reason(provider: Provider, json: &Value) -> Option<String> {
+    match provider {
+        Provider::OpenAI => json["choices"][0]["finish_reason"].as_str().map(String::from),
+        Provider::Anthropic => json["stop_reason"].as_str().map(String::from),
+    }
+}
+
+/// Whether the turn came back to the human. An explicit question tool says
+/// so outright; otherwise a turn that ended without asking for a tool means
+/// the agent produced its answer and is now sitting at a prompt.
+fn turn_awaits_human(stop_reason: Option<&str>, has_question: bool) -> bool {
+    has_question || matches!(stop_reason, Some("end_turn") | Some("stop"))
+}
+
 /// Scans the same tool-calls/content a response already carries for one
 /// matching a known "ask the human a question" convention. Unary twin of
 /// the streaming accumulate-then-scan path in handle_streaming.
@@ -400,6 +577,7 @@ fn extract_agent_question(provider: Provider, json: &Value) -> Option<(String, S
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_unary(
     state: Arc<AppState>,
     provider: Provider,
@@ -408,9 +586,11 @@ async fn handle_unary(
     model_name: Option<String>,
     latency: i64,
     status: StatusCode,
+    call: CallContext,
 ) -> Response {
     let headers = res.headers().clone();
     let res_bytes = res.bytes().await.unwrap_or_default();
+    let duration_ms = call.started.elapsed().as_millis() as i64;
     let parsed_response: Option<Value> = serde_json::from_slice(&res_bytes).ok();
 
     let usage = parsed_response.as_ref()
@@ -418,12 +598,32 @@ async fn handle_unary(
         .unwrap_or_default();
     let agent_question = parsed_response.as_ref()
         .and_then(|json| extract_agent_question(provider, json));
+    let stop_reason = parsed_response.as_ref().and_then(|json| extract_stop_reason(provider, json));
+    let (error_type, error_message) = parsed_response.as_ref()
+        .map(extract_error_details)
+        .unwrap_or((None, None));
 
     let response_text = String::from_utf8_lossy(&res_bytes).to_string();
     let _ = state.db.save_traffic_response(task_id, &response_text).await;
     if let Some((tool, text)) = &agent_question {
         let _ = state.db.save_agent_question(task_id, tool, text).await;
     }
+
+    let call_status = classify_http_status(status.as_u16());
+    let outcome = TaskOutcome {
+        status: call_status.to_string(),
+        http_status: Some(status.as_u16() as i64),
+        error_type,
+        error_message,
+        awaiting_input: call_status == session_state::STATUS_OK
+            && turn_awaits_human(stop_reason.as_deref(), agent_question.is_some()),
+        stop_reason,
+        ttfb_ms: Some(latency),
+        duration_ms: Some(duration_ms),
+    };
+    let _ = state.db.finish_task(task_id, &outcome).await;
+    call.record_rate_limits(&state, provider, &headers).await;
+    call.notify(&state, "task_finished", &outcome.status);
 
     let cost = model_name.as_deref().and_then(|m| state.pricing.estimate_cost(
         m,
@@ -452,29 +652,69 @@ async fn handle_unary(
     response_builder.body(axum::body::Bytes::from(res_bytes).into()).unwrap()
 }
 
+/// Everything a streamed response reveals, folded together as chunks arrive.
+/// One struct rather than a handful of `&mut` parameters because the set kept
+/// growing — usage, tool calls, and now why the turn ended and whether it
+/// ended at all.
+#[derive(Debug, Default)]
+struct StreamAccumulator {
+    usage: UsageInfo,
+    tool_ids: HashSet<String>,
+    tool_calls: Vec<(String, agent_question::ToolCallAccumulator)>,
+    stop_reason: Option<String>,
+    /// Whether the provider's own end-of-stream marker arrived. Its absence
+    /// is the only evidence available that a stream was cut short — the
+    /// agent was cancelled, or the connection dropped mid-answer — which
+    /// otherwise looks identical to a clean finish with fewer tokens.
+    saw_terminal: bool,
+    error_type: Option<String>,
+    error_message: Option<String>,
+}
+
+impl StreamAccumulator {
+    /// Reconstructs the question the agent asked, if it asked one.
+    fn agent_question(&self) -> Option<(String, String)> {
+        self.tool_calls.iter().find_map(|(_, acc)| {
+            let name = acc.name.as_deref()?;
+            if !agent_question::is_agent_question_tool(name) {
+                return None;
+            }
+            let arguments: Value = serde_json::from_str(&acc.arguments).ok()?;
+            agent_question::extract_question_text(&arguments).map(|text| (name.to_string(), text))
+        })
+    }
+}
+
 /// Folds one SSE chunk's `data: ` lines into the running totals. Chunk
 /// boundaries aren't guaranteed to land on line boundaries, so a `data: `
 /// line split across two chunks is missed — acceptable for a best-effort
 /// telemetry sidecar that isn't the billing source of truth.
-fn accumulate_openai_stream_chunk(
-    text: &str,
-    usage: &mut UsageInfo,
-    tool_ids: &mut HashSet<String>,
-    tool_calls_acc: &mut Vec<(String, agent_question::ToolCallAccumulator)>,
-) {
+fn accumulate_openai_stream_chunk(text: &str, acc: &mut StreamAccumulator) {
     for line in text.lines() {
         let Some(data) = line.strip_prefix("data: ") else { continue };
-        if data == "[DONE]" {
+        if data.trim() == "[DONE]" {
+            acc.saw_terminal = true;
             continue;
         }
         let Ok(json) = serde_json::from_str::<Value>(data) else { continue };
 
+        if !json["error"].is_null() {
+            let (error_type, message) = extract_error_details(&json);
+            acc.error_type = error_type;
+            acc.error_message = message;
+        }
+
         if let Some(usage_obj) = json.get("usage").filter(|u| !u.is_null()) {
             let total_prompt = usage_obj["prompt_tokens"].as_i64().unwrap_or(0);
             let cache_read = usage_obj["prompt_tokens_details"]["cached_tokens"].as_i64().unwrap_or(0);
-            usage.prompt_tokens = (total_prompt - cache_read).max(0);
-            usage.cache_read_tokens = cache_read;
-            usage.completion_tokens = usage_obj["completion_tokens"].as_i64().unwrap_or(usage.completion_tokens);
+            acc.usage.prompt_tokens = (total_prompt - cache_read).max(0);
+            acc.usage.cache_read_tokens = cache_read;
+            acc.usage.completion_tokens = usage_obj["completion_tokens"].as_i64().unwrap_or(acc.usage.completion_tokens);
+        }
+
+        // Sent once, on the final content chunk of the turn.
+        if let Some(reason) = json["choices"][0]["finish_reason"].as_str() {
+            acc.stop_reason = Some(reason.to_string());
         }
 
         if let Some(tool_calls) = json["choices"][0]["delta"]["tool_calls"].as_array() {
@@ -485,9 +725,9 @@ fn accumulate_openai_stream_chunk(
                 let key = tc.get("index").map(|v| v.to_string())
                     .or_else(|| tc.get("id").and_then(|v| v.as_str()).map(String::from));
                 if let Some(key) = key {
-                    tool_ids.insert(key.clone());
+                    acc.tool_ids.insert(key.clone());
 
-                    let entry = agent_question::tool_call_entry(tool_calls_acc, &key);
+                    let entry = agent_question::tool_call_entry(&mut acc.tool_calls, &key);
                     if let Some(name) = tc["function"]["name"].as_str() {
                         entry.name = Some(name.to_string());
                     }
@@ -500,12 +740,7 @@ fn accumulate_openai_stream_chunk(
     }
 }
 
-fn accumulate_anthropic_stream_chunk(
-    text: &str,
-    usage: &mut UsageInfo,
-    tool_ids: &mut HashSet<String>,
-    tool_calls_acc: &mut Vec<(String, agent_question::ToolCallAccumulator)>,
-) {
+fn accumulate_anthropic_stream_chunk(text: &str, acc: &mut StreamAccumulator) {
     for line in text.lines() {
         let Some(data) = line.strip_prefix("data: ") else { continue };
         let Ok(json) = serde_json::from_str::<Value>(data) else { continue };
@@ -513,20 +748,20 @@ fn accumulate_anthropic_stream_chunk(
         match json["type"].as_str() {
             Some("message_start") => {
                 let usage_obj = &json["message"]["usage"];
-                usage.prompt_tokens = usage_obj["input_tokens"].as_i64().unwrap_or(0);
-                usage.cache_creation_tokens = usage_obj["cache_creation_input_tokens"].as_i64().unwrap_or(0);
-                usage.cache_read_tokens = usage_obj["cache_read_input_tokens"].as_i64().unwrap_or(0);
+                acc.usage.prompt_tokens = usage_obj["input_tokens"].as_i64().unwrap_or(0);
+                acc.usage.cache_creation_tokens = usage_obj["cache_creation_input_tokens"].as_i64().unwrap_or(0);
+                acc.usage.cache_read_tokens = usage_obj["cache_read_input_tokens"].as_i64().unwrap_or(0);
             }
             Some("content_block_start") => {
                 if json["content_block"]["type"].as_str() == Some("tool_use") {
                     if let Some(id) = json["content_block"]["id"].as_str() {
-                        tool_ids.insert(id.to_string());
+                        acc.tool_ids.insert(id.to_string());
                     }
                     // Keyed by the block's stream index (not its id) so it
                     // lines up with content_block_delta below, which only
                     // carries the index, not the id, on each fragment.
                     if let Some(index) = json["index"].as_i64() {
-                        let entry = agent_question::tool_call_entry(tool_calls_acc, &index.to_string());
+                        let entry = agent_question::tool_call_entry(&mut acc.tool_calls, &index.to_string());
                         if let Some(name) = json["content_block"]["name"].as_str() {
                             entry.name = Some(name.to_string());
                         }
@@ -536,20 +771,82 @@ fn accumulate_anthropic_stream_chunk(
             Some("content_block_delta") => {
                 if json["delta"]["type"].as_str() == Some("input_json_delta") {
                     if let (Some(index), Some(fragment)) = (json["index"].as_i64(), json["delta"]["partial_json"].as_str()) {
-                        agent_question::tool_call_entry(tool_calls_acc, &index.to_string()).arguments.push_str(fragment);
+                        agent_question::tool_call_entry(&mut acc.tool_calls, &index.to_string()).arguments.push_str(fragment);
                     }
                 }
             }
             Some("message_delta") => {
                 if let Some(out) = json["usage"]["output_tokens"].as_i64() {
-                    usage.completion_tokens = out;
+                    acc.usage.completion_tokens = out;
                 }
+                if let Some(reason) = json["delta"]["stop_reason"].as_str() {
+                    acc.stop_reason = Some(reason.to_string());
+                }
+            }
+            Some("message_stop") => acc.saw_terminal = true,
+            // Anthropic can fail mid-stream (an overload after the headers
+            // already said 200), which is only visible as an error event.
+            Some("error") => {
+                let (error_type, message) = extract_error_details(&json);
+                acc.error_type = error_type;
+                acc.error_message = message;
             }
             _ => {}
         }
     }
 }
 
+/// Decides how a streamed call ended.
+///
+/// A stream is harder to classify than a unary call because the HTTP status
+/// is decided before any content exists: a 200 only means the request was
+/// accepted, not that an answer arrived. So three things can each override
+/// it — a non-2xx status (the body is a plain JSON error, not SSE), an error
+/// event mid-stream, and a stream that simply stopped without its terminal
+/// marker.
+fn classify_stream_outcome(
+    acc: &StreamAccumulator,
+    raw_text: &str,
+    status: StatusCode,
+    has_question: bool,
+    ttfb_ms: i64,
+    duration_ms: i64,
+) -> TaskOutcome {
+    let http_class = classify_http_status(status.as_u16());
+
+    let (status_str, error_type, error_message) = if http_class != session_state::STATUS_OK {
+        // Rejected outright: the body is a single JSON error document.
+        let parsed: Option<Value> = serde_json::from_str(raw_text).ok();
+        let (error_type, message) = parsed.as_ref().map(extract_error_details).unwrap_or((None, None));
+        (http_class, error_type, message)
+    } else if acc.error_type.is_some() || acc.error_message.is_some() {
+        // Accepted, then failed part-way through. An overload event here is
+        // still an overload, not a generic error, so it keeps its own state.
+        let is_overload = acc.error_type.as_deref() == Some("overloaded_error");
+        let class = if is_overload { session_state::STATUS_OVERLOADED } else { session_state::STATUS_ERROR };
+        (class, acc.error_type.clone(), acc.error_message.clone())
+    } else if !acc.saw_terminal {
+        (session_state::STATUS_INTERRUPTED, None, None)
+    } else {
+        (session_state::STATUS_OK, None, None)
+    };
+
+    TaskOutcome {
+        status: status_str.to_string(),
+        http_status: Some(status.as_u16() as i64),
+        error_type,
+        error_message,
+        // Only a cleanly finished turn can be waiting on the human: a cut-off
+        // stream isn't waiting for an answer, it needs to be retried.
+        awaiting_input: status_str == session_state::STATUS_OK
+            && turn_awaits_human(acc.stop_reason.as_deref(), has_question),
+        stop_reason: acc.stop_reason.clone(),
+        ttfb_ms: Some(ttfb_ms),
+        duration_ms: Some(duration_ms),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_streaming(
     state: Arc<AppState>,
     provider: Provider,
@@ -558,8 +855,10 @@ async fn handle_streaming(
     model_name: Option<String>,
     latency: i64,
     status: StatusCode,
+    call: CallContext,
 ) -> Result<Response, StatusCode> {
     let headers = res.headers().clone();
+    call.record_rate_limits(&state, provider, &headers).await;
 
     // Unbounded and non-blocking so a slow telemetry consumer can never add
     // latency to (or drop chunks from) the response the caller actually sees.
@@ -582,45 +881,41 @@ async fn handle_streaming(
     });
 
     tokio::spawn(async move {
-        let mut usage = UsageInfo::default();
-        let mut tool_ids: HashSet<String> = HashSet::new();
-        let mut tool_calls: Vec<(String, agent_question::ToolCallAccumulator)> = Vec::new();
+        let mut acc = StreamAccumulator::default();
         let mut raw_text = String::new();
 
         while let Some(chunk_text) = rx.recv().await {
             raw_text.push_str(&chunk_text);
             match provider {
-                Provider::OpenAI => accumulate_openai_stream_chunk(&chunk_text, &mut usage, &mut tool_ids, &mut tool_calls),
-                Provider::Anthropic => accumulate_anthropic_stream_chunk(&chunk_text, &mut usage, &mut tool_ids, &mut tool_calls),
+                Provider::OpenAI => accumulate_openai_stream_chunk(&chunk_text, &mut acc),
+                Provider::Anthropic => accumulate_anthropic_stream_chunk(&chunk_text, &mut acc),
             }
         }
-        usage.tool_calls_count = tool_ids.len() as i64;
+        // The loop above ends when the last chunk has been forwarded, which
+        // is the only moment the true wall-clock cost of a streamed call is
+        // known — `latency` was measured back when the headers arrived.
+        let duration_ms = call.started.elapsed().as_millis() as i64;
+        acc.usage.tool_calls_count = acc.tool_ids.len() as i64;
 
-        let agent_question = tool_calls.iter().find_map(|(_, acc)| {
-            let name = acc.name.as_deref()?;
-            if !agent_question::is_agent_question_tool(name) {
-                return None;
-            }
-            let arguments: Value = serde_json::from_str(&acc.arguments).ok()?;
-            agent_question::extract_question_text(&arguments).map(|text| (name.to_string(), text))
-        });
+        let agent_question = acc.agent_question();
+        let outcome = classify_stream_outcome(&acc, &raw_text, status, agent_question.is_some(), latency, duration_ms);
 
         let cost = model_name.as_deref().and_then(|m| state.pricing.estimate_cost(
             m,
             provider.as_str(),
-            usage.prompt_tokens,
-            usage.cache_creation_tokens,
-            usage.cache_read_tokens,
-            usage.completion_tokens,
+            acc.usage.prompt_tokens,
+            acc.usage.cache_creation_tokens,
+            acc.usage.cache_read_tokens,
+            acc.usage.completion_tokens,
         ));
 
         let _ = state.db.log_metric(
             task_id,
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            usage.cache_creation_tokens,
-            usage.cache_read_tokens,
-            usage.tool_calls_count,
+            acc.usage.prompt_tokens,
+            acc.usage.completion_tokens,
+            acc.usage.cache_creation_tokens,
+            acc.usage.cache_read_tokens,
+            acc.usage.tool_calls_count,
             latency,
             cost,
         ).await;
@@ -628,6 +923,8 @@ async fn handle_streaming(
         if let Some((tool, text)) = &agent_question {
             let _ = state.db.save_agent_question(task_id, tool, text).await;
         }
+        let _ = state.db.finish_task(task_id, &outcome).await;
+        call.notify(&state, "task_finished", &outcome.status);
     });
 
     // Preserve the upstream status/headers rather than always answering 200:
@@ -718,59 +1015,55 @@ mod tests {
 
     #[test]
     fn openai_stream_dedupes_tool_call_fragments_by_index() {
-        let mut usage = UsageInfo::default();
-        let mut tool_ids = HashSet::new();
-        let mut tool_calls = Vec::new();
+        let mut acc = StreamAccumulator::default();
 
         // First fragment carries `id`; the continuation fragment for the
         // same call only carries `index` — both must resolve to one call.
         accumulate_openai_stream_chunk(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"foo\"}}]}}]}\n\n",
-            &mut usage, &mut tool_ids, &mut tool_calls,
+            &mut acc,
         );
         accumulate_openai_stream_chunk(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n",
-            &mut usage, &mut tool_ids, &mut tool_calls,
+            &mut acc,
         );
         accumulate_openai_stream_chunk(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"function\":{\"name\":\"bar\"}}]}}]}\n\n",
-            &mut usage, &mut tool_ids, &mut tool_calls,
+            &mut acc,
         );
         accumulate_openai_stream_chunk(
             "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":25,\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n\ndata: [DONE]\n\n",
-            &mut usage, &mut tool_ids, &mut tool_calls,
+            &mut acc,
         );
 
-        assert_eq!(tool_ids.len(), 2);
-        assert_eq!(usage.prompt_tokens, 80);
-        assert_eq!(usage.cache_read_tokens, 40);
-        assert_eq!(usage.completion_tokens, 25);
+        assert_eq!(acc.tool_ids.len(), 2);
+        assert_eq!(acc.usage.prompt_tokens, 80);
+        assert_eq!(acc.usage.cache_read_tokens, 40);
+        assert_eq!(acc.usage.completion_tokens, 25);
     }
 
     #[test]
     fn anthropic_stream_accumulates_across_events() {
-        let mut usage = UsageInfo::default();
-        let mut tool_ids = HashSet::new();
-        let mut tool_calls = Vec::new();
+        let mut acc = StreamAccumulator::default();
 
         accumulate_anthropic_stream_chunk(
             "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":50,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":5}}}\n\n",
-            &mut usage, &mut tool_ids, &mut tool_calls,
+            &mut acc,
         );
         accumulate_anthropic_stream_chunk(
             "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\"}}\n\n",
-            &mut usage, &mut tool_ids, &mut tool_calls,
+            &mut acc,
         );
         accumulate_anthropic_stream_chunk(
             "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n",
-            &mut usage, &mut tool_ids, &mut tool_calls,
+            &mut acc,
         );
 
-        assert_eq!(usage.prompt_tokens, 50);
-        assert_eq!(usage.cache_creation_tokens, 10);
-        assert_eq!(usage.cache_read_tokens, 5);
-        assert_eq!(usage.completion_tokens, 42);
-        assert_eq!(tool_ids.len(), 1);
+        assert_eq!(acc.usage.prompt_tokens, 50);
+        assert_eq!(acc.usage.cache_creation_tokens, 10);
+        assert_eq!(acc.usage.cache_read_tokens, 5);
+        assert_eq!(acc.usage.completion_tokens, 42);
+        assert_eq!(acc.tool_ids.len(), 1);
     }
 
     #[test]
@@ -814,9 +1107,7 @@ mod tests {
 
     #[test]
     fn openai_stream_reconstructs_fragmented_question_arguments() {
-        let mut usage = UsageInfo::default();
-        let mut tool_ids = HashSet::new();
-        let mut tool_calls = Vec::new();
+        let mut acc = StreamAccumulator::default();
 
         // Built via json!() rather than hand-escaped string literals — the
         // "arguments" field is itself a fragment of a *different* JSON
@@ -837,40 +1128,169 @@ mod tests {
 
         for chunk in &chunks {
             let line = format!("data: {}\n\n", chunk);
-            accumulate_openai_stream_chunk(&line, &mut usage, &mut tool_ids, &mut tool_calls);
+            accumulate_openai_stream_chunk(&line, &mut acc);
         }
 
-        assert_eq!(tool_calls.len(), 1);
-        let (_, acc) = &tool_calls[0];
-        assert_eq!(acc.name.as_deref(), Some("ask_followup_question"));
-        let arguments: Value = serde_json::from_str(&acc.arguments).unwrap();
+        assert_eq!(acc.tool_calls.len(), 1);
+        let (_, entry) = &acc.tool_calls[0];
+        assert_eq!(entry.name.as_deref(), Some("ask_followup_question"));
+        let arguments: Value = serde_json::from_str(&entry.arguments).unwrap();
         assert_eq!(agent_question::extract_question_text(&arguments).as_deref(), Some("Add tests?"));
     }
 
     #[test]
     fn anthropic_stream_reconstructs_fragmented_question_input() {
-        let mut usage = UsageInfo::default();
-        let mut tool_ids = HashSet::new();
-        let mut tool_calls = Vec::new();
+        let mut acc = StreamAccumulator::default();
 
         accumulate_anthropic_stream_chunk(
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"ask_followup_question\"}}\n\n",
-            &mut usage, &mut tool_ids, &mut tool_calls,
+            &mut acc,
         );
         accumulate_anthropic_stream_chunk(
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"question\\\": \\\"Use \"}}\n\n",
-            &mut usage, &mut tool_ids, &mut tool_calls,
+            &mut acc,
         );
         accumulate_anthropic_stream_chunk(
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"TypeScript?\\\"}\"}}\n\n",
-            &mut usage, &mut tool_ids, &mut tool_calls,
+            &mut acc,
         );
 
-        assert_eq!(tool_calls.len(), 1);
-        let (_, acc) = &tool_calls[0];
-        assert_eq!(acc.name.as_deref(), Some("ask_followup_question"));
-        let arguments: Value = serde_json::from_str(&acc.arguments).unwrap();
+        assert_eq!(acc.tool_calls.len(), 1);
+        let (_, entry) = &acc.tool_calls[0];
+        assert_eq!(entry.name.as_deref(), Some("ask_followup_question"));
+        let arguments: Value = serde_json::from_str(&entry.arguments).unwrap();
         assert_eq!(agent_question::extract_question_text(&arguments).as_deref(), Some("Use TypeScript?"));
+    }
+
+    #[test]
+    fn http_statuses_map_onto_the_outcomes_the_dashboard_distinguishes() {
+        assert_eq!(classify_http_status(200), session_state::STATUS_OK);
+        assert_eq!(classify_http_status(429), session_state::STATUS_RATE_LIMITED);
+        assert_eq!(classify_http_status(529), session_state::STATUS_OVERLOADED);
+        assert_eq!(classify_http_status(503), session_state::STATUS_OVERLOADED);
+        assert_eq!(classify_http_status(401), session_state::STATUS_ERROR);
+        assert_eq!(classify_http_status(400), session_state::STATUS_ERROR);
+        assert_eq!(classify_http_status(500), session_state::STATUS_ERROR);
+    }
+
+    #[test]
+    fn error_envelope_is_read_from_either_providers_shape() {
+        let anthropic: Value = serde_json::from_str(
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"quota exhausted"}}"#
+        ).unwrap();
+        assert_eq!(
+            extract_error_details(&anthropic),
+            (Some("rate_limit_error".to_string()), Some("quota exhausted".to_string()))
+        );
+
+        // OpenAI sometimes sends `code` where Anthropic sends `type`.
+        let openai: Value = serde_json::from_str(
+            r#"{"error":{"code":"insufficient_quota","message":"You exceeded your quota"}}"#
+        ).unwrap();
+        assert_eq!(
+            extract_error_details(&openai),
+            (Some("insufficient_quota".to_string()), Some("You exceeded your quota".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_tool_using_turn_is_not_waiting_on_the_human() {
+        assert!(!turn_awaits_human(Some("tool_use"), false));
+        assert!(!turn_awaits_human(Some("tool_calls"), false));
+        assert!(turn_awaits_human(Some("end_turn"), false));
+        assert!(turn_awaits_human(Some("stop"), false));
+        // ...unless the tool it used was a question for the human.
+        assert!(turn_awaits_human(Some("tool_use"), true));
+    }
+
+    #[test]
+    fn stop_reason_is_read_from_each_providers_field() {
+        let openai: Value = serde_json::from_str(r#"{"choices":[{"finish_reason":"tool_calls"}]}"#).unwrap();
+        assert_eq!(extract_stop_reason(Provider::OpenAI, &openai).as_deref(), Some("tool_calls"));
+
+        let anthropic: Value = serde_json::from_str(r#"{"stop_reason":"end_turn"}"#).unwrap();
+        assert_eq!(extract_stop_reason(Provider::Anthropic, &anthropic).as_deref(), Some("end_turn"));
+    }
+
+    #[test]
+    fn openai_stream_records_the_finish_reason() {
+        let mut acc = StreamAccumulator::default();
+        accumulate_openai_stream_chunk(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            &mut acc,
+        );
+
+        assert_eq!(acc.stop_reason.as_deref(), Some("stop"));
+        assert!(acc.saw_terminal);
+    }
+
+    #[test]
+    fn anthropic_stream_records_stop_reason_and_terminal_event() {
+        let mut acc = StreamAccumulator::default();
+        accumulate_anthropic_stream_chunk(
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}\n\n",
+            &mut acc,
+        );
+        assert_eq!(acc.stop_reason.as_deref(), Some("tool_use"));
+        assert!(!acc.saw_terminal, "the stream has not ended yet");
+
+        accumulate_anthropic_stream_chunk("data: {\"type\":\"message_stop\"}\n\n", &mut acc);
+        assert!(acc.saw_terminal);
+    }
+
+    #[test]
+    fn an_error_event_mid_stream_is_captured_despite_a_200() {
+        let mut acc = StreamAccumulator::default();
+        accumulate_anthropic_stream_chunk(
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+            &mut acc,
+        );
+
+        let outcome = classify_stream_outcome(&acc, "", StatusCode::OK, false, 10, 20);
+        assert_eq!(outcome.status, session_state::STATUS_OVERLOADED);
+        assert_eq!(outcome.error_message.as_deref(), Some("Overloaded"));
+        assert!(!outcome.awaiting_input);
+    }
+
+    #[test]
+    fn a_stream_that_stops_without_its_terminal_marker_is_interrupted() {
+        let mut acc = StreamAccumulator::default();
+        accumulate_anthropic_stream_chunk(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+            &mut acc,
+        );
+
+        let outcome = classify_stream_outcome(&acc, "", StatusCode::OK, false, 10, 900);
+        assert_eq!(outcome.status, session_state::STATUS_INTERRUPTED);
+        assert_eq!(outcome.duration_ms, Some(900));
+    }
+
+    #[test]
+    fn a_completed_stream_that_ended_its_turn_is_waiting_on_the_human() {
+        let mut acc = StreamAccumulator::default();
+        accumulate_anthropic_stream_chunk(
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+            &mut acc,
+        );
+
+        let outcome = classify_stream_outcome(&acc, "", StatusCode::OK, false, 10, 20);
+        assert_eq!(outcome.status, session_state::STATUS_OK);
+        assert!(outcome.awaiting_input);
+    }
+
+    /// A 429 on a streaming request never produces SSE at all — the body is
+    /// one JSON error document, and the HTTP status must win over the
+    /// "no terminal marker seen" rule.
+    #[test]
+    fn a_rejected_streaming_request_is_classified_from_its_status_not_its_body() {
+        let acc = StreamAccumulator::default();
+        let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#;
+
+        let outcome = classify_stream_outcome(&acc, body, StatusCode::TOO_MANY_REQUESTS, false, 5, 5);
+        assert_eq!(outcome.status, session_state::STATUS_RATE_LIMITED);
+        assert_eq!(outcome.error_type.as_deref(), Some("rate_limit_error"));
+        assert_eq!(outcome.http_status, Some(429));
+        assert!(!outcome.awaiting_input);
     }
 
     #[test]

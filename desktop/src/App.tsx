@@ -1,12 +1,25 @@
 import React, { useEffect, useState } from "react"
 import { BrowserRouter, Routes, Route, Link, useLocation } from "react-router-dom"
-import { MessageSquare, Settings, BarChart3, Radio } from "lucide-react"
+import { MessageSquare, Settings, BarChart3, Radio, Bot } from "lucide-react"
 import AnalyticsDashboard from "./components/AnalyticsDashboard"
+import AgentStatusView from "./components/AgentStatusView"
 import TrafficView from "./components/TrafficView"
+import { SessionsProvider, useAttentionCount } from "./hooks/useSessions"
+
+const NAV_ITEMS = [
+  { to: "/", label: "Agents", icon: Bot },
+  { to: "/traffic", label: "Traffic", icon: Radio },
+  { to: "/analytics", label: "Analytics", icon: BarChart3 },
+  { to: "/chat", label: "Chat", icon: MessageSquare },
+  { to: "/settings", label: "Settings", icon: Settings },
+] as const
 
 function Layout({ children }: { children: React.ReactNode }) {
   const location = useLocation();
   const [status, setStatus] = useState("Initializing...")
+  // Surfaced on the nav itself so a waiting or blocked agent is visible from
+  // any tab — the dashboard shouldn't have to be the open one to be useful.
+  const attention = useAttentionCount()
 
   useEffect(() => {
     // Placeholder for Tauri command call
@@ -21,22 +34,24 @@ function Layout({ children }: { children: React.ReactNode }) {
           Harnesswurm
         </div>
         <nav className="flex-1 p-4 space-y-2">
-          <Link to="/" className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ` + (location.pathname === '/' ? 'bg-blue-600' : 'hover:bg-slate-800')}>
-            <MessageSquare size={20} />
-            <span>Chat</span>
-          </Link>
-          <Link to="/analytics" className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ` + (location.pathname === '/analytics' ? 'bg-blue-600' : 'hover:bg-slate-800')}>
-            <BarChart3 size={20} />
-            <span>Analytics</span>
-          </Link>
-          <Link to="/traffic" className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ` + (location.pathname === '/traffic' ? 'bg-blue-600' : 'hover:bg-slate-800')}>
-            <Radio size={20} />
-            <span>Traffic</span>
-          </Link>
-          <Link to="/settings" className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ` + (location.pathname === '/settings' ? 'bg-blue-600' : 'hover:bg-slate-800')}>
-            <Settings size={20} />
-            <span>Settings</span>
-          </Link>
+          {NAV_ITEMS.map(({ to, label, icon: Icon }) => (
+            <Link
+              key={to}
+              to={to}
+              className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ` + (location.pathname === to ? 'bg-blue-600' : 'hover:bg-slate-800')}
+            >
+              <Icon size={20} />
+              <span className="flex-1">{label}</span>
+              {to === "/" && attention > 0 && (
+                <span
+                  className="px-2 py-0.5 rounded-full bg-amber-400 text-slate-900 text-xs font-bold"
+                  title={`${attention} agent session(s) need you`}
+                >
+                  {attention}
+                </span>
+              )}
+            </Link>
+          ))}
         </nav>
         <div className="p-4 border-t border-slate-800 text-xs text-slate/50">
           Status: <span className="font-mono">{status}</span>
@@ -77,16 +92,23 @@ function SettingsView() {
 
 function App() {
   return (
-    <BrowserRouter>
-      <Layout>
-        <Routes>
-          <Route path="/" element={<ChatView />} />
-          <Route path="/analytics" element={<AnalyticsDashboard />} />
-          <Route path="/traffic" element={<TrafficView />} />
-          <Route path="/settings" element={<SettingsView />} />
-        </Routes>
-      </Layout>
-    </BrowserRouter>
+    // The provider wraps the router so the sidebar's attention badge reads
+    // the same live session data as the Agents view, from one subscription.
+    <SessionsProvider>
+      <BrowserRouter>
+        <Layout>
+          <Routes>
+            {/* Agents is the landing view: "what is everything doing right
+                now" is the question the app exists to answer. */}
+            <Route path="/" element={<AgentStatusView />} />
+            <Route path="/analytics" element={<AnalyticsDashboard />} />
+            <Route path="/traffic" element={<TrafficView />} />
+            <Route path="/chat" element={<ChatView />} />
+            <Route path="/settings" element={<SettingsView />} />
+          </Routes>
+        </Layout>
+      </BrowserRouter>
+    </SessionsProvider>
   )
 }
 
