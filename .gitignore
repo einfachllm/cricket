@@ -10,6 +10,7 @@ desktop/src-tauri/target/
 harnesswurm/backend/target/
 desktop/src-tauri/debug/
 desktop/src-tauri/release/
+desktop/src-tauri/gen/schemas/
 *.db
 *.db-journal
 *.db-shm

@@ -1,10 +1,14 @@
-#![cfg_attr(not(debug_assertions), target_os = "linux", features = ["tray-icon"])]
+// Hides the console window on release builds on Windows (the actual target
+// platform for this app); irrelevant on other OSes.
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+
+use tauri::Manager;
 
 fn main() {
   tauri::Builder::default()
     .setup(|app| {
       let data_dir = app
-        .path_resolver()
+        .path()
         .app_data_dir()
         .expect("could not resolve app data directory");
       std::fs::create_dir_all(&data_dir).expect("could not create app data directory");
