@@ -72,6 +72,107 @@ page and edit the file to match what you actually use; add or remove models
 freely. A model with no entry (or missing input/output prices) just shows no
 cost estimate rather than a wrong one.
 
+## Running it locally
+
+### Just the app (one command)
+
+The desktop app **embeds the backend in its own process** — there is no
+separate server to start:
+
+```bash
+cd desktop
+npm install
+npm run tauri dev
+```
+
+That opens the window with the proxy already listening on
+`127.0.0.1:8081`. State lives in the OS app-data directory (not the current
+working directory), and `agents.yaml` / `pricing.yaml` are seeded there on
+first run.
+
+To get an app you can just double-click, with no toolchain at all:
+
+```bash
+npm run tauri build          # → an installer/bundle in src-tauri/target/release/bundle
+```
+
+Both need the Tauri system dependencies for your OS —
+https://v2.tauri.app/start/prerequisites/ — plus Rust and Node.
+
+### Backend and UI separately (only for frontend work)
+
+Two terminals is a **development** convenience, not how the app ships: it
+gives you Vite's hot reload in a browser without rebuilding the Rust shell.
+Use it when iterating on the UI; otherwise use `npm run tauri dev` above.
+
+```bash
+cd harnesswurm/backend && cargo run     # http://127.0.0.1:8081
+cd desktop && npm run dev               # http://localhost:5173
+```
+
+Run `cargo run` from the same directory each time — the standalone binary
+keeps its state (`harnesswurm.db`, `agents.yaml`, `pricing.yaml`) in the
+current directory, which is a *different* database from the one the packaged
+app uses. Don't run both at once: whichever grabs port 8081 first wins, and
+the UI will quietly show that one's data.
+
+### See it working — without an API key
+```bash
+python3 harnesswurm/demo_seed.py --db <path-to-harnesswurm.db>
+```
+It writes one session per status. Pass `--db` the database the running app is
+using — for `cargo run` that's `harnesswurm/backend/harnesswurm.db` (the
+default, so `cd harnesswurm/backend && python3 ../demo_seed.py` is enough);
+for the packaged app it's under your OS app-data directory, which the app logs
+on startup.
+
+Open the Agents view and every state should be visible: thinking, running a
+tool, waiting for you, rate limited, auth failed, idle, plus provider quota
+bars. `--clear` removes them again — demo rows are prefixed `demo-` and are
+never confused with real captured traffic.
+
+Seed *after* the app is running: it closes out open calls on startup, so a
+seeded "Thinking" session would otherwise be reaped to *Interrupted* — which
+is itself the reaper working correctly.
+
+### Send a real call through the proxy
+With an API key, anything that speaks either API works — the proxy forwards
+whatever auth headers you already send:
+```bash
+curl http://localhost:8081/v1/chat/completions \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "X-Agent-ID: manual-test" -H "X-Session-ID: my-first-session" \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"say hi"}]}'
+```
+Watch the Agents view while it runs: the session appears as **Thinking**, then
+settles to **Waiting for you** once the turn ends. Add `"stream": true` to
+exercise the streaming path.
+
+### Point a real coding agent at it
+Set the agent's API base URL to the proxy. The two styles differ in how much
+of the path the client appends:
+
+| Client style | Base URL to configure |
+| --- | --- |
+| OpenAI-compatible (appends `/chat/completions`) | `http://localhost:8081/v1` |
+| Anthropic-compatible (appends `/v1/messages`) | `http://localhost:8081` |
+
+Most agents expose this as an environment variable or a config field
+(`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, a `baseUrl` setting…); the exact name
+varies per tool.
+
+**Known gap:** `X-Agent-ID` and `X-Session-ID` are how calls are attributed,
+and most agents send neither — those calls all collapse into a single
+`unknown_agent` / `default_session` bucket. If your agent can set custom
+headers, set them; if not, per-agent attribution isn't available yet.
+
+### Running the tests
+```bash
+cd harnesswurm/backend && cargo test     # parsing, pricing, DB, state rules
+cd desktop && npm test                   # UI, and npm run typecheck
+```
+
 ## Agent status
 
 Different agents (Claude Code, Kilo, opencode, aider, Cursor…) share no

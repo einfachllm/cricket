@@ -235,6 +235,10 @@ pub async fn run(config: ServerConfig) -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     println!("Proxy server listening on http://{}", config.bind_addr);
+    // Where state actually lives is not guessable from outside when the
+    // server is embedded — the desktop app puts it in a per-OS app-data
+    // directory — so print it rather than making people hunt for the database.
+    println!("State directory: {}", config.data_dir.display());
     axum::serve(listener, app).await?;
 
     Ok(())
