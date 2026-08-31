@@ -29,7 +29,19 @@ Anthropic-compatible agents.
    cargo run
    ```
    The server listens on `http://127.0.0.1:8081` by default; override with
-   the `BIND_ADDR` env var.
+   the `BIND_ADDR` env var. State (the database, `agents.yaml`,
+   `pricing.yaml`) lives in the current directory.
+
+### Embedding
+
+`backend` is a library (`src/lib.rs`) with a thin binary (`src/main.rs`) on
+top, not just a binary — `../desktop/src-tauri` depends on it directly and
+spawns `harnesswurm_backend::run(ServerConfig { bind_addr, data_dir })` from
+its own startup, so the desktop app is a single process with no separate
+`cargo run` needed. Point `data_dir` at wherever makes sense for the embedding
+host (a proper per-OS app data directory for a packaged app); `agents.yaml`
+and `pricing.yaml` are seeded there from the bundled defaults on first run if
+missing, and left alone (still user-editable) after that.
 
 ## Usage
 
