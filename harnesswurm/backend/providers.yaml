@@ -1,0 +1,43 @@
+# Where each provider's API actually lives.
+#
+# Harnesswurm forwards a call unchanged to the `base_url` of the provider it
+# resolved for that call, so anything speaking one of the two supported wire
+# formats works — the hosted APIs, a gateway, or a model server running on
+# localhost (Ollama, llama.cpp, vLLM, LM Studio, LiteLLM…).
+#
+# Fields:
+#   name      Identifier used in the proxy path (/p/<name>/…), in the
+#             X-Provider header, and recorded on every call (it is what the
+#             Traffic view shows and what `provider:` in pricing.yaml matches).
+#   api       Wire format this endpoint speaks: `openai` or `anthropic`.
+#             It selects how responses are parsed, not where they go.
+#   base_url  Exactly the base URL you would otherwise give the client:
+#             for `openai` the part before /chat/completions (usually ends
+#             in /v1), for `anthropic` the part before /v1/messages.
+#   default   Optional. The provider used for the plain /v1/chat/completions
+#             and /v1/messages routes — i.e. for clients that cannot set a
+#             custom base path or header. One per api style.
+#
+# Edits take effect on the next start of the app.
+providers:
+  - name: "openai"
+    api: "openai"
+    base_url: "https://api.openai.com/v1"
+    default: true
+
+  - name: "anthropic"
+    api: "anthropic"
+    base_url: "https://api.anthropic.com"
+    default: true
+
+  # A local model server. Point an OpenAI-compatible client at
+  # http://localhost:8081/p/ollama/v1 and its calls are proxied here:
+  # - name: "ollama"
+  #   api: "openai"
+  #   base_url: "http://localhost:11434/v1"
+
+  # Any other OpenAI-compatible endpoint — a gateway, a router, a colleague's
+  # box — is the same shape:
+  # - name: "vllm"
+  #   api: "openai"
+  #   base_url: "http://192.168.1.20:8000/v1"

@@ -19,10 +19,12 @@ use tokio::sync::{broadcast, mpsc};
 pub mod agent_question;
 pub mod db;
 pub mod pricing;
+pub mod providers;
 pub mod rate_limits;
 pub mod session_state;
 
 use db::TaskOutcome;
+use providers::{ApiStyle, ProviderTable};
 
 /// Capacity of the live-event fan-out. A slow dashboard that falls this far
 /// behind gets lagged out rather than holding memory: it only ever misses
@@ -31,6 +33,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 const DEFAULT_AGENTS_YAML: &str = include_str!("../agents.yaml");
 const DEFAULT_PRICING_YAML: &str = include_str!("../pricing.yaml");
+const DEFAULT_PROVIDERS_YAML: &str = include_str!("../providers.yaml");
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct AgentConfig {
@@ -43,24 +46,23 @@ struct AgentsFile {
     agents: Vec<AgentConfig>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Provider {
-    OpenAI,
-    Anthropic,
+/// One resolved upstream for a single call: which endpoint the request is
+/// forwarded to, and under which name it is recorded. `style` decides how
+/// the traffic is parsed; `name` is what the dashboard and `pricing.yaml`
+/// see, so a local endpoint shows up as itself rather than as "openai".
+#[derive(Debug, Clone)]
+struct Upstream {
+    name: String,
+    style: ApiStyle,
+    url: String,
 }
 
-impl Provider {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Provider::OpenAI => "openai",
-            Provider::Anthropic => "anthropic",
-        }
-    }
-
-    fn target_url(&self) -> &'static str {
-        match self {
-            Provider::OpenAI => "https://api.openai.com/v1/chat/completions",
-            Provider::Anthropic => "https://api.anthropic.com/v1/messages",
+impl From<&providers::ProviderConfig> for Upstream {
+    fn from(config: &providers::ProviderConfig) -> Self {
+        Self {
+            name: config.name.clone(),
+            style: config.api,
+            url: config.target_url(),
         }
     }
 }
@@ -100,10 +102,10 @@ impl CallContext {
     /// Stores the provider's quota headers, if it sent any. Skipping empty
     /// snapshots keeps the table to actual readings, so "no data" and
     /// "unlimited" stay distinguishable.
-    async fn record_rate_limits(&self, state: &AppState, provider: Provider, headers: &HeaderMap) {
+    async fn record_rate_limits(&self, state: &AppState, provider: &str, headers: &HeaderMap) {
         let snapshot = rate_limits::extract(headers);
         if !snapshot.is_empty() {
-            let _ = state.db.save_rate_limits(self.task_id, provider.as_str(), &snapshot).await;
+            let _ = state.db.save_rate_limits(self.task_id, provider, &snapshot).await;
         }
     }
 }
@@ -113,6 +115,10 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub agents: Vec<AgentConfig>,
     pub pricing: pricing::PricingTable,
+    /// Where each provider's API lives, from `providers.yaml`. Read per
+    /// call so a request can name its own upstream (path prefix or
+    /// `X-Provider`) instead of everything going to one hardcoded host.
+    pub providers: ProviderTable,
     /// Fan-out for "something changed" pings to any connected dashboard.
     /// Deliberately carries no state of its own: a subscriber re-reads the
     /// analytics endpoints on a ping, so there is exactly one definition of
@@ -174,8 +180,10 @@ pub async fn run(config: ServerConfig) -> Result<()> {
 
     let agents_path = config.data_dir.join("agents.yaml");
     let pricing_path = config.data_dir.join("pricing.yaml");
+    let providers_path = config.data_dir.join("providers.yaml");
     seed_default_file(&agents_path, DEFAULT_AGENTS_YAML)?;
     seed_default_file(&pricing_path, DEFAULT_PRICING_YAML)?;
+    seed_default_file(&providers_path, DEFAULT_PROVIDERS_YAML)?;
 
     let db_path = config.data_dir.join("harnesswurm.db");
     migrate_legacy_db(&config.data_dir, &db_path)?;
@@ -194,6 +202,9 @@ pub async fn run(config: ServerConfig) -> Result<()> {
 
     let pricing = pricing::PricingTable::load(&pricing_path);
 
+    let mut provider_table = ProviderTable::load(&providers_path);
+    provider_table.apply_env_overrides();
+
     // Any call still marked in-flight belongs to a previous process and can
     // never complete, so close those out before serving — otherwise they'd
     // show as agents perpetually "Thinking".
@@ -210,6 +221,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         client: reqwest::Client::new(),
         agents,
         pricing,
+        providers: provider_table,
         events,
     });
 
@@ -220,9 +232,16 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     // the Traffic tab and Analytics dashboard stay empty.
     let cors = tower_http::cors::CorsLayer::permissive();
 
+    let state_for_log = state.clone();
+
     let app = Router::new()
         .route("/v1/chat/completions", post(openai_proxy_handler))
         .route("/v1/messages", post(anthropic_proxy_handler))
+        // Same two endpoints, addressed at one named provider — the way a
+        // client that can only be given a base URL picks its upstream.
+        .route("/p/:provider/v1/chat/completions", post(named_openai_proxy_handler))
+        .route("/p/:provider/v1/messages", post(named_anthropic_proxy_handler))
+        .route("/v1/providers", get(get_providers))
         .route("/v1/analytics/experiments", get(get_experiments))
         .route("/v1/analytics/experiments/:id/metrics", get(get_experiment_metrics))
         .route("/v1/analytics/experiments/:id/comparison", get(get_experiment_comparison))
@@ -242,6 +261,18 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     // server is embedded — the desktop app puts it in a per-OS app-data
     // directory — so print it rather than making people hunt for the database.
     println!("State directory: {}", config.data_dir.display());
+    // Forwarding to the wrong host is otherwise invisible until a call
+    // fails, so say up front where each configured provider actually goes.
+    for provider in state_for_log.providers.all() {
+        let default_marker = if provider.default { " (default)" } else { "" };
+        println!(
+            "Provider {} [{}] -> {}{}",
+            provider.name,
+            provider.api.as_str(),
+            provider.target_url(),
+            default_marker
+        );
+    }
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -425,13 +456,76 @@ async fn get_events(State(state): State<Arc<AppState>>) -> Sse<impl futures::Str
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
+/// The configured providers, so the UI (and `curl`) can show what a call
+/// would be forwarded to without reading the YAML off disk.
+async fn get_providers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let list: Vec<Value> = state.providers.all().iter().map(|p| json!({
+        "name": p.name,
+        "api": p.api.as_str(),
+        "base_url": p.base_url,
+        "target_url": p.target_url(),
+        "default": p.default,
+    })).collect();
+    axum::Json(json!({ "providers": list }))
+}
+
+/// Which upstream this call goes to. A name given explicitly — in the path
+/// (`/p/<name>/…`) or in `X-Provider` — wins over the style's default, and
+/// an unknown one is refused rather than quietly forwarded to the hosted
+/// API under a name the caller didn't ask for.
+fn resolve_upstream(
+    providers: &ProviderTable,
+    style: ApiStyle,
+    named: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<Upstream, (StatusCode, String)> {
+    let requested = named
+        .or_else(|| headers.get("X-Provider").and_then(|v| v.to_str().ok()))
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+
+    let Some(name) = requested else {
+        return Ok(Upstream::from(providers.default_for(style)));
+    };
+
+    let config = providers.by_name(name).ok_or_else(|| (
+        StatusCode::NOT_FOUND,
+        format!(
+            "Unknown provider '{name}'. Configured providers: {}. Add it to providers.yaml.",
+            providers.names().join(", ")
+        ),
+    ))?;
+
+    // Forwarding an OpenAI-shaped body to an Anthropic endpoint (or the
+    // reverse) can only fail upstream, with a confusing error; say which
+    // route the provider actually belongs on instead.
+    if config.api != style {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Provider '{}' speaks the {} API, but this call came in on the {} endpoint. \
+                 Use {} instead.",
+                config.name,
+                config.api.as_str(),
+                style.as_str(),
+                match config.api {
+                    ApiStyle::OpenAI => "/p/<provider>/v1/chat/completions",
+                    ApiStyle::Anthropic => "/p/<provider>/v1/messages",
+                },
+            ),
+        ));
+    }
+
+    Ok(Upstream::from(config))
+}
+
 async fn openai_proxy_handler(
     state: State<Arc<AppState>>,
     headers: HeaderMap,
     method: Method,
     req: Request,
 ) -> Result<Response, StatusCode> {
-    proxy_handler(Provider::OpenAI, state.0, headers, method, req).await
+    proxy_handler(ApiStyle::OpenAI, None, state.0, headers, method, req).await
 }
 
 async fn anthropic_proxy_handler(
@@ -440,17 +534,47 @@ async fn anthropic_proxy_handler(
     method: Method,
     req: Request,
 ) -> Result<Response, StatusCode> {
-    proxy_handler(Provider::Anthropic, state.0, headers, method, req).await
+    proxy_handler(ApiStyle::Anthropic, None, state.0, headers, method, req).await
+}
+
+async fn named_openai_proxy_handler(
+    Path(provider): Path<String>,
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    method: Method,
+    req: Request,
+) -> Result<Response, StatusCode> {
+    proxy_handler(ApiStyle::OpenAI, Some(provider), state.0, headers, method, req).await
+}
+
+async fn named_anthropic_proxy_handler(
+    Path(provider): Path<String>,
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    method: Method,
+    req: Request,
+) -> Result<Response, StatusCode> {
+    proxy_handler(ApiStyle::Anthropic, Some(provider), state.0, headers, method, req).await
 }
 
 async fn proxy_handler(
-    provider: Provider,
+    style: ApiStyle,
+    named_provider: Option<String>,
     state: Arc<AppState>,
     headers: HeaderMap,
     method: Method,
     req: Request,
 ) -> Result<Response, StatusCode> {
     let start = Instant::now();
+
+    // Resolved before anything is recorded: a call that can't be routed is
+    // a configuration mistake to report back, not a task to log as failed.
+    let upstream = match resolve_upstream(&state.providers, style, named_provider.as_deref(), &headers) {
+        Ok(upstream) => upstream,
+        Err((status, message)) => {
+            return Ok((status, axum::Json(json!({ "error": { "message": message } }))).into_response());
+        }
+    };
 
     let agent_name = headers.get("X-Agent-ID")
         .and_then(|v| v.to_str().ok())
@@ -483,7 +607,7 @@ async fn proxy_handler(
         task_preview,
         Some(session_id.to_string()),
         model_name.clone(),
-        Some(provider.as_str().to_string()),
+        Some(upstream.name.clone()),
     ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let call = CallContext {
@@ -497,8 +621,8 @@ async fn proxy_handler(
     let _ = state.db.save_traffic_request(task_id, &request_text).await;
     call.notify(&state, "task_started", session_state::STATUS_IN_FLIGHT);
 
-    let forward_body: Vec<u8> = match (&parsed_body, provider, is_streaming) {
-        (Some(json), Provider::OpenAI, true) => {
+    let forward_body: Vec<u8> = match (&parsed_body, upstream.style, is_streaming) {
+        (Some(json), ApiStyle::OpenAI, true) => {
             // OpenAI only includes `usage` on the final streamed chunk when
             // asked for it; without this, streamed token counts are 0.
             let mut j = json.clone();
@@ -508,7 +632,7 @@ async fn proxy_handler(
         _ => body_bytes.to_vec(),
     };
 
-    let mut proxy_req = state.client.request(method, provider.target_url());
+    let mut proxy_req = state.client.request(method, &upstream.url);
     for header_name in ["authorization", "x-api-key", "anthropic-version", "anthropic-beta"] {
         if let Some(value) = headers.get(header_name) {
             proxy_req = proxy_req.header(header_name, value.clone());
@@ -543,9 +667,9 @@ async fn proxy_handler(
     let latency = start.elapsed().as_millis() as i64;
 
     if is_streaming {
-        handle_streaming(state, provider, response, task_id, model_name, latency, status, call).await
+        handle_streaming(state, upstream, response, task_id, model_name, latency, status, call).await
     } else {
-        Ok(handle_unary(state, provider, response, task_id, model_name, latency, status, call).await)
+        Ok(handle_unary(state, upstream, response, task_id, model_name, latency, status, call).await)
     }
 }
 
@@ -574,9 +698,9 @@ fn extract_task_preview(body: &Value) -> Option<String> {
     Some(normalized.chars().take(200).collect())
 }
 
-fn extract_usage(provider: Provider, json: &Value) -> UsageInfo {
+fn extract_usage(provider: ApiStyle, json: &Value) -> UsageInfo {
     match provider {
-        Provider::OpenAI => {
+        ApiStyle::OpenAI => {
             let usage = &json["usage"];
             let total_prompt = usage["prompt_tokens"].as_i64().unwrap_or(0);
             let cache_read = usage["prompt_tokens_details"]["cached_tokens"].as_i64().unwrap_or(0);
@@ -588,7 +712,7 @@ fn extract_usage(provider: Provider, json: &Value) -> UsageInfo {
                 tool_calls_count: json["choices"][0]["message"]["tool_calls"].as_array().map(|a| a.len() as i64).unwrap_or(0),
             }
         }
-        Provider::Anthropic => {
+        ApiStyle::Anthropic => {
             let usage = &json["usage"];
             UsageInfo {
                 prompt_tokens: usage["input_tokens"].as_i64().unwrap_or(0),
@@ -631,10 +755,10 @@ fn extract_error_details(json: &Value) -> (Option<String>, Option<String>) {
 /// "the agent went off to run a tool" apart from "the agent is done and
 /// waiting for you". OpenAI calls it `finish_reason`, Anthropic
 /// `stop_reason`, with different vocabularies for the same three outcomes.
-fn extract_stop_reason(provider: Provider, json: &Value) -> Option<String> {
+fn extract_stop_reason(provider: ApiStyle, json: &Value) -> Option<String> {
     match provider {
-        Provider::OpenAI => json["choices"][0]["finish_reason"].as_str().map(String::from),
-        Provider::Anthropic => json["stop_reason"].as_str().map(String::from),
+        ApiStyle::OpenAI => json["choices"][0]["finish_reason"].as_str().map(String::from),
+        ApiStyle::Anthropic => json["stop_reason"].as_str().map(String::from),
     }
 }
 
@@ -651,12 +775,12 @@ fn turn_awaits_human(stop_reason: Option<&str>, has_question: bool) -> bool {
 ///
 /// Unnamed tool calls are skipped rather than recorded as an empty name: a
 /// malformed fragment should not become a phantom tool in the breakdown.
-fn extract_tool_names(provider: Provider, json: &Value) -> Vec<String> {
+fn extract_tool_names(provider: ApiStyle, json: &Value) -> Vec<String> {
     let names: Vec<&str> = match provider {
-        Provider::OpenAI => json["choices"][0]["message"]["tool_calls"].as_array().map(|calls| {
+        ApiStyle::OpenAI => json["choices"][0]["message"]["tool_calls"].as_array().map(|calls| {
             calls.iter().filter_map(|tc| tc["function"]["name"].as_str()).collect()
         }),
-        Provider::Anthropic => json["content"].as_array().map(|blocks| {
+        ApiStyle::Anthropic => json["content"].as_array().map(|blocks| {
             blocks.iter()
                 .filter(|b| b["type"] == "tool_use")
                 .filter_map(|b| b["name"].as_str())
@@ -670,9 +794,9 @@ fn extract_tool_names(provider: Provider, json: &Value) -> Vec<String> {
 /// Scans the same tool-calls/content a response already carries for one
 /// matching a known "ask the human a question" convention. Unary twin of
 /// the streaming accumulate-then-scan path in handle_streaming.
-fn extract_agent_question(provider: Provider, json: &Value) -> Option<(String, String)> {
+fn extract_agent_question(provider: ApiStyle, json: &Value) -> Option<(String, String)> {
     match provider {
-        Provider::OpenAI => {
+        ApiStyle::OpenAI => {
             let tool_calls = json["choices"][0]["message"]["tool_calls"].as_array()?;
             tool_calls.iter().find_map(|tc| {
                 let name = tc["function"]["name"].as_str().unwrap_or("");
@@ -684,7 +808,7 @@ fn extract_agent_question(provider: Provider, json: &Value) -> Option<(String, S
                 agent_question::extract_question_text(&arguments).map(|text| (name.to_string(), text))
             })
         }
-        Provider::Anthropic => {
+        ApiStyle::Anthropic => {
             let content = json["content"].as_array()?;
             content.iter().find_map(|block| {
                 if block["type"] != "tool_use" {
@@ -703,7 +827,7 @@ fn extract_agent_question(provider: Provider, json: &Value) -> Option<(String, S
 #[allow(clippy::too_many_arguments)]
 async fn handle_unary(
     state: Arc<AppState>,
-    provider: Provider,
+    upstream: Upstream,
     res: reqwest::Response,
     task_id: i64,
     model_name: Option<String>,
@@ -717,17 +841,17 @@ async fn handle_unary(
     let parsed_response: Option<Value> = serde_json::from_slice(&res_bytes).ok();
 
     let usage = parsed_response.as_ref()
-        .map(|json| extract_usage(provider, json))
+        .map(|json| extract_usage(upstream.style, json))
         .unwrap_or_default();
     let agent_question = parsed_response.as_ref()
-        .and_then(|json| extract_agent_question(provider, json));
-    let stop_reason = parsed_response.as_ref().and_then(|json| extract_stop_reason(provider, json));
+        .and_then(|json| extract_agent_question(upstream.style, json));
+    let stop_reason = parsed_response.as_ref().and_then(|json| extract_stop_reason(upstream.style, json));
     let (error_type, error_message) = parsed_response.as_ref()
         .map(extract_error_details)
         .unwrap_or((None, None));
 
     let tool_names = parsed_response.as_ref()
-        .map(|json| extract_tool_names(provider, json))
+        .map(|json| extract_tool_names(upstream.style, json))
         .unwrap_or_default();
 
     let response_text = String::from_utf8_lossy(&res_bytes).to_string();
@@ -752,12 +876,12 @@ async fn handle_unary(
         duration_ms: Some(duration_ms),
     };
     let _ = state.db.finish_task(task_id, &outcome).await;
-    call.record_rate_limits(&state, provider, &headers).await;
+    call.record_rate_limits(&state, &upstream.name, &headers).await;
     call.notify(&state, "task_finished", &outcome.status);
 
     let cost = model_name.as_deref().and_then(|m| state.pricing.estimate_cost(
         m,
-        provider.as_str(),
+        &upstream.name,
         usage.prompt_tokens,
         usage.cache_creation_tokens,
         usage.cache_read_tokens,
@@ -986,7 +1110,7 @@ fn classify_stream_outcome(
 #[allow(clippy::too_many_arguments)]
 async fn handle_streaming(
     state: Arc<AppState>,
-    provider: Provider,
+    upstream: Upstream,
     res: reqwest::Response,
     task_id: i64,
     model_name: Option<String>,
@@ -995,7 +1119,7 @@ async fn handle_streaming(
     call: CallContext,
 ) -> Result<Response, StatusCode> {
     let headers = res.headers().clone();
-    call.record_rate_limits(&state, provider, &headers).await;
+    call.record_rate_limits(&state, &upstream.name, &headers).await;
 
     // Unbounded and non-blocking so a slow telemetry consumer can never add
     // latency to (or drop chunks from) the response the caller actually sees.
@@ -1023,9 +1147,9 @@ async fn handle_streaming(
 
         while let Some(chunk_text) = rx.recv().await {
             raw_text.push_str(&chunk_text);
-            match provider {
-                Provider::OpenAI => accumulate_openai_stream_chunk(&chunk_text, &mut acc),
-                Provider::Anthropic => accumulate_anthropic_stream_chunk(&chunk_text, &mut acc),
+            match upstream.style {
+                ApiStyle::OpenAI => accumulate_openai_stream_chunk(&chunk_text, &mut acc),
+                ApiStyle::Anthropic => accumulate_anthropic_stream_chunk(&chunk_text, &mut acc),
             }
         }
         // The loop above ends when the last chunk has been forwarded, which
@@ -1039,7 +1163,7 @@ async fn handle_streaming(
 
         let cost = model_name.as_deref().and_then(|m| state.pricing.estimate_cost(
             m,
-            provider.as_str(),
+            &upstream.name,
             acc.usage.prompt_tokens,
             acc.usage.cache_creation_tokens,
             acc.usage.cache_read_tokens,
@@ -1085,6 +1209,91 @@ async fn handle_streaming(
 mod tests {
     use super::*;
 
+    const TEST_PROVIDERS: &str = "providers:\n\
+        \x20 - name: openai\n    api: openai\n    base_url: https://api.openai.com/v1\n    default: true\n\
+        \x20 - name: ollama\n    api: openai\n    base_url: http://localhost:11434/v1\n\
+        \x20 - name: anthropic\n    api: anthropic\n    base_url: https://api.anthropic.com\n    default: true\n";
+
+    fn provider_table() -> ProviderTable {
+        ProviderTable::parse(TEST_PROVIDERS).expect("test providers parse")
+    }
+
+    fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn an_unnamed_call_goes_to_the_style_default() {
+        let upstream = resolve_upstream(&provider_table(), ApiStyle::OpenAI, None, &HeaderMap::new()).unwrap();
+        assert_eq!(upstream.name, "openai");
+        assert_eq!(upstream.url, "https://api.openai.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn a_named_provider_is_forwarded_to_its_own_base_url() {
+        let upstream = resolve_upstream(&provider_table(), ApiStyle::OpenAI, Some("ollama"), &HeaderMap::new()).unwrap();
+        assert_eq!(upstream.name, "ollama");
+        assert_eq!(upstream.url, "http://localhost:11434/v1/chat/completions");
+        // The name, not the wire format, is what the call is recorded under,
+        // so a local run doesn't show up in the dashboard as "openai".
+        assert_eq!(upstream.style, ApiStyle::OpenAI);
+    }
+
+    #[test]
+    fn the_x_provider_header_selects_an_upstream_too() {
+        let headers = header_map(&[("x-provider", "ollama")]);
+        let upstream = resolve_upstream(&provider_table(), ApiStyle::OpenAI, None, &headers).unwrap();
+        assert_eq!(upstream.name, "ollama");
+    }
+
+    #[test]
+    fn the_path_wins_over_the_header() {
+        let headers = header_map(&[("x-provider", "ollama")]);
+        let upstream = resolve_upstream(&provider_table(), ApiStyle::OpenAI, Some("openai"), &headers).unwrap();
+        assert_eq!(upstream.name, "openai");
+    }
+
+    #[test]
+    fn an_unknown_provider_is_refused_rather_than_sent_to_the_hosted_api() {
+        let (status, message) = resolve_upstream(
+            &provider_table(), ApiStyle::OpenAI, Some("typo"), &HeaderMap::new(),
+        ).unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(message.contains("ollama"), "the error should list what is configured: {message}");
+    }
+
+    #[test]
+    fn a_provider_reached_on_the_wrong_style_endpoint_is_refused() {
+        let (status, message) = resolve_upstream(
+            &provider_table(), ApiStyle::Anthropic, Some("ollama"), &HeaderMap::new(),
+        ).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("chat/completions"), "the error should name the right route: {message}");
+    }
+
+    #[test]
+    fn an_empty_provider_header_falls_back_to_the_default() {
+        let headers = header_map(&[("x-provider", "   ")]);
+        let upstream = resolve_upstream(&provider_table(), ApiStyle::OpenAI, None, &headers).unwrap();
+        assert_eq!(upstream.name, "openai");
+    }
+
+    #[test]
+    fn the_bundled_default_providers_yaml_parses() {
+        // It ships as a first-run default, so a typo in it would leave every
+        // fresh install silently on the fallback rather than its own config.
+        let table = ProviderTable::parse(DEFAULT_PROVIDERS_YAML).expect("bundled providers.yaml parses");
+        assert_eq!(table.default_for(ApiStyle::OpenAI).name, "openai");
+        assert_eq!(table.default_for(ApiStyle::Anthropic).name, "anthropic");
+    }
+
     #[test]
     fn task_preview_prefers_last_user_message_string_content() {
         let body: Value = serde_json::from_str(r#"{
@@ -1128,7 +1337,7 @@ mod tests {
             "usage": {"prompt_tokens": 100, "completion_tokens": 20, "prompt_tokens_details": {"cached_tokens": 30}}
         }"#).unwrap();
 
-        let usage = extract_usage(Provider::OpenAI, &json);
+        let usage = extract_usage(ApiStyle::OpenAI, &json);
         assert_eq!(usage.prompt_tokens, 70);
         assert_eq!(usage.cache_read_tokens, 30);
         assert_eq!(usage.cache_creation_tokens, 0);
@@ -1146,7 +1355,7 @@ mod tests {
             ]}}]
         }"#).unwrap();
         assert_eq!(
-            extract_tool_names(Provider::OpenAI, &openai),
+            extract_tool_names(ApiStyle::OpenAI, &openai),
             vec!["read_file", "read_file", "bash"],
         );
 
@@ -1158,7 +1367,7 @@ mod tests {
             ]
         }"#).unwrap();
         assert_eq!(
-            extract_tool_names(Provider::Anthropic, &anthropic),
+            extract_tool_names(ApiStyle::Anthropic, &anthropic),
             vec!["read_file", "read_file"],
         );
     }
@@ -1171,14 +1380,14 @@ mod tests {
                 {"function": {"name": "bash"}}
             ]}}]
         }"#).unwrap();
-        assert_eq!(extract_tool_names(Provider::OpenAI, &json), vec!["bash"]);
+        assert_eq!(extract_tool_names(ApiStyle::OpenAI, &json), vec!["bash"]);
     }
 
     #[test]
     fn a_response_with_no_tools_names_none() {
         let json: Value = serde_json::from_str(r#"{"choices": [{"message": {"content": "done"}}]}"#).unwrap();
-        assert!(extract_tool_names(Provider::OpenAI, &json).is_empty());
-        assert!(extract_tool_names(Provider::Anthropic, &json).is_empty());
+        assert!(extract_tool_names(ApiStyle::OpenAI, &json).is_empty());
+        assert!(extract_tool_names(ApiStyle::Anthropic, &json).is_empty());
     }
 
     #[test]
@@ -1204,7 +1413,7 @@ mod tests {
             "usage": {"input_tokens": 50, "output_tokens": 15, "cache_creation_input_tokens": 200, "cache_read_input_tokens": 400}
         }"#).unwrap();
 
-        let usage = extract_usage(Provider::Anthropic, &json);
+        let usage = extract_usage(ApiStyle::Anthropic, &json);
         assert_eq!(usage.prompt_tokens, 50);
         assert_eq!(usage.cache_creation_tokens, 200);
         assert_eq!(usage.cache_read_tokens, 400);
@@ -1274,7 +1483,7 @@ mod tests {
             ]}}]
         }"#).unwrap();
 
-        let result = extract_agent_question(Provider::OpenAI, &json);
+        let result = extract_agent_question(ApiStyle::OpenAI, &json);
         assert_eq!(result, Some(("ask_followup_question".to_string(), "Which file?".to_string())));
     }
 
@@ -1286,7 +1495,7 @@ mod tests {
             ]}}]
         }"#).unwrap();
 
-        assert_eq!(extract_agent_question(Provider::OpenAI, &json), None);
+        assert_eq!(extract_agent_question(ApiStyle::OpenAI, &json), None);
     }
 
     #[test]
@@ -1300,7 +1509,7 @@ mod tests {
             ]
         }"#).unwrap();
 
-        let result = extract_agent_question(Provider::Anthropic, &json);
+        let result = extract_agent_question(ApiStyle::Anthropic, &json);
         assert_eq!(result, Some(("AskUserQuestion".to_string(), "Use TypeScript?".to_string())));
     }
 
@@ -1405,10 +1614,10 @@ mod tests {
     #[test]
     fn stop_reason_is_read_from_each_providers_field() {
         let openai: Value = serde_json::from_str(r#"{"choices":[{"finish_reason":"tool_calls"}]}"#).unwrap();
-        assert_eq!(extract_stop_reason(Provider::OpenAI, &openai).as_deref(), Some("tool_calls"));
+        assert_eq!(extract_stop_reason(ApiStyle::OpenAI, &openai).as_deref(), Some("tool_calls"));
 
         let anthropic: Value = serde_json::from_str(r#"{"stop_reason":"end_turn"}"#).unwrap();
-        assert_eq!(extract_stop_reason(Provider::Anthropic, &anthropic).as_deref(), Some("end_turn"));
+        assert_eq!(extract_stop_reason(ApiStyle::Anthropic, &anthropic).as_deref(), Some("end_turn"));
     }
 
     #[test]
