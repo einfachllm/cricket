@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, BarChart, Bar } from 'recharts';
 import { Activity, TrendingUp, AlertCircle, DollarSign } from 'lucide-react';
+import ExperimentComparison from './ExperimentComparison';
 
 interface MetricData {
   timestamp: string;
@@ -138,7 +139,10 @@ const AnalyticsDashboard = () => {
           </div>
         </div>
 
-        <div className="lg:col-span-3 bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+        <div className="lg:col-span-3 space-y-6">
+          {selectedExperiment && <ExperimentComparison experimentId={selectedExperiment} />}
+
+          <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
           {loading ? (
             <div className="h-64 flex items-center justify-center">
               <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
@@ -168,6 +172,7 @@ const AnalyticsDashboard = () => {
               <p>Select an experiment to view detailed metrics</p>
             </div>
           )}
+          </div>
         </div>
       </div>
     </div>

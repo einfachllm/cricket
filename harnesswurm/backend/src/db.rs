@@ -30,6 +30,18 @@ pub struct TaskOutcome {
 /// nearly every successful call.
 const RATE_LIMIT_SCAN_ROWS: i64 = 200;
 
+/// The run did what it was asked: the change works, the issue is fixed.
+pub const VERDICT_SOLVED: &str = "solved";
+/// The run did not — it gave up, went in circles, or produced something wrong.
+pub const VERDICT_FAILED: &str = "failed";
+
+/// Whether a string is a verdict the comparison understands. Checked at the
+/// edge so an unrecognised value is a 400 rather than a row that quietly
+/// matches nothing when the comparison later filters on it.
+pub fn is_valid_verdict(verdict: &str) -> bool {
+    verdict == VERDICT_SOLVED || verdict == VERDICT_FAILED
+}
+
 /// One stored quota reading, with when it was taken.
 #[derive(Debug, Clone)]
 struct RateLimitReading {
@@ -174,6 +186,21 @@ impl Database {
             );"
         ).execute(&pool).await?;
 
+        // Whether a run actually solved what it was given. Keyed by the run
+        // (agent + session), not by call, because that is the grain a human
+        // can actually judge: individual calls have no notion of success.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS session_verdicts (
+                agent_id INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                verdict TEXT NOT NULL,
+                note TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (agent_id, session_id),
+                FOREIGN KEY(agent_id) REFERENCES agents(id)
+            );"
+        ).execute(&pool).await?;
+
         // Older on-disk databases predate these columns; add them in place so
         // existing installs upgrade without losing history.
         Self::add_column_if_missing(&pool, "tasks", "provider", "TEXT").await?;
@@ -198,6 +225,8 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(agent_id, session_id, id)")
             .execute(&pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_tasks_timestamp ON tasks(timestamp DESC)")
+            .execute(&pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_tasks_experiment ON tasks(experiment_id, agent_id, session_id)")
             .execute(&pool).await?;
 
         Ok(Self { pool })
@@ -473,6 +502,175 @@ impl Database {
         }).collect();
 
         Ok(metrics)
+    }
+
+    /// One row per *run* in an experiment, where a run is one agent working
+    /// one session.
+    ///
+    /// This is the grain that answers "which agent solved it cheaper", and
+    /// the reason `get_experiment_metrics` cannot: that returns a per-call
+    /// time series with no agent on it, so two agents pointed at the same
+    /// experiment are indistinguishable once their calls interleave.
+    ///
+    /// Cost is summed with unpriced calls counted separately rather than
+    /// treated as free — a run on a model missing from `pricing.yaml` would
+    /// otherwise total $0.00 and win the comparison outright.
+    pub async fn get_experiment_comparison(&self, experiment_id: i64) -> Result<Vec<Value>> {
+        let rows = sqlx::query(
+            "WITH call AS (
+                SELECT
+                    t.agent_id,
+                    -- session_id is nullable on tasks, but a verdict needs a
+                    -- stable key; '' is that key for calls sent without one.
+                    COALESCE(t.session_id, '') AS session_key,
+                    t.session_id,
+                    t.timestamp,
+                    t.status,
+                    t.model_name,
+                    t.provider,
+                    t.duration_ms,
+                    COALESCE(mm.prompt_tokens, 0) + COALESCE(mm.cache_creation_tokens, 0)
+                        + COALESCE(mm.cache_read_tokens, 0) AS input_tokens,
+                    COALESCE(mm.completion_tokens, 0) AS output_tokens,
+                    COALESCE(mm.cache_read_tokens, 0) AS cache_read_tokens,
+                    COALESCE(mm.tool_calls_count, 0) AS tool_calls,
+                    mm.cost_estimate
+                FROM tasks t
+                LEFT JOIN (
+                    SELECT task_id,
+                           MAX(prompt_tokens) AS prompt_tokens,
+                           MAX(completion_tokens) AS completion_tokens,
+                           MAX(cache_creation_tokens) AS cache_creation_tokens,
+                           MAX(cache_read_tokens) AS cache_read_tokens,
+                           MAX(tool_calls_count) AS tool_calls_count,
+                           MAX(cost_estimate) AS cost_estimate
+                    FROM metrics GROUP BY task_id
+                ) mm ON mm.task_id = t.id
+                WHERE t.experiment_id = ?
+             )
+             SELECT
+                a.name AS agent_name,
+                c.session_key AS session_key,
+                MAX(c.session_id) AS session_id,
+                COUNT(*) AS call_count,
+                MIN(c.timestamp) AS first_seen,
+                MAX(c.timestamp) AS last_seen,
+                CAST(strftime('%s', MAX(c.timestamp)) AS INTEGER)
+                    - CAST(strftime('%s', MIN(c.timestamp)) AS INTEGER) AS wall_clock_seconds,
+                SUM(c.input_tokens) AS input_tokens,
+                SUM(c.output_tokens) AS output_tokens,
+                SUM(c.cache_read_tokens) AS cache_read_tokens,
+                SUM(c.tool_calls) AS tool_calls,
+                -- CAST because SQLite infers INTEGER for this SUM when every
+                -- call is unpriced, which then fails to decode as an f64.
+                CAST(SUM(COALESCE(c.cost_estimate, 0)) AS REAL) AS total_cost,
+                SUM(CASE WHEN c.cost_estimate IS NULL THEN 1 ELSE 0 END) AS unpriced_calls,
+                SUM(COALESCE(c.duration_ms, 0)) AS busy_ms,
+                SUM(CASE WHEN c.status = 'rate_limited' THEN 1 ELSE 0 END) AS rate_limited_calls,
+                SUM(CASE WHEN c.status IN ('error', 'overloaded') THEN 1 ELSE 0 END) AS error_calls,
+                -- A run with a call still open has not finished spending, so
+                -- its total is a running tally rather than a result.
+                SUM(CASE WHEN c.status = 'in_flight' THEN 1 ELSE 0 END) AS in_flight_calls,
+                GROUP_CONCAT(DISTINCT c.model_name) AS models,
+                GROUP_CONCAT(DISTINCT c.provider) AS providers,
+                MAX(v.verdict) AS verdict,
+                MAX(v.note) AS verdict_note
+             FROM call c
+             JOIN agents a ON a.id = c.agent_id
+             LEFT JOIN session_verdicts v
+                    ON v.agent_id = c.agent_id AND v.session_id = c.session_key
+             GROUP BY c.agent_id, c.session_key
+             ORDER BY total_cost ASC, agent_name ASC"
+        )
+        .bind(experiment_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let runs = rows.iter().map(|row| {
+            json!({
+                "agent_name": row.get::<String, _>("agent_name"),
+                "session_key": row.get::<String, _>("session_key"),
+                "session_id": row.get::<Option<String>, _>("session_id"),
+                "call_count": row.get::<i64, _>("call_count"),
+                "first_seen": row.get::<Option<String>, _>("first_seen"),
+                "last_seen": row.get::<Option<String>, _>("last_seen"),
+                "wall_clock_seconds": row.get::<Option<i64>, _>("wall_clock_seconds").unwrap_or(0),
+                "input_tokens": row.get::<Option<i64>, _>("input_tokens").unwrap_or(0),
+                "output_tokens": row.get::<Option<i64>, _>("output_tokens").unwrap_or(0),
+                "cache_read_tokens": row.get::<Option<i64>, _>("cache_read_tokens").unwrap_or(0),
+                "tool_calls": row.get::<Option<i64>, _>("tool_calls").unwrap_or(0),
+                "total_cost": row.get::<Option<f64>, _>("total_cost").unwrap_or(0.0),
+                "unpriced_calls": row.get::<Option<i64>, _>("unpriced_calls").unwrap_or(0),
+                "busy_ms": row.get::<Option<i64>, _>("busy_ms").unwrap_or(0),
+                "rate_limited_calls": row.get::<Option<i64>, _>("rate_limited_calls").unwrap_or(0),
+                "error_calls": row.get::<Option<i64>, _>("error_calls").unwrap_or(0),
+                "in_flight_calls": row.get::<Option<i64>, _>("in_flight_calls").unwrap_or(0),
+                "models": row.get::<Option<String>, _>("models"),
+                "providers": row.get::<Option<String>, _>("providers"),
+                "verdict": row.get::<Option<String>, _>("verdict"),
+                "verdict_note": row.get::<Option<String>, _>("verdict_note"),
+            })
+        }).collect();
+
+        Ok(runs)
+    }
+
+    /// Records whether a run actually solved the task it was given.
+    ///
+    /// The proxy can measure what a run *cost* but not whether it was any
+    /// good — nothing in the traffic says the patch compiles. That judgement
+    /// is a human's, and without it "cheapest" would crown whichever agent
+    /// gave up first.
+    ///
+    /// A `verdict` of `None` clears a previous call, so a misclick is
+    /// undoable. Returns `false` if no agent by that name exists, which the
+    /// caller turns into a 404 rather than inventing an agent from a typo.
+    pub async fn set_session_verdict(
+        &self,
+        agent_name: &str,
+        session_id: Option<&str>,
+        verdict: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        let agent_id: Option<i64> = sqlx::query("SELECT id FROM agents WHERE name = ?")
+            .bind(agent_name)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| row.get(0));
+
+        let agent_id = match agent_id {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let session_key = session_id.unwrap_or("");
+
+        match verdict {
+            Some(verdict) => {
+                sqlx::query(
+                    "INSERT INTO session_verdicts (agent_id, session_id, verdict, note)
+                     VALUES (?, ?, ?, ?)
+                     ON CONFLICT(agent_id, session_id) DO UPDATE SET
+                        verdict = excluded.verdict,
+                        note = excluded.note,
+                        updated_at = CURRENT_TIMESTAMP"
+                )
+                .bind(agent_id)
+                .bind(session_key)
+                .bind(verdict)
+                .bind(note)
+                .execute(&self.pool)
+                .await?;
+            }
+            None => {
+                sqlx::query("DELETE FROM session_verdicts WHERE agent_id = ? AND session_id = ?")
+                    .bind(agent_id)
+                    .bind(session_key)
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+
+        Ok(true)
     }
 
     /// One row per task, aggregated across its metric rows (a streaming task
@@ -1141,5 +1339,201 @@ mod tests {
         assert_eq!(traffic["agent_question_text"], "Which file?");
 
         Ok(())
+    }
+
+    /// One completed call by `agent` in `session`, attributed to `experiment`.
+    async fn seed_run_call(
+        db: &Database,
+        experiment_id: i64,
+        agent: &str,
+        session: &str,
+        cost: Option<f64>,
+    ) -> Result<i64> {
+        let agent_id = db.get_or_create_agent(agent).await?;
+        let task_id = db.create_task(
+            agent_id,
+            Some(experiment_id),
+            None,
+            Some(session.to_string()),
+            Some("gpt-4o".to_string()),
+            Some("openai".to_string()),
+        ).await?;
+        db.log_metric(task_id, 1000, 200, 0, 500, 2, 300, cost).await?;
+        db.finish_task(task_id, &ok_outcome("stop", false)).await?;
+        Ok(task_id)
+    }
+
+    #[tokio::test]
+    async fn comparison_folds_an_experiment_into_one_row_per_agent_and_session() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+
+        // Two calls from one agent, one from the other: the run is the unit,
+        // not the call, so this must come back as two rows.
+        seed_run_call(&db, experiment_id, "kilo", "run-a", Some(0.10)).await?;
+        seed_run_call(&db, experiment_id, "kilo", "run-a", Some(0.05)).await?;
+        seed_run_call(&db, experiment_id, "opencode", "run-b", Some(0.40)).await?;
+
+        let runs = db.get_experiment_comparison(experiment_id).await?;
+        assert_eq!(runs.len(), 2);
+
+        // Cheapest first.
+        assert_eq!(runs[0]["agent_name"], "kilo");
+        assert_eq!(runs[0]["call_count"], 2);
+        assert!((runs[0]["total_cost"].as_f64().unwrap() - 0.15).abs() < 1e-9);
+        assert_eq!(runs[0]["input_tokens"], 3000);
+        assert_eq!(runs[0]["output_tokens"], 400);
+        assert_eq!(runs[0]["cache_read_tokens"], 1000);
+        assert_eq!(runs[0]["tool_calls"], 4);
+        assert_eq!(runs[0]["unpriced_calls"], 0);
+        assert_eq!(runs[0]["models"], "gpt-4o");
+
+        assert_eq!(runs[1]["agent_name"], "opencode");
+        assert_eq!(runs[1]["total_cost"], 0.4);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn comparison_ignores_calls_from_other_experiments() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let mine = db.get_or_create_experiment("issue-1284", None).await?;
+        let theirs = db.get_or_create_experiment("issue-9000", None).await?;
+
+        seed_run_call(&db, mine, "kilo", "run-a", Some(0.10)).await?;
+        seed_run_call(&db, theirs, "kilo", "run-c", Some(0.90)).await?;
+
+        let runs = db.get_experiment_comparison(mine).await?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["session_id"], "run-a");
+
+        Ok(())
+    }
+
+    /// A run on a model missing from `pricing.yaml` totals $0.00, which would
+    /// otherwise read as "free" and win. The count of unpriced calls is what
+    /// lets the UI say "unknown" instead.
+    #[tokio::test]
+    async fn comparison_counts_unpriced_calls_rather_than_treating_them_as_free() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+
+        seed_run_call(&db, experiment_id, "kilo", "run-a", None).await?;
+        seed_run_call(&db, experiment_id, "kilo", "run-a", Some(0.20)).await?;
+
+        let runs = db.get_experiment_comparison(experiment_id).await?;
+        assert_eq!(runs[0]["unpriced_calls"], 1);
+        assert_eq!(runs[0]["total_cost"], 0.2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn comparison_surfaces_failed_calls_per_run() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        let agent_id = db.get_or_create_agent("cursor").await?;
+
+        let task_id = db.create_task(agent_id, Some(experiment_id), None,
+            Some("run-a".to_string()), None, Some("openai".to_string())).await?;
+        db.finish_task(task_id, &TaskOutcome {
+            status: session_state::STATUS_RATE_LIMITED.to_string(),
+            http_status: Some(429),
+            ..Default::default()
+        }).await?;
+
+        let runs = db.get_experiment_comparison(experiment_id).await?;
+        assert_eq!(runs[0]["rate_limited_calls"], 1);
+        assert_eq!(runs[0]["error_calls"], 0);
+        // No metric row at all, so nothing was priced.
+        assert_eq!(runs[0]["unpriced_calls"], 1);
+
+        Ok(())
+    }
+
+    /// A run still mid-call has not finished spending; its total is a running
+    /// tally, and the comparison has to be able to say so.
+    #[tokio::test]
+    async fn comparison_flags_a_run_that_is_still_in_flight() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        let agent_id = db.get_or_create_agent("kilo").await?;
+
+        seed_run_call(&db, experiment_id, "kilo", "run-a", Some(0.10)).await?;
+        db.create_task(agent_id, Some(experiment_id), None, Some("run-a".to_string()), None, None).await?;
+
+        let runs = db.get_experiment_comparison(experiment_id).await?;
+        assert_eq!(runs[0]["in_flight_calls"], 1);
+        assert_eq!(runs[0]["call_count"], 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_verdict_attaches_to_its_run_and_can_be_cleared() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        seed_run_call(&db, experiment_id, "kilo", "run-a", Some(0.10)).await?;
+        seed_run_call(&db, experiment_id, "opencode", "run-b", Some(0.40)).await?;
+
+        assert!(db.set_session_verdict("kilo", Some("run-a"), Some(VERDICT_SOLVED), Some("tests pass")).await?);
+
+        let runs = db.get_experiment_comparison(experiment_id).await?;
+        assert_eq!(runs[0]["verdict"], "solved");
+        assert_eq!(runs[0]["verdict_note"], "tests pass");
+        // The other run is untouched — a verdict is per run, not per agent.
+        assert_eq!(runs[1]["verdict"], Value::Null);
+
+        // Re-marking overwrites rather than erroring on the primary key.
+        assert!(db.set_session_verdict("kilo", Some("run-a"), Some(VERDICT_FAILED), None).await?);
+        let runs = db.get_experiment_comparison(experiment_id).await?;
+        assert_eq!(runs[0]["verdict"], "failed");
+        assert_eq!(runs[0]["verdict_note"], Value::Null);
+
+        assert!(db.set_session_verdict("kilo", Some("run-a"), None, None).await?);
+        let runs = db.get_experiment_comparison(experiment_id).await?;
+        assert_eq!(runs[0]["verdict"], Value::Null);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_verdict_for_an_unknown_agent_is_rejected_rather_than_inventing_one() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+
+        assert!(!db.set_session_verdict("typo", Some("run-a"), Some(VERDICT_SOLVED), None).await?);
+        let agents: i64 = sqlx::query("SELECT COUNT(*) FROM agents")
+            .fetch_one(&db.pool).await?.get(0);
+        assert_eq!(agents, 0);
+
+        Ok(())
+    }
+
+    /// Calls sent without an `X-Session-ID` land in one bucket keyed by '',
+    /// and a verdict has to be able to name that bucket too.
+    #[tokio::test]
+    async fn a_run_with_no_session_id_still_takes_a_verdict() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let experiment_id = db.get_or_create_experiment("issue-1284", None).await?;
+        let agent_id = db.get_or_create_agent("kilo").await?;
+        let task_id = db.create_task(agent_id, Some(experiment_id), None, None, None, None).await?;
+        db.log_metric(task_id, 10, 20, 0, 0, 0, 100, Some(0.01)).await?;
+
+        assert!(db.set_session_verdict("kilo", None, Some(VERDICT_SOLVED), None).await?);
+
+        let runs = db.get_experiment_comparison(experiment_id).await?;
+        assert_eq!(runs[0]["session_id"], Value::Null);
+        assert_eq!(runs[0]["session_key"], "");
+        assert_eq!(runs[0]["verdict"], "solved");
+
+        Ok(())
+    }
+
+    #[test]
+    fn only_the_two_known_verdicts_are_accepted() {
+        assert!(is_valid_verdict(VERDICT_SOLVED));
+        assert!(is_valid_verdict(VERDICT_FAILED));
+        assert!(!is_valid_verdict("maybe"));
+        assert!(!is_valid_verdict(""));
     }
 }

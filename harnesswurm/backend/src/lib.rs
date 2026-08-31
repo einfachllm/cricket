@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, State, Request},
     http::{HeaderMap, Method, StatusCode},
     response::{sse::{Event, Sse}, IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use anyhow::Result;
@@ -225,6 +225,8 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         .route("/v1/messages", post(anthropic_proxy_handler))
         .route("/v1/analytics/experiments", get(get_experiments))
         .route("/v1/analytics/experiments/:id/metrics", get(get_experiment_metrics))
+        .route("/v1/analytics/experiments/:id/comparison", get(get_experiment_comparison))
+        .route("/v1/analytics/sessions/verdict", put(put_session_verdict))
         .route("/v1/analytics/tasks", get(get_recent_tasks))
         .route("/v1/analytics/tasks/:id/traffic", get(get_task_traffic))
         .route("/v1/analytics/sessions", get(get_sessions))
@@ -269,6 +271,54 @@ async fn get_experiment_metrics(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(axum::Json(metrics))
+}
+
+/// Per-run totals for one experiment — the side-by-side that answers "which
+/// agent got there cheaper". `.../metrics` is the same calls as a time
+/// series; this is the same calls folded down to one row per agent+session.
+async fn get_experiment_comparison(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let runs = state.db.get_experiment_comparison(id).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(axum::Json(runs))
+}
+
+#[derive(serde::Deserialize)]
+struct VerdictRequest {
+    agent_name: String,
+    session_id: Option<String>,
+    /// `"solved"`, `"failed"`, or null to clear a previous verdict.
+    verdict: Option<String>,
+    note: Option<String>,
+}
+
+/// Marks whether a run solved its task. Nothing in the proxied traffic can
+/// answer that, so the comparison takes it from whoever read the diff.
+async fn put_session_verdict(
+    State(state): State<Arc<AppState>>,
+    axum::Json(request): axum::Json<VerdictRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    if let Some(verdict) = request.verdict.as_deref() {
+        if !db::is_valid_verdict(verdict) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    let updated = state.db.set_session_verdict(
+        &request.agent_name,
+        request.session_id.as_deref(),
+        request.verdict.as_deref(),
+        request.note.as_deref(),
+    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !updated {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(axum::Json(json!({ "ok": true })))
 }
 
 async fn get_recent_tasks(

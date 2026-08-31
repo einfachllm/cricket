@@ -51,6 +51,41 @@ export interface SessionSummary {
   tokens_limit: number | null;
 }
 
+/// Whether a run actually solved what it was given. Nothing in the proxied
+/// traffic can answer this, so it comes from whoever read the diff — see
+/// `set_session_verdict` in the backend for why the comparison needs it.
+export type Verdict = 'solved' | 'failed';
+
+/// One *run* — one agent working one session — folded down from its calls.
+/// The unit the experiment comparison ranks on.
+export interface RunComparison {
+  agent_name: string;
+  /// Stable key for the run, `''` for calls sent without an `X-Session-ID`.
+  session_key: string;
+  session_id: string | null;
+  call_count: number;
+  first_seen: string | null;
+  last_seen: string | null;
+  wall_clock_seconds: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  tool_calls: number;
+  total_cost: number;
+  unpriced_calls: number;
+  busy_ms: number;
+  rate_limited_calls: number;
+  error_calls: number;
+  /// Calls still open. Non-zero means the run is still spending, so its
+  /// total is a running tally rather than a result.
+  in_flight_calls: number;
+  /// Comma-separated, since a run may switch models mid-task.
+  models: string | null;
+  providers: string | null;
+  verdict: Verdict | null;
+  verdict_note: string | null;
+}
+
 export interface ProviderLimits {
   provider: string | null;
   requests_limit: number | null;
@@ -72,6 +107,22 @@ export async function fetchJson<T>(path: string, init?: RequestInit): Promise<T>
     throw new Error(`${path} responded ${response.status}`);
   }
   return response.json() as Promise<T>;
+}
+
+/// Marks (or, with `verdict: null`, un-marks) whether a run solved its task.
+export async function setVerdict(
+  run: Pick<RunComparison, 'agent_name' | 'session_id'>,
+  verdict: Verdict | null,
+): Promise<void> {
+  await fetchJson<{ ok: boolean }>('/v1/analytics/sessions/verdict', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      agent_name: run.agent_name,
+      session_id: run.session_id,
+      verdict,
+    }),
+  });
 }
 
 /// Coarse, glanceable durations — the frontend twin of the backend's

@@ -24,6 +24,9 @@ Anthropic-compatible agents.
 - **Multi-Agent Support**: Uses headers to distinguish between different
   agents, sessions, and experiments, so you can compare configurations (e.g.
   the same task with and without a skill enabled) side by side.
+- **Run comparison**: Two agents on the same issue, folded to one row each and
+  ranked on what solving it actually cost. See [Comparing two agents on the
+  same task](#comparing-two-agents-on-the-same-task).
 
 ## Setup
 
@@ -131,6 +134,10 @@ tool, waiting for you, rate limited, auth failed, idle, plus provider quota
 bars. `--clear` removes them again — demo rows are prefixed `demo-` and are
 never confused with real captured traffic.
 
+It also seeds one experiment, `demo-issue-1284`, with four runs across three
+agents — visible under Analytics. It is arranged so that spend alone gives the
+wrong answer: the cheapest run is the one that gave up.
+
 Seed *after* the app is running: it closes out open calls on startup, so a
 seeded "Thinking" session would otherwise be reaped to *Interrupted* — which
 is itself the reaper working correctly.
@@ -211,9 +218,50 @@ Two caveats worth knowing:
 Calls left open by a killed process are closed out as *Interrupted* on the
 next startup, so nothing shows as permanently "Thinking".
 
+## Comparing two agents on the same task
+
+Point both agents at the proxy with the **same** `X-Experiment-ID` and a
+different `X-Agent-ID` / `X-Session-ID`:
+
+```bash
+# terminal 1
+X-Agent-ID: kilo         X-Session-ID: issue-1284-kilo    X-Experiment-ID: issue-1284
+# terminal 2
+X-Agent-ID: claude-code  X-Session-ID: issue-1284-claude  X-Experiment-ID: issue-1284
+```
+
+Open **Analytics → the experiment**. Each agent+session becomes one *run*, and
+the table shows what each spent, in tokens, calls, tool calls and wall clock.
+
+### Cost alone answers the wrong question
+
+The proxy sees what a run cost. It cannot see whether the diff works — so
+ranking on spend rewards the agent that gave up after two calls, which is
+reliably the cheapest run of a hard task. Mark each run **Solved** or
+**Failed** yourself (the toggle in the table); only solved runs are ranked,
+and until at least one is marked, the view declines to name a winner.
+
+Three further things the headline number would otherwise hide:
+
+- **Unpriced models.** A model with no entry in `pricing.yaml` contributes
+  $0.00, so a run that touched one shows as `≥ $x` and is kept out of the
+  ranking rather than winning on an understated total.
+- **Runs still going.** A run with a call still open shows `$x so far` and is
+  not ranked against runs that have finished spending.
+- **One run each is a sample size of one.** The **Per agent** roll-up divides
+  everything an agent spent by the runs it solved, so an agent that lands one
+  attempt in three is charged for all three. Run the same task a few times per
+  agent and that number, not the cheapest single run, is the one to trust.
+
 ### Analytics API
 - `GET /v1/analytics/experiments` — list experiments.
 - `GET /v1/analytics/experiments/:id/metrics` — metrics for one experiment, over time.
+- `GET /v1/analytics/experiments/:id/comparison` — one row per run (agent +
+  session) in the experiment: totals for cost, tokens, cache reads, tool
+  calls, wall clock, failed/rate-limited/still-open calls, and the verdict.
+- `PUT /v1/analytics/sessions/verdict` — mark a run solved or failed:
+  `{"agent_name": "kilo", "session_id": "issue-1284-kilo", "verdict": "solved", "note": "tests pass"}`.
+  A `verdict` of `null` clears it.
 - `GET /v1/analytics/tasks` — most recent calls across all agents (model, provider, tokens, cache tokens, tool calls, latency, cost, call status, and a short preview of what was asked).
 - `GET /v1/analytics/tasks/:id/traffic` — the full raw request/response body for one call.
 - `GET /v1/analytics/sessions` — one row per agent+session: derived state, totals, spend, and the last question asked.
