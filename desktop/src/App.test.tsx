@@ -8,8 +8,8 @@ test("renders heading", () => {
   expect(headingElement).toBeInTheDocument()
 })
 
-test("renders status", () => {
+test("renders backend readiness", () => {
   render(<App />)
-  const statusElement = screen.getByText(/Status:/i)
+  const statusElement = screen.getByText(/Backend ready/i)
   expect(statusElement).toBeInTheDocument()
 })

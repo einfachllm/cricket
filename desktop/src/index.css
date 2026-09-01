@@ -1,12 +1,23 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-body {
-  margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-    sans-serif;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+:root { color-scheme: light; font-family: 'DM Sans', system-ui, sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; background: #f7f8fb; -webkit-font-smoothing: antialiased; }
+button, input, select { font: inherit; }
+code, .font-mono { font-family: 'JetBrains Mono', ui-monospace, monospace !important; }
+
+@layer components {
+  .page-wrap { @apply space-y-6 px-5 py-6 sm:px-8 sm:py-8 lg:px-10; }
+  .surface { @apply rounded-2xl border border-slate-200/80 bg-white shadow-[0_1px_2px_rgba(15,23,42,0.03)]; }
+  .empty-panel { @apply surface flex min-h-[280px] flex-col items-center justify-center gap-2 text-slate-400; }
+  .empty-panel h2 { @apply mt-2 text-base font-semibold text-slate-700; }
+  .empty-panel p { @apply max-w-sm text-center text-sm; }
 }
+
+::selection { background: #c7d2fe; color: #312e81; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border: 3px solid transparent; border-radius: 99px; background-clip: padding-box; }

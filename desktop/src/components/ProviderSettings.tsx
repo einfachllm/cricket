@@ -60,9 +60,9 @@ function CopyButton({ value }: { value: string }) {
           // screen and can be selected by hand.
         }
       }}
-      className="text-gray-400 hover:text-gray-700"
+      className="text-slate-400 hover:text-slate-700"
     >
-      {copied ? <Check size={14} className="text-green-600" /> : <Copy size={14} />}
+      {copied ? <Check size={14} className="text-emerald-600" /> : <Copy size={14} />}
     </button>
   );
 }
@@ -149,10 +149,10 @@ export default function ProviderSettings() {
     <div className="space-y-4">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h2 className="text-lg font-semibold text-gray-800 flex items-center gap-2">
+          <h2 className="flex items-center gap-2 text-xl font-semibold tracking-tight text-slate-900">
             <Server size={18} /> Providers
           </h2>
-          <p className="text-sm text-gray-500 mt-1 max-w-3xl">
+          <p className="mt-1 max-w-3xl text-sm text-slate-500">
             Where each proxied call is forwarded to. Point an agent at the base URL of a
             provider below and its traffic is captured on the way through — a local model
             server (Ollama, vLLM, LM Studio, llama.cpp) is just another entry. Saved edits
@@ -161,7 +161,7 @@ export default function ProviderSettings() {
         </div>
         <button
           onClick={() => void load()}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm bg-white border border-gray-200 hover:bg-gray-50 text-gray-700 shrink-0"
+          className="flex shrink-0 items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
         >
           <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
           Reload
@@ -169,22 +169,22 @@ export default function ProviderSettings() {
       </div>
 
       {error && (
-        <div role="alert" className="flex items-start gap-2 p-3 rounded-lg bg-red-50 border border-red-200 text-sm text-red-800">
+        <div role="alert" className="flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800">
           <AlertTriangle size={16} className="mt-0.5 shrink-0" />
           <span>{error}</span>
         </div>
       )}
 
       {justSaved && !dirty && (
-        <div className="flex items-center gap-2 p-3 rounded-lg bg-green-50 border border-green-200 text-sm text-green-800">
+        <div className="flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800">
           <Check size={16} /> Saved to providers.yaml — new calls use it immediately.
         </div>
       )}
 
-      <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+      <div className="surface overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
-            <thead className="bg-gray-50 text-gray-500 uppercase text-xs">
+            <thead className="bg-slate-50 text-xs uppercase text-slate-500">
               <tr>
                 <th className="text-left px-4 py-3 font-semibold">Name</th>
                 <th className="text-left px-4 py-3 font-semibold">API</th>
@@ -196,14 +196,14 @@ export default function ProviderSettings() {
             </thead>
             <tbody>
               {rows.map((row) => (
-                <tr key={row.id} className="border-t border-gray-100 align-top">
+                <tr key={row.id} className="border-t border-slate-100 align-top">
                   <td className="px-4 py-3">
                     <input
                       aria-label="Provider name"
                       value={row.name}
                       onChange={(e) => update(row.id, { name: e.target.value })}
                       placeholder="ollama"
-                      className="w-32 px-2 py-1.5 rounded-lg border border-gray-200 font-mono text-xs"
+                      className="w-32 rounded-lg border border-slate-200 px-2 py-1.5 font-mono text-xs"
                     />
                   </td>
                   <td className="px-4 py-3">
@@ -211,7 +211,7 @@ export default function ProviderSettings() {
                       aria-label={`API format for ${row.name || 'new provider'}`}
                       value={row.api}
                       onChange={(e) => update(row.id, { api: e.target.value as ProviderApiStyle, default: false })}
-                      className="px-2 py-1.5 rounded-lg border border-gray-200 text-xs bg-white"
+                      className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs"
                     >
                       <option value="openai">openai</option>
                       <option value="anthropic">anthropic</option>
@@ -223,20 +223,20 @@ export default function ProviderSettings() {
                       value={row.base_url}
                       onChange={(e) => update(row.id, { base_url: e.target.value })}
                       placeholder="http://localhost:11434/v1"
-                      className="w-72 px-2 py-1.5 rounded-lg border border-gray-200 font-mono text-xs"
+                      className="w-72 rounded-lg border border-slate-200 px-2 py-1.5 font-mono text-xs"
                     />
-                    <div className="text-xs text-gray-400 mt-1 font-mono truncate max-w-[22rem]" title={previewTargetUrl(row)}>
+                    <div className="mt-1 max-w-[22rem] truncate font-mono text-xs text-slate-400" title={previewTargetUrl(row)}>
                       → {previewTargetUrl(row) || '–'}
                     </div>
                     {row.envOverride && (
-                      <div className="text-xs text-amber-700 mt-1">
+                      <div className="mt-1 text-xs text-amber-700">
                         Overridden by <span className="font-mono">{row.envOverride}</span> until that
                         variable is unset — calls go there, not to the URL above.
                       </div>
                     )}
                   </td>
                   <td className="px-4 py-3">
-                    <label className="inline-flex items-center gap-2 text-xs text-gray-600">
+                    <label className="inline-flex items-center gap-2 whitespace-nowrap text-xs text-slate-600">
                       <input
                         type="radio"
                         name={`default-${row.api}`}
@@ -249,7 +249,7 @@ export default function ProviderSettings() {
                   </td>
                   <td className="px-4 py-3">
                     <div className="flex items-center gap-2">
-                      <code className="text-xs text-gray-600">{proxyBaseUrl(row)}</code>
+                      <code className="text-xs text-slate-600">{proxyBaseUrl(row)}</code>
                       <CopyButton value={proxyBaseUrl(row)} />
                     </div>
                   </td>
@@ -257,7 +257,7 @@ export default function ProviderSettings() {
                     <button
                       onClick={() => removeRow(row.id)}
                       aria-label={`Remove ${row.name || 'provider'}`}
-                      className="text-gray-400 hover:text-red-600"
+                      className="text-slate-400 hover:text-red-600"
                     >
                       <Trash2 size={16} />
                     </button>
@@ -266,7 +266,7 @@ export default function ProviderSettings() {
               ))}
               {!loading && rows.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="px-4 py-8 text-center text-gray-400">
+                  <td colSpan={6} className="px-4 py-8 text-center text-slate-400">
                     No providers configured — add one, or reload to get the defaults back.
                   </td>
                 </tr>
@@ -279,23 +279,23 @@ export default function ProviderSettings() {
       <div className="flex items-center gap-3">
         <button
           onClick={addRow}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm bg-white border border-gray-200 hover:bg-gray-50 text-gray-700"
+          className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
         >
           <Plus size={16} /> Add provider
         </button>
         <button
           onClick={() => void save()}
           disabled={!dirty || busy}
-          className={`px-4 py-2 rounded-lg text-sm font-medium ${
-            dirty && !busy ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-gray-200 text-gray-500 cursor-not-allowed'
+          className={`rounded-xl px-4 py-2 text-sm font-medium ${
+            dirty && !busy ? 'bg-indigo-500 text-white hover:bg-indigo-600' : 'cursor-not-allowed bg-slate-200 text-slate-500'
           }`}
         >
           {busy ? 'Saving…' : 'Save providers'}
         </button>
-        {dirty && <span className="text-xs text-gray-500">Unsaved changes</span>}
+        {dirty && <span className="text-xs text-slate-500">Unsaved changes</span>}
       </div>
 
-      <p className="text-xs text-gray-500 max-w-3xl">
+      <p className="max-w-3xl text-xs text-slate-500">
         A provider is also addressable by header — <span className="font-mono">X-Provider: name</span> —
         for clients with a fixed base URL. Calls are recorded under the provider name, so a local run
         shows as itself in Traffic and Analytics; give <span className="font-mono">pricing.yaml</span> an
