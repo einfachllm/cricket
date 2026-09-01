@@ -1,0 +1,29 @@
+# How a call that carries no X-Agent-ID header is attributed to an agent
+# anyway.
+#
+# Most coding agents cannot be configured to send custom headers, but they
+# cannot hide either: each one sends a distinctive User-Agent header, and a
+# system prompt whose opening lines name it. Matching either is enough.
+#
+#   agent          the name calls are recorded under (same as X-Agent-ID)
+#   user_agents    case-insensitive substrings of the User-Agent header
+#   system_prompts case-insensitive substrings of the request's system prompt
+#
+# File order is priority: the first entry that matches wins. An explicit
+# X-Agent-ID header always beats a fingerprint. Hand edits take effect on the
+# next start of the app.
+#
+# The seeded list is deliberately short and verified against the agent's own
+# traffic. To add yours, run the agent through the proxy once and copy its
+# User-Agent (and system prompt opening) out of the Traffic tab.
+fingerprints:
+  - agent: "claude-code"
+    user_agents: ["claude-cli"]
+    system_prompts: ["You are Claude Code"]
+
+  # Same shape for anything else:
+  # - agent: "aider"
+  #   user_agents: ["aider"]
+  #
+  # - agent: "opencode"
+  #   user_agents: ["opencode"]

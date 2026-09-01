@@ -30,6 +30,17 @@ impl ApiStyle {
     }
 }
 
+/// How a response *body* is parsed, as opposed to `ApiStyle`, which says
+/// where a request is sent. The two come apart on the aux endpoints: a call
+/// to `/v1/responses` goes to an `openai` provider but needs its own parser,
+/// and `/v1/models` needs no parser at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireApi {
+    OpenAi,
+    Anthropic,
+    Responses,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProviderConfig {
     pub name: String,
@@ -64,17 +75,23 @@ impl ProviderConfig {
     /// otherwise end up with the endpoint buried inside that query and
     /// every call rejected.
     pub fn target_url(&self) -> String {
+        self.url_for(self.api.endpoint_path())
+    }
+
+    /// Same as `target_url` for any endpoint this provider serves — the
+    /// aux endpoints (`/v1/models`, `/v1/messages/count_tokens`,
+    /// `/v1/responses`) hang off the same base URL as the main ones.
+    pub fn url_for(&self, endpoint_path: &str) -> String {
         let url = self.effective_base_url();
         let (base, query) = match url.split_once('?') {
             Some((base, query)) => (base, Some(query)),
             None => (url, None),
         };
         let base = base.trim_end_matches('/');
-        let path = self.api.endpoint_path();
-        let full_path = if base.ends_with(path) {
+        let full_path = if base.ends_with(endpoint_path) {
             base.to_string()
         } else {
-            format!("{base}{path}")
+            format!("{base}{endpoint_path}")
         };
         match query {
             Some(query) => format!("{full_path}?{query}"),

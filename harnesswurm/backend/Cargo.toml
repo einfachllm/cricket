@@ -18,3 +18,12 @@ tracing-subscriber = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 serde_yaml = "0.9.34"
+sha2 = "0.10"
+
+[[bin]]
+name = "harnesswurm-backend"
+path = "src/main.rs"
+
+[[bin]]
+name = "harnesswurm"
+path = "src/bin/harnesswurm.rs"
