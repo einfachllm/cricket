@@ -4,6 +4,7 @@ import { Settings, BarChart3, Radio, Bot, FlaskConical } from "lucide-react"
 import AnalyticsDashboard from "./components/AnalyticsDashboard"
 import AgentStatusView from "./components/AgentStatusView"
 import TrafficView from "./components/TrafficView"
+import ProviderSettings from "./components/ProviderSettings"
 import { SessionsProvider, useAttentionCount } from "./hooks/useSessions"
 
 const NAV_ITEMS = [
@@ -103,7 +104,7 @@ function Layout({ children }: { children: React.ReactNode }) {
 }
 
 function SettingsView() {
-  return <div className="page-wrap"><div className="empty-panel"><Settings size={26} /><h2>Workspace settings</h2><p>Configure local providers, tools, and agent adapters here.</p></div></div>
+  return <div className="page-wrap"><ProviderSettings /></div>
 }
 
 function App() {

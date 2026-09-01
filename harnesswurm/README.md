@@ -8,6 +8,10 @@ Anthropic-compatible agents.
 - **Proxy Mode**: Intercepts requests to LLM providers — OpenAI-style
   (`/v1/chat/completions`) and Anthropic-style (`/v1/messages`) — and forwards
   them unmodified to the real API.
+- **Configurable providers**: Where each call is forwarded to is edited in the
+  desktop app's Settings tab (or in `providers.yaml`), so the hosted APIs, a
+  gateway, or a model server on localhost (Ollama, vLLM, LM Studio, llama.cpp,
+  LiteLLM) are all just entries. See [Providers](#providers).
 - **Telemetry**: Extracts token usage (including cache read/write tokens),
   tool call counts, and latency, for both unary and streaming responses.
 - **Live agent status**: Derives what each agent session is *doing right now*
@@ -38,7 +42,7 @@ Anthropic-compatible agents.
    ```
    The server listens on `http://127.0.0.1:8081` by default; override with
    the `BIND_ADDR` env var. State (the database, `agents.yaml`,
-   `pricing.yaml`) lives in the current directory.
+   `pricing.yaml`, `providers.yaml`) lives in the current directory.
 
 ### Embedding
 
@@ -47,18 +51,21 @@ top, not just a binary — `../desktop/src-tauri` depends on it directly and
 spawns `harnesswurm_backend::run(ServerConfig { bind_addr, data_dir })` from
 its own startup, so the desktop app is a single process with no separate
 `cargo run` needed. Point `data_dir` at wherever makes sense for the embedding
-host (a proper per-OS app data directory for a packaged app); `agents.yaml`
-and `pricing.yaml` are seeded there from the bundled defaults on first run if
-missing, and left alone (still user-editable) after that.
+host (a proper per-OS app data directory for a packaged app); `agents.yaml`,
+`pricing.yaml` and `providers.yaml` are seeded there from the bundled defaults
+on first run if missing, and left alone (still user-editable) after that.
 
 ## Usage
 
 Point your agent's OpenAI-compatible client at
 `http://localhost:8081/v1/chat/completions`, or its Anthropic-compatible
 client at `http://localhost:8081/v1/messages`. Requests are forwarded as-is
-to `api.openai.com` / `api.anthropic.com` using whatever `Authorization` /
-`x-api-key` / `anthropic-version` headers your client already sends — no
-proxy-specific auth setup needed.
+to the provider configured for that route — out of the box `api.openai.com` /
+`api.anthropic.com` — carrying whatever headers your client already sends
+(`Authorization`, `x-api-key`, `api-key`, `anthropic-version`, a gateway's
+own), so no proxy-specific auth setup is needed. To send a call somewhere else (a local model server, a
+gateway), add it to `providers.yaml` and address it by name: see
+[Providers](#providers).
 
 ### Required/optional headers
 - `X-Agent-ID`: Name of the agent (e.g., `kilo`, `opencode`).
@@ -90,8 +97,8 @@ npm run tauri dev
 
 That opens the window with the proxy already listening on
 `127.0.0.1:8081`. State lives in the OS app-data directory (not the current
-working directory), and `agents.yaml` / `pricing.yaml` are seeded there on
-first run.
+working directory), and `agents.yaml` / `pricing.yaml` / `providers.yaml` are
+seeded there on first run.
 
 To get an app you can just double-click, with no toolchain at all:
 
@@ -114,7 +121,8 @@ cd desktop && npm run dev               # http://localhost:5173
 ```
 
 Run `cargo run` from the same directory each time — the standalone binary
-keeps its state (`harnesswurm.db`, `agents.yaml`, `pricing.yaml`) in the
+keeps its state (`harnesswurm.db`, `agents.yaml`, `pricing.yaml`,
+`providers.yaml`) in the
 current directory, which is a *different* database from the one the packaged
 app uses. Don't run both at once: whichever grabs port 8081 first wins, and
 the UI will quietly show that one's data.
@@ -167,6 +175,11 @@ of the path the client appends:
 | OpenAI-compatible (appends `/chat/completions`) | `http://localhost:8081/v1` |
 | Anthropic-compatible (appends `/v1/messages`) | `http://localhost:8081` |
 
+Those two go to the provider marked `default` for that style in
+`providers.yaml`. To reach a specific provider instead, put its name in the
+base URL — `http://localhost:8081/p/ollama/v1` and
+`http://localhost:8081/p/ollama` respectively. See [Providers](#providers).
+
 Most agents expose this as an environment variable or a config field
 (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, a `baseUrl` setting…); the exact name
 varies per tool.
@@ -181,6 +194,126 @@ headers, set them; if not, per-agent attribution isn't available yet.
 cd harnesswurm/backend && cargo test     # parsing, pricing, DB, state rules
 cd desktop && npm test                   # UI, and npm run typecheck
 ```
+
+## Providers
+
+Every call is forwarded to the URL of the provider it resolved to, and
+`providers.yaml` says what those are.
+
+**In the app:** Settings → Providers lists them, with the base URL to paste
+into an agent next to each. Add, edit or remove entries and hit *Save
+providers*; the file is rewritten and the next call uses it — no restart. A
+rejected edit (nameless entry, duplicate name, a base URL that isn't one, two
+defaults for one api style) changes nothing on disk or in memory and says
+which entry is wrong.
+
+**In the file:** it is seeded on first run and looks like this:
+
+```yaml
+providers:
+  - name: "openai"
+    api: "openai"
+    base_url: "https://api.openai.com/v1"
+    default: true
+
+  - name: "anthropic"
+    api: "anthropic"
+    base_url: "https://api.anthropic.com"
+    default: true
+
+  - name: "ollama"
+    api: "openai"
+    base_url: "http://localhost:11434/v1"
+```
+
+- `name` — how the provider is addressed, and the name every call to it is
+  recorded under (what the Traffic view shows, and what `provider:` in
+  `pricing.yaml` matches).
+- `api` — the wire format the endpoint speaks, `openai` or `anthropic`. It
+  decides how the traffic is *parsed*, not where it goes: a local server
+  speaking the OpenAI format is `api: openai` even though nothing about it is
+  OpenAI.
+- `base_url` — exactly the base URL you would otherwise configure in the
+  client: for `openai` the part before `/chat/completions` (usually ending in
+  `/v1`), for `anthropic` the part before `/v1/messages`. A complete endpoint
+  URL is accepted as-is too, and a query string — a gateway's `api-version`
+  or key — is kept at the end where it belongs.
+- `default` — the provider the bare `/v1/chat/completions` and `/v1/messages`
+  routes use, one per api style.
+
+Hand edits take effect on the next start; a save from the app takes effect
+immediately. Note that saving from the app rewrites the file, so comments
+added by hand do not survive one. On startup the resolved target of every
+provider is printed, and `GET /v1/providers` returns the same list, so where a
+call would actually go is never a guess.
+
+### Choosing a provider per call
+
+Three ways, most specific first:
+
+1. **Path prefix** — `POST /p/<name>/v1/chat/completions` or
+   `POST /p/<name>/v1/messages`. This is the one to use for coding agents,
+   since it needs nothing but the base URL they already let you set.
+2. **`X-Provider: <name>` header** — for clients that can send custom headers
+   but have a fixed path.
+3. **Nothing** — the `default: true` provider for that route's api style.
+
+An unknown name is refused with 404 (listing what *is* configured) and a
+provider addressed on the wrong style's endpoint with 400, rather than being
+quietly forwarded to the hosted API under a name you didn't ask for.
+
+### Local models, end to end
+
+Ollama, llama.cpp, vLLM, LM Studio and LiteLLM all serve the OpenAI format, so
+they are one entry each:
+
+```yaml
+  - name: "ollama"
+    api: "openai"
+    base_url: "http://localhost:11434/v1"
+```
+
+```bash
+curl http://localhost:8081/p/ollama/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Agent-ID: manual-test" -H "X-Session-ID: local-1" \
+  -d '{"model":"llama3.2","messages":[{"role":"user","content":"say hi"}]}'
+```
+
+Whatever headers the client sends are forwarded unchanged; a local server
+that wants no auth simply receives none.
+
+Local models are unpriced by default, which shows as no cost estimate rather
+than $0.00. If the machine time is worth costing, add an entry to
+`pricing.yaml` whose `provider` matches the provider name:
+
+```yaml
+  - name: "llama3.2"
+    provider: "ollama"
+    input_per_million: 0.0
+    output_per_million: 0.0
+```
+
+### Which headers reach the provider
+
+Every request header is forwarded except two groups: those describing this
+hop rather than the call (`host`, `content-length`, `connection` and the
+other hop-by-hop headers, plus `accept-encoding`, since responses are
+returned with the provider's own headers intact), and Harnesswurm's own
+`X-Agent-ID` / `X-Session-ID` / `X-Experiment-ID` / `X-Provider`, which mean
+nothing upstream. A provider authenticating with `api-key`, an organization
+header, or anything else a gateway expects therefore works without being
+named anywhere.
+
+### Env overrides
+
+`HARNESSWURM_OPENAI_BASE_URL` and `HARNESSWURM_ANTHROPIC_BASE_URL` replace the
+`base_url` of the default provider for that style, for a one-off run without
+editing the file. The file's own value is left untouched — the Settings tab
+shows the override and keeps editing the saved value, so an override can't
+quietly become permanent. They are deliberately *not* named `OPENAI_BASE_URL` /
+`ANTHROPIC_BASE_URL`: those are usually already set to point a client **at**
+this proxy, and honoring them here would make Harnesswurm forward to itself.
 
 ## Agent status
 
@@ -323,6 +456,11 @@ calls are proxied, so traffic captured before this existed shows no tools.
 - `GET /v1/analytics/tasks/:id/traffic` — the full raw request/response body for one call.
 - `GET /v1/analytics/sessions` — one row per agent+session: derived state, totals, spend, and the last question asked.
 - `GET /v1/analytics/limits` — current quota per provider, folded from the most recent reading of each header.
+- `GET /v1/providers` — the configured providers and the URL each one forwards
+  to, plus `env_override` when a variable is supplying the base URL in effect.
+- `PUT /v1/providers` — replace the list (`{"providers": [...]}`), which is
+  what the Settings tab sends: validated, written to `providers.yaml`, and in
+  effect for the next call. Rejected edits change nothing.
 - `GET /v1/analytics/events` — SSE feed pinging on every call start and finish, so a dashboard updates immediately instead of on a poll.
 
 ### Timing
