@@ -90,7 +90,7 @@ function ProviderLimitsCard({ limits }: { limits: ProviderLimits[] }) {
   if (reporting.length === 0) return null;
 
   return (
-    <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-5">
+    <div className="surface p-5">
       <h3 className="text-sm font-semibold text-gray-700 mb-4">Provider quota</h3>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
         {reporting.map((limit) => (
@@ -118,7 +118,7 @@ function SessionCard({ session }: { session: SessionSummary }) {
   const attentionRing = session.needs_attention ? 'ring-1 ring-amber-200' : '';
 
   return (
-    <div className={`bg-white rounded-xl shadow-sm border border-gray-100 border-l-4 ${accent} ${attentionRing} p-5 space-y-3`}>
+    <div className={`rounded-2xl bg-white border border-slate-200/80 border-l-[3px] ${accent} ${attentionRing} p-5 space-y-3 shadow-[0_1px_2px_rgba(15,23,42,0.03)] transition-all hover:-translate-y-0.5 hover:shadow-[0_10px_30px_rgba(15,23,42,0.07)]`}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
@@ -187,11 +187,11 @@ function SummaryStrip({ sessions }: { sessions: SessionSummary[] }) {
   ];
 
   return (
-    <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+    <div className="surface grid grid-cols-2 divide-x divide-y divide-slate-100 overflow-hidden lg:grid-cols-4 lg:divide-y-0">
       {tiles.map((tile) => (
-        <div key={tile.label} className="bg-white rounded-xl shadow-sm border border-gray-100 px-5 py-4">
-          <p className="text-xs uppercase font-semibold text-gray-400">{tile.label}</p>
-          <p className={`text-2xl font-bold ${tile.tone}`}>{tile.value}</p>
+        <div key={tile.label} className="px-5 py-4 sm:px-6">
+          <p className="text-[10px] uppercase tracking-[0.14em] font-semibold text-slate-400">{tile.label}</p>
+          <p className={`mt-1 text-2xl font-semibold tracking-tight ${tile.tone}`}>{tile.value}</p>
         </div>
       ))}
     </div>
@@ -203,12 +203,12 @@ const AgentStatusView = () => {
   const ordered = sortSessions(sessions);
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="page-wrap">
       <div className="flex justify-between items-center">
-        <h2 className="text-3xl font-bold text-gray-800 flex items-center gap-2">
-          <Bot size={28} className="text-blue-600" />
-          Agents
-        </h2>
+        <div>
+          <h2 className="text-xl font-semibold tracking-tight text-slate-900">Live agents</h2>
+          <p className="mt-1 text-sm text-slate-500">See what is running, blocked, and costing you—without opening every agent.</p>
+        </div>
         <span
           className="flex items-center gap-2 text-xs text-gray-500"
           title={live ? 'Streaming updates from the proxy' : 'Falling back to polling every few seconds'}
@@ -236,7 +236,7 @@ const AgentStatusView = () => {
         </div>
       ) : (
         !error && (
-          <div className="bg-white rounded-xl shadow-sm border border-gray-100 py-12 text-center">
+          <div className="surface py-16 text-center">
             <Bot size={40} className="mx-auto text-gray-200 mb-3" />
             <p className="text-gray-400 text-sm">
               {loaded
