@@ -57,13 +57,28 @@ impl ProviderConfig {
     /// The full URL a call to this provider is forwarded to. A `base_url`
     /// that already names the endpoint is left alone, so pasting a complete
     /// URL out of another tool's config also works.
+    ///
+    /// The endpoint is appended to the *path*, not to the whole string: a
+    /// gateway that carries its API version or credentials in the query
+    /// (`…/v1?api-version=2024-02-01`, the Azure-style shape) would
+    /// otherwise end up with the endpoint buried inside that query and
+    /// every call rejected.
     pub fn target_url(&self) -> String {
-        let base = self.effective_base_url().trim_end_matches('/');
+        let url = self.effective_base_url();
+        let (base, query) = match url.split_once('?') {
+            Some((base, query)) => (base, Some(query)),
+            None => (url, None),
+        };
+        let base = base.trim_end_matches('/');
         let path = self.api.endpoint_path();
-        if base.ends_with(path) {
+        let full_path = if base.ends_with(path) {
             base.to_string()
         } else {
             format!("{base}{path}")
+        };
+        match query {
+            Some(query) => format!("{full_path}?{query}"),
+            None => full_path,
         }
     }
 }
@@ -380,6 +395,31 @@ mod tests {
         );
         assert_eq!(t.by_name("slashed").unwrap().target_url(), "http://localhost:4000/v1/messages");
         assert_eq!(t.by_name("full").unwrap().target_url(), "http://localhost:4000/v1/chat/completions");
+    }
+
+    #[test]
+    fn target_url_appends_to_the_path_and_keeps_the_query() {
+        // A gateway whose API version (or key) rides in the query: appending
+        // to the whole string would produce
+        // ".../v1?api-version=2024-02-01/chat/completions" and be rejected.
+        let t = table(
+            "providers:\n  - name: gateway\n    api: openai\n    base_url: \"https://gw.example/v1?api-version=2024-02-01\"\n",
+        );
+        assert_eq!(
+            t.by_name("gateway").unwrap().target_url(),
+            "https://gw.example/v1/chat/completions?api-version=2024-02-01"
+        );
+    }
+
+    #[test]
+    fn a_query_survives_a_base_url_that_already_names_the_endpoint() {
+        let t = table(
+            "providers:\n  - name: gateway\n    api: anthropic\n    base_url: \"https://gw.example/v1/messages?key=abc\"\n",
+        );
+        assert_eq!(
+            t.by_name("gateway").unwrap().target_url(),
+            "https://gw.example/v1/messages?key=abc"
+        );
     }
 
     #[test]

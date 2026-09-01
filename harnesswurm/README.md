@@ -61,9 +61,9 @@ Point your agent's OpenAI-compatible client at
 `http://localhost:8081/v1/chat/completions`, or its Anthropic-compatible
 client at `http://localhost:8081/v1/messages`. Requests are forwarded as-is
 to the provider configured for that route — out of the box `api.openai.com` /
-`api.anthropic.com` — using whatever `Authorization` / `x-api-key` /
-`anthropic-version` headers your client already sends, so no proxy-specific
-auth setup is needed. To send a call somewhere else (a local model server, a
+`api.anthropic.com` — carrying whatever headers your client already sends
+(`Authorization`, `x-api-key`, `api-key`, `anthropic-version`, a gateway's
+own), so no proxy-specific auth setup is needed. To send a call somewhere else (a local model server, a
 gateway), add it to `providers.yaml` and address it by name: see
 [Providers](#providers).
 
@@ -236,7 +236,8 @@ providers:
 - `base_url` — exactly the base URL you would otherwise configure in the
   client: for `openai` the part before `/chat/completions` (usually ending in
   `/v1`), for `anthropic` the part before `/v1/messages`. A complete endpoint
-  URL is accepted as-is too.
+  URL is accepted as-is too, and a query string — a gateway's `api-version`
+  or key — is kept at the end where it belongs.
 - `default` — the provider the bare `/v1/chat/completions` and `/v1/messages`
   routes use, one per api style.
 
@@ -279,8 +280,8 @@ curl http://localhost:8081/p/ollama/v1/chat/completions \
   -d '{"model":"llama3.2","messages":[{"role":"user","content":"say hi"}]}'
 ```
 
-Whatever auth headers the client sends are forwarded unchanged; a local server
-that wants none simply receives none.
+Whatever headers the client sends are forwarded unchanged; a local server
+that wants no auth simply receives none.
 
 Local models are unpriced by default, which shows as no cost estimate rather
 than $0.00. If the machine time is worth costing, add an entry to
@@ -292,6 +293,17 @@ than $0.00. If the machine time is worth costing, add an entry to
     input_per_million: 0.0
     output_per_million: 0.0
 ```
+
+### Which headers reach the provider
+
+Every request header is forwarded except two groups: those describing this
+hop rather than the call (`host`, `content-length`, `connection` and the
+other hop-by-hop headers, plus `accept-encoding`, since responses are
+returned with the provider's own headers intact), and Harnesswurm's own
+`X-Agent-ID` / `X-Session-ID` / `X-Experiment-ID` / `X-Provider`, which mean
+nothing upstream. A provider authenticating with `api-key`, an organization
+header, or anything else a gateway expects therefore works without being
+named anywhere.
 
 ### Env overrides
 

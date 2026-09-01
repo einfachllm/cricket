@@ -142,6 +142,10 @@ describe('ProviderSettings', () => {
     // A complete endpoint URL pasted from another tool is left alone.
     expect(previewTargetUrl({ api: 'openai', base_url: 'http://x/v1/chat/completions' }))
       .toBe('http://x/v1/chat/completions')
+    // A gateway's query (api-version, a key) stays at the end rather than
+    // swallowing the endpoint.
+    expect(previewTargetUrl({ api: 'openai', base_url: 'https://gw.example/v1?api-version=2024-02-01' }))
+      .toBe('https://gw.example/v1/chat/completions?api-version=2024-02-01')
     expect(previewTargetUrl({ api: 'openai', base_url: '  ' })).toBe('')
   })
 })

@@ -35,12 +35,18 @@ function toDraft(row: Row): ProviderDraft {
 }
 
 /// The frontend twin of `ProviderConfig::target_url`, so a row shows where it
-/// would forward *while being typed* rather than only after a save.
+/// would forward *while being typed* rather than only after a save. Like the
+/// backend, the endpoint goes on the path and any query is kept at the end,
+/// so a gateway URL carrying an api-version previews as it will be called.
 export function previewTargetUrl(row: { api: ProviderApiStyle; base_url: string }): string {
-  const base = row.base_url.trim().replace(/\/+$/, '');
+  const trimmed = row.base_url.trim();
+  if (!trimmed) return '';
+  const queryAt = trimmed.indexOf('?');
+  const query = queryAt === -1 ? '' : trimmed.slice(queryAt);
+  const base = (queryAt === -1 ? trimmed : trimmed.slice(0, queryAt)).replace(/\/+$/, '');
   if (!base) return '';
   const path = row.api === 'openai' ? '/chat/completions' : '/v1/messages';
-  return base.endsWith(path) ? base : base + path;
+  return (base.endsWith(path) ? base : base + path) + query;
 }
 
 function CopyButton({ value }: { value: string }) {

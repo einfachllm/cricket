@@ -694,9 +694,9 @@ async fn proxy_handler(
     };
 
     let mut proxy_req = state.client.request(method, &upstream.url);
-    for header_name in ["authorization", "x-api-key", "anthropic-version", "anthropic-beta"] {
-        if let Some(value) = headers.get(header_name) {
-            proxy_req = proxy_req.header(header_name, value.clone());
+    for (name, value) in headers.iter() {
+        if forwards_upstream(name.as_str()) {
+            proxy_req = proxy_req.header(name.clone(), value.clone());
         }
     }
     let proxy_req = proxy_req
@@ -732,6 +732,47 @@ async fn proxy_handler(
     } else {
         Ok(handle_unary(state, upstream, response, task_id, model_name, latency, status, call).await)
     }
+}
+
+/// Whether an incoming request header is passed on to the provider.
+///
+/// An allowlist of the two hosted APIs' auth headers used to stand here,
+/// which silently dropped the credential of anything else — an
+/// OpenAI-compatible gateway authenticating with `api-key` got an auth
+/// failure on every call, with nothing in the traffic to explain it. Since
+/// any provider can be configured now, the rule is inverted: everything is
+/// forwarded except headers that belong to *this* hop or to the proxy
+/// itself.
+fn forwards_upstream(name: &str) -> bool {
+    // Hop-by-hop headers describe the client↔proxy connection, and `host` /
+    // `content-length` are recomputed for the new request (the body can
+    // differ — a streamed OpenAI call gets `stream_options` added).
+    const CONNECTION_SCOPED: [&str; 11] = [
+        "host",
+        "content-length",
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        // Responses are forwarded with the provider's own headers intact,
+        // so asking upstream for a compressed body risks handing the caller
+        // bytes whose `content-encoding` no longer describes them.
+        "accept-encoding",
+    ];
+    // Harnesswurm's own routing and attribution headers. They mean nothing
+    // to a provider, and a strict gateway can reject unknown ones.
+    const PROXY_LOCAL: [&str; 4] = ["x-agent-id", "x-session-id", "x-experiment-id", "x-provider"];
+
+    let name = name.to_ascii_lowercase();
+    // `content-type` is set explicitly on the forwarded request below.
+    if name == "content-type" {
+        return false;
+    }
+    !CONNECTION_SCOPED.contains(&name.as_str()) && !PROXY_LOCAL.contains(&name.as_str())
 }
 
 /// Best-effort "what is this call actually asking for" summary, taken from
@@ -1288,6 +1329,28 @@ mod tests {
             );
         }
         headers
+    }
+
+    #[test]
+    fn a_custom_providers_auth_header_is_forwarded() {
+        // The case that motivated inverting the rule: an OpenAI-compatible
+        // gateway that authenticates with `api-key` rather than a bearer
+        // token used to have its credential dropped silently.
+        for header in ["authorization", "x-api-key", "api-key", "anthropic-version", "anthropic-beta", "openai-organization", "x-goog-api-key"] {
+            assert!(forwards_upstream(header), "{header} carries auth or provider intent");
+        }
+    }
+
+    #[test]
+    fn connection_scoped_and_proxy_local_headers_stay_on_this_hop() {
+        for header in ["host", "content-length", "connection", "transfer-encoding", "accept-encoding", "content-type"] {
+            assert!(!forwards_upstream(header), "{header} describes this hop, not the upstream call");
+        }
+        // Attribution headers are Harnesswurm's own vocabulary; a provider
+        // has no use for them and a strict gateway may reject them.
+        for header in ["x-agent-id", "X-Session-ID", "x-experiment-id", "x-provider"] {
+            assert!(!forwards_upstream(header), "{header} is proxy-local");
+        }
     }
 
     #[test]
