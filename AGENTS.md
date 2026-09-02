@@ -70,8 +70,9 @@ Desktop (run from `desktop`):
 - Attribution precedence: `/r/…` run prefix > `X-*-ID` headers >
   fingerprints. Never let a fingerprint beat an explicit label.
 - `/v1/models` and `/v1/messages/count_tokens` are forwarded but not
-  recorded. `/v1/responses` is recorded with usage but **no tool-call
-  attribution yet** — don't invent tool counts there.
+  recorded. `/v1/responses` is recorded with usage and tool calls —
+  `function_call` items by their `name`, other `*_call` items by type
+  (`responses_tool_name`).
 - Providers (`providers.yaml`) are hot-editable via `PUT /v1/providers`;
   every other yaml is seeded once, then hand-edited (restart to apply).
 - DB migrations are `add_column_if_missing` calls in `Database::new` — there

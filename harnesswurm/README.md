@@ -203,9 +203,9 @@ The aux endpoints are proxied on the same base URLs — `/v1/models`,
 `/v1/messages/count_tokens`, `/v1/responses` — so an agent probing
 connectivity or pre-counting its context gets a real answer instead of a
 404 that looks like a dead provider. `/v1/responses` (the Responses API the
-Codex CLI speaks) is recorded like any other call, with token and cache
-counts; tool-call attribution for it is not implemented yet, so its rows
-show zero tools rather than a guess. `models` and `count_tokens` are
+Codex CLI speaks) is recorded like any other call, with token, cache and
+tool-call counts — `function_call` items by their tool's name, built-in
+tools (`web_search_call` …) by their type. `models` and `count_tokens` are
 forwarded unrecorded — they are questions *about* a call, not calls.
 
 Those two go to the provider marked `default` for that style in

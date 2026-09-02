@@ -1177,6 +1177,22 @@ fn extract_task_preview(body: &Value) -> Option<String> {
     Some(normalized.chars().take(200).collect())
 }
 
+/// The tool a Responses-API output item represents, if it is a tool
+/// execution: `function_call` items carry the invoked tool's `name`, the
+/// built-in tools (`web_search_call`, `file_search_call`, `local_shell_call`
+/// …) are named by their type — the `_call` suffix is the API's own
+/// convention for them.
+fn responses_tool_name(item: &Value) -> Option<&str> {
+    let item_type = item["type"].as_str()?;
+    if item_type == "function_call" {
+        return item["name"].as_str();
+    }
+    if item_type.ends_with("_call") {
+        return Some(item_type);
+    }
+    None
+}
+
 fn extract_usage(wire: WireApi, json: &Value) -> UsageInfo {
     match wire {
         WireApi::OpenAi => {
@@ -1206,9 +1222,7 @@ fn extract_usage(wire: WireApi, json: &Value) -> UsageInfo {
         WireApi::Responses => {
             // The Responses API reports `input_tokens` including cached ones,
             // mirroring `prompt_tokens` on chat/completions. Tool calls ride
-            // in the output *items* rather than a `tool_calls` array and are
-            // not parsed yet, so they count as 0 — visible honesty rather
-            // than a guessed number.
+            // in the output *items* rather than a `tool_calls` array.
             let usage = &json["usage"];
             let total_input = usage["input_tokens"].as_i64().unwrap_or(0);
             let cache_read = usage["input_tokens_details"]["cached_tokens"].as_i64().unwrap_or(0);
@@ -1217,7 +1231,9 @@ fn extract_usage(wire: WireApi, json: &Value) -> UsageInfo {
                 completion_tokens: usage["output_tokens"].as_i64().unwrap_or(0),
                 cache_creation_tokens: 0,
                 cache_read_tokens: cache_read,
-                tool_calls_count: 0,
+                tool_calls_count: json["output"].as_array()
+                    .map(|items| items.iter().filter(|item| responses_tool_name(item).is_some()).count() as i64)
+                    .unwrap_or(0),
             }
         }
     }
@@ -1252,15 +1268,24 @@ fn extract_error_details(json: &Value) -> (Option<String>, Option<String>) {
 /// waiting for you". OpenAI calls it `finish_reason`, Anthropic
 /// `stop_reason`, with different vocabularies for the same three outcomes.
 /// The Responses API has no such field; its `status` only names failure
-/// modes, so anything other than a completed response is surfaced.
+/// modes, so anything other than a completed response is surfaced — and a
+/// truncation is translated onto the shared `max_tokens` vocabulary so it
+/// lights up the same "Hit output limit" state as the other two formats.
 fn extract_stop_reason(wire: WireApi, json: &Value) -> Option<String> {
     match wire {
         WireApi::OpenAi => json["choices"][0]["finish_reason"].as_str().map(String::from),
         WireApi::Anthropic => json["stop_reason"].as_str().map(String::from),
-        WireApi::Responses => json["status"]
-            .as_str()
-            .filter(|status| *status != "completed")
-            .map(String::from),
+        WireApi::Responses => {
+            let status = json["status"].as_str()?;
+            match status {
+                "completed" => None,
+                "incomplete" => {
+                    let reason = json["incomplete_details"]["reason"].as_str().unwrap_or_default();
+                    Some(if reason == "max_output_tokens" { "max_tokens" } else { "incomplete" }.to_string())
+                }
+                other => Some(other.to_string()),
+            }
+        }
     }
 }
 
@@ -1277,7 +1302,6 @@ fn turn_awaits_human(stop_reason: Option<&str>, has_question: bool) -> bool {
 ///
 /// Unnamed tool calls are skipped rather than recorded as an empty name: a
 /// malformed fragment should not become a phantom tool in the breakdown.
-/// Responses-API calls name no tools (see `extract_usage`) and yield none.
 fn extract_tool_names(wire: WireApi, json: &Value) -> Vec<String> {
     let names: Vec<&str> = match wire {
         WireApi::OpenAi => json["choices"][0]["message"]["tool_calls"].as_array().map(|calls| {
@@ -1289,7 +1313,9 @@ fn extract_tool_names(wire: WireApi, json: &Value) -> Vec<String> {
                 .filter_map(|b| b["name"].as_str())
                 .collect()
         }),
-        WireApi::Responses => None,
+        WireApi::Responses => json["output"].as_array().map(|items| {
+            items.iter().filter_map(responses_tool_name).collect()
+        }),
     }.unwrap_or_default();
 
     names.into_iter().map(String::from).collect()
@@ -1325,9 +1351,22 @@ fn extract_agent_question(wire: WireApi, json: &Value) -> Option<(String, String
                 agent_question::extract_question_text(&block["input"]).map(|text| (name.to_string(), text))
             })
         }
-        // No tool-call parsing on the Responses API yet, so no question can
-        // be recognized either — see `extract_usage`.
-        WireApi::Responses => None,
+        // A question tool arrives as a `function_call` output item whose
+        // arguments are a JSON string rather than an object.
+        WireApi::Responses => {
+            let items = json["output"].as_array()?;
+            items.iter().find_map(|item| {
+                if item["type"] != "function_call" {
+                    return None;
+                }
+                let name = item["name"].as_str().unwrap_or("");
+                if !agent_question::is_agent_question_tool(name) {
+                    return None;
+                }
+                let arguments: Value = serde_json::from_str(item["arguments"].as_str().unwrap_or("{}")).ok()?;
+                agent_question::extract_question_text(&arguments).map(|text| (name.to_string(), text))
+            })
+        }
     }
 }
 
@@ -1586,13 +1625,31 @@ impl StreamAccumulator {
 
     fn process_responses_event(&mut self, json: &Value) {
         match json["type"].as_str() {
+            // A function call arriving incrementally: the item carries the
+            // tool's name up front, its arguments then stream in as string
+            // fragments — the same shape as Anthropic's content_block_start /
+            // input_json_delta pair, keyed by the output index.
+            Some("response.output_item.added") => {
+                let item = &json["item"];
+                if let (Some(index), Some(name)) = (json["output_index"].as_i64(), responses_tool_name(item)) {
+                    self.tool_ids.insert(index.to_string());
+                    agent_question::tool_call_entry(&mut self.tool_calls, &index.to_string())
+                        .name = Some(name.to_string());
+                }
+            }
+            Some("response.function_call_arguments.delta") => {
+                if let (Some(index), Some(fragment)) = (json["output_index"].as_i64(), json["delta"].as_str()) {
+                    agent_question::tool_call_entry(&mut self.tool_calls, &index.to_string())
+                        .arguments.push_str(fragment);
+                }
+            }
             // The terminal events of a Responses stream; the final response
             // object rides along and is where usage lives.
             Some("response.completed") | Some("response.incomplete") => {
                 self.saw_terminal = true;
                 self.usage = extract_usage(WireApi::Responses, &json["response"]);
                 if json["type"] == "response.incomplete" {
-                    self.stop_reason = Some("incomplete".to_string());
+                    self.stop_reason = extract_stop_reason(WireApi::Responses, &json["response"]);
                 }
             }
             Some("response.failed") => {
@@ -2540,6 +2597,149 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 50);
         assert_eq!(usage.cache_read_tokens, 250);
         assert_eq!(usage.completion_tokens, 12);
+    }
+
+    #[test]
+    fn responses_unary_names_function_and_builtin_tool_calls() {
+        let json: Value = serde_json::from_str(r#"{
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "summary": []},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "looking"}]},
+                {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{\"cmd\":\"ls\"}"},
+                {"type": "web_search_call", "id": "ws1", "status": "completed"},
+                {"type": "function_call", "call_id": "c2", "name": "shell", "arguments": "{}"},
+                {"type": "function_call", "call_id": "c3", "arguments": "{}"}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }"#).unwrap();
+
+        // Same shell twice is two calls; a function_call without a name is
+        // skipped rather than becoming a phantom tool; the built-in search
+        // is named by its type.
+        assert_eq!(
+            extract_tool_names(WireApi::Responses, &json),
+            vec!["shell", "web_search_call", "shell"],
+        );
+        let usage = extract_usage(WireApi::Responses, &json);
+        assert_eq!(usage.tool_calls_count, 3);
+    }
+
+    #[test]
+    fn responses_unary_question_from_a_function_call() {
+        let json: Value = serde_json::from_str(r#"{
+            "status": "completed",
+            "output": [
+                {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+                {"type": "function_call", "call_id": "c2", "name": "AskUserQuestion",
+                 "arguments": "{\"questions\":[{\"question\":\"Use TypeScript?\"}]}"}
+            ]
+        }"#).unwrap();
+
+        let result = extract_agent_question(WireApi::Responses, &json);
+        assert_eq!(result, Some(("AskUserQuestion".to_string(), "Use TypeScript?".to_string())));
+    }
+
+    #[test]
+    fn responses_incomplete_maps_max_output_tokens_onto_the_shared_vocabulary() {
+        let truncated: Value = serde_json::from_str(
+            r#"{"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_stop_reason(WireApi::Responses, &truncated).as_deref(), Some("max_tokens"));
+
+        let other: Value = serde_json::from_str(
+            r#"{"status": "incomplete", "incomplete_details": {"reason": "content_filter"}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_stop_reason(WireApi::Responses, &other).as_deref(), Some("incomplete"));
+
+        let done: Value = serde_json::from_str(r#"{"status": "completed"}"#).unwrap();
+        assert_eq!(extract_stop_reason(WireApi::Responses, &done), None);
+    }
+
+    #[test]
+    fn responses_stream_accumulates_function_calls_from_item_events() {
+        let mut acc = StreamAccumulator::default();
+
+        // The name rides on the item event; the arguments arrive as fragments.
+        acc.feed_chunk(
+            WireApi::Responses,
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"name\":\"AskUserQuestion\",\"arguments\":\"\"}}\n\n",
+        );
+        acc.feed_chunk(
+            WireApi::Responses,
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"question\\\": \\\"Add \"}\n\n",
+        );
+        acc.feed_chunk(
+            WireApi::Responses,
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"tests?\\\"}\"}\n\n",
+        );
+        // A second, non-question function call; and message/reasoning items
+        // that must not count as tools.
+        acc.feed_chunk(
+            WireApi::Responses,
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\"fc_2\",\"name\":\"shell\"}}\n\n",
+        );
+        acc.feed_chunk(
+            WireApi::Responses,
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":3,\"item\":{\"type\":\"message\",\"role\":\"assistant\"}}\n\n",
+        );
+        acc.feed_chunk(
+            WireApi::Responses,
+            &format!(
+                "data: {}\n\n",
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "status": "completed",
+                        "output": [
+                            {"type": "function_call", "call_id": "c1", "name": "AskUserQuestion",
+                             "arguments": "{\"question\": \"Add tests?\"}"},
+                            {"type": "function_call", "call_id": "c2", "name": "shell", "arguments": "{}"}
+                        ],
+                        "usage": {"input_tokens": 40, "output_tokens": 9}
+                    }
+                })
+            ),
+        );
+
+        assert!(acc.saw_terminal);
+        assert_eq!(acc.tool_names(), vec!["AskUserQuestion", "shell"]);
+        assert_eq!(acc.usage.tool_calls_count, 2);
+        assert_eq!(acc.usage.prompt_tokens, 40);
+
+        // The turn asked the human a question via fragmented arguments.
+        assert_eq!(
+            acc.agent_question(),
+            Some(("AskUserQuestion".to_string(), "Add tests?".to_string()))
+        );
+        let outcome = classify_stream_outcome(&acc, "", StatusCode::OK, true, 10, 20);
+        assert!(outcome.awaiting_input);
+    }
+
+    #[test]
+    fn responses_stream_incomplete_maps_onto_max_tokens() {
+        let mut acc = StreamAccumulator::default();
+        acc.feed_chunk(
+            WireApi::Responses,
+            &format!(
+                "data: {}\n\n",
+                json!({
+                    "type": "response.incomplete",
+                    "response": {
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_output_tokens"},
+                        "usage": {"input_tokens": 30, "output_tokens": 100}
+                    }
+                })
+            ),
+        );
+
+        assert!(acc.saw_terminal);
+        let outcome = classify_stream_outcome(&acc, "", StatusCode::OK, false, 10, 20);
+        assert_eq!(outcome.status, session_state::STATUS_OK);
+        assert_eq!(outcome.stop_reason.as_deref(), Some("max_tokens"));
     }
 
     #[test]
