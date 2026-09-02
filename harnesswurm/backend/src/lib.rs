@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, Query, State, Request},
     http::{HeaderMap, Method, StatusCode},
     response::{sse::{Event, Sse}, IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{get, put},
     Router,
 };
 use anyhow::Result;
@@ -18,13 +18,14 @@ use tokio::sync::{broadcast, mpsc};
 
 pub mod agent_question;
 pub mod db;
+pub mod fingerprints;
 pub mod pricing;
 pub mod providers;
 pub mod rate_limits;
 pub mod session_state;
 
 use db::TaskOutcome;
-use providers::{ApiStyle, ProviderTable};
+use providers::{ApiStyle, ProviderTable, WireApi};
 
 /// Capacity of the live-event fan-out. A slow dashboard that falls this far
 /// behind gets lagged out rather than holding memory: it only ever misses
@@ -34,6 +35,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 const DEFAULT_AGENTS_YAML: &str = include_str!("../agents.yaml");
 const DEFAULT_PRICING_YAML: &str = include_str!("../pricing.yaml");
 const DEFAULT_PROVIDERS_YAML: &str = include_str!("../providers.yaml");
+const DEFAULT_FINGERPRINTS_YAML: &str = include_str!("../fingerprints.yaml");
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct AgentConfig {
@@ -47,24 +49,219 @@ struct AgentsFile {
 }
 
 /// One resolved upstream for a single call: which endpoint the request is
-/// forwarded to, and under which name it is recorded. `style` decides how
-/// the traffic is parsed; `name` is what the dashboard and `pricing.yaml`
-/// see, so a local endpoint shows up as itself rather than as "openai".
+/// forwarded to, and under which name it is recorded. How the response is
+/// *parsed* is a property of the endpoint (see `Endpoint::wire`), not of
+/// the provider — the aux endpoints broke that coupling.
 #[derive(Debug, Clone)]
 struct Upstream {
+    /// The name every call to this provider is recorded under (what the
+    /// Traffic view shows, and what `provider:` in `pricing.yaml` matches).
     name: String,
-    style: ApiStyle,
+    /// The complete URL this specific call is forwarded to.
     url: String,
 }
 
-impl From<&providers::ProviderConfig> for Upstream {
-    fn from(config: &providers::ProviderConfig) -> Self {
+impl Upstream {
+    fn for_endpoint(config: &providers::ProviderConfig, endpoint: Endpoint) -> Self {
         Self {
             name: config.name.clone(),
-            style: config.api,
-            url: config.target_url(),
+            url: config.url_for(endpoint.upstream_path(config.api)),
         }
     }
+}
+
+/// One of the API endpoints the proxy fronts. The first three carry agent
+/// turns and are recorded as tasks; the aux ones exist because real agents
+/// call them as part of their loop (a connectivity probe against
+/// `/v1/models`, a context pre-count against `count_tokens`) and deserve a
+/// forward rather than a 404 that makes the agent think its provider is
+/// down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Endpoint {
+    ChatCompletions,
+    Messages,
+    Responses,
+    CountTokens,
+    Models,
+}
+
+impl Endpoint {
+    /// The wire format responses on this endpoint are parsed as. `None` for
+    /// the pass-through endpoints, which are forwarded but not interpreted.
+    fn wire(self) -> Option<WireApi> {
+        match self {
+            Endpoint::ChatCompletions => Some(WireApi::OpenAi),
+            Endpoint::Messages => Some(WireApi::Anthropic),
+            Endpoint::Responses => Some(WireApi::Responses),
+            Endpoint::CountTokens | Endpoint::Models => None,
+        }
+    }
+
+    /// The provider style that serves this endpoint. `None` when both do
+    /// (`/v1/models` exists on both APIs), in which case a bare call picks
+    /// by the caller's auth headers — see `models_style_hint`.
+    fn required_style(self) -> Option<ApiStyle> {
+        match self {
+            Endpoint::ChatCompletions | Endpoint::Responses => Some(ApiStyle::OpenAI),
+            Endpoint::Messages | Endpoint::CountTokens => Some(ApiStyle::Anthropic),
+            Endpoint::Models => None,
+        }
+    }
+
+    /// The path appended to the provider's base URL. Style-dependent for
+    /// `/v1/models`, the one endpoint both APIs serve: an OpenAI-style base
+    /// URL already ends in `/v1` (the client appends `/models`), an
+    /// Anthropic-style base does not (the client appends `/v1/models`).
+    fn upstream_path(self, style: ApiStyle) -> &'static str {
+        match self {
+            Endpoint::ChatCompletions => "/chat/completions",
+            Endpoint::Messages => "/v1/messages",
+            Endpoint::Responses => "/responses",
+            Endpoint::CountTokens => "/v1/messages/count_tokens",
+            Endpoint::Models => match style {
+                ApiStyle::OpenAI => "/models",
+                ApiStyle::Anthropic => "/v1/models",
+            },
+        }
+    }
+
+    /// Whether a call here is recorded as a task with telemetry. `/v1/models`
+    /// and `count_tokens` answer questions *about* a call the agent is about
+    /// to make, so they are forwarded but contribute no row of their own.
+    fn is_recorded(self) -> bool {
+        self.wire().is_some()
+    }
+}
+
+/// The URL tails that identify an endpoint. Order matters: a longer tail
+/// sharing a suffix with a shorter one (`/v1/messages/count_tokens` vs
+/// `/v1/messages`) must come first, since matching is by `strip_suffix`.
+const ENDPOINT_TAILS: [(&str, Endpoint); 5] = [
+    ("/v1/messages/count_tokens", Endpoint::CountTokens),
+    ("/v1/chat/completions", Endpoint::ChatCompletions),
+    ("/v1/messages", Endpoint::Messages),
+    ("/v1/models", Endpoint::Models),
+    ("/v1/responses", Endpoint::Responses),
+];
+
+/// Agent/experiment/session attribution carried in the URL path — the one
+/// channel every agent can be pointed through, because it needs nothing
+/// beyond the base URL all of them let you configure. Built by
+/// `build_run_prefix`, used by `parse_proxy_path`.
+struct RunAttribution {
+    agent: String,
+    /// Present in the three-segment form `/r/<agent>/<experiment>/<session>`;
+    /// the two-segment form leaves the experiment to headers (or to none).
+    experiment: Option<String>,
+    session: String,
+}
+
+/// Everything the request path says about a proxied call: which endpoint it
+/// hits, which named provider it asked for, and the run attribution it
+/// carries. Parsed by `parse_proxy_path` — one pure function, so every
+/// prefix shape provably agrees with every other.
+struct ProxyPath {
+    run: Option<RunAttribution>,
+    provider: Option<String>,
+    endpoint: Endpoint,
+}
+
+/// Parses a proxy route into its parts. The endpoint is recognized by its
+/// tail, so `/v1/messages/count_tokens` must be listed before `/v1/messages`
+/// to not be swallowed as a messages call with a stray suffix. Everything
+/// before the tail is prefix segments: nothing, `/p/<provider>`,
+/// `/r/<agent>/<session>`, `/r/<agent>/<experiment>/<session>`, or a `/r/…`
+/// form with `/p/<provider>` appended — the combinations the
+/// `harnesswurm run` wrapper generates.
+fn parse_proxy_path(path: &str) -> Result<ProxyPath, String> {
+    let usage = "Run prefixes are /r/<agent>/<session> or /r/<agent>/<experiment>/<session>, \
+                 provider prefixes are /p/<provider>, and both combine: \
+                 /r/<agent>/<experiment>/<session>/p/<provider>/v1/…";
+    let (prefix, endpoint) = ENDPOINT_TAILS
+        .iter()
+        .find_map(|(tail, endpoint)| path.strip_suffix(tail).map(|prefix| (prefix, *endpoint)))
+        .ok_or_else(|| {
+            format!(
+                "Unknown proxy route '{path}'. Known endpoints: {} — each optionally under \
+                 /r/<agent>[/<experiment>]/<session> and /p/<provider>.",
+                ENDPOINT_TAILS.iter().map(|(tail, _)| *tail).collect::<Vec<_>>().join(", "),
+            )
+        })?;
+
+    let mut segments: Vec<&str> = prefix.split('/').filter(|s| !s.is_empty()).collect();
+
+    // A trailing `/p/<name>` names the provider, on its own or after a run
+    // prefix.
+    let mut provider = None;
+    if segments.len() >= 2 && segments[segments.len() - 2] == "p" {
+        let name = segments.pop().expect("length checked above");
+        segments.pop();
+        if name.is_empty() {
+            return Err(format!("Empty provider name in '{path}'. {usage}"));
+        }
+        provider = Some(name.to_string());
+    }
+
+    let mut run = None;
+    if segments.first() == Some(&"r") {
+        segments.remove(0);
+        let attribution = match segments.as_slice() {
+            [agent, session] => RunAttribution {
+                agent: agent.to_string(),
+                experiment: None,
+                session: session.to_string(),
+            },
+            [agent, experiment, session] => RunAttribution {
+                agent: agent.to_string(),
+                experiment: Some(experiment.to_string()),
+                session: session.to_string(),
+            },
+            _ => return Err(format!("Unknown run prefix in '{path}'. {usage}")),
+        };
+        run = Some(attribution);
+        segments.clear();
+    }
+
+    if !segments.is_empty() {
+        return Err(format!("Unknown proxy route '{path}'. {usage}"));
+    }
+
+    Ok(ProxyPath { run, provider, endpoint })
+}
+
+/// The `/r/…` path prefix the `harnesswurm run` wrapper points an agent's
+/// base URL at — one function shared by the wrapper and the tests, so what
+/// the wrapper generates is by construction what the proxy parses.
+/// Segments are restricted to URL-safe characters because they travel in a
+/// base URL pasted into other tools' configs.
+pub fn build_run_prefix(
+    agent: &str,
+    experiment: Option<&str>,
+    session: &str,
+    provider: Option<&str>,
+) -> Result<String, String> {
+    let mut segments = vec![agent.to_string()];
+    if let Some(experiment) = experiment {
+        segments.push(experiment.to_string());
+    }
+    segments.push(session.to_string());
+    if let Some(provider) = provider {
+        segments.extend(["p".to_string(), provider.to_string()]);
+    }
+
+    for segment in &segments {
+        let safe = !segment.is_empty()
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        if !safe {
+            return Err(format!(
+                "'{segment}' can only contain letters, digits, '-', '_' and '.' — it travels inside a base URL"
+            ));
+        }
+    }
+
+    Ok(format!("/r/{}", segments.join("/")))
 }
 
 /// Token/tool-call totals for one proxied call. `prompt_tokens` always means
@@ -124,6 +321,11 @@ pub struct AppState {
     /// Where that file lives, so a saved edit lands next to the rest of the
     /// state instead of in whatever the process's working directory is.
     pub providers_path: PathBuf,
+    /// How calls without `X-Agent-ID` are attributed anyway: recognizable
+    /// `User-Agent` headers and system prompts, from `fingerprints.yaml`.
+    /// Loaded once at startup; hand edits to the file apply on the next
+    /// start, like every non-provider config.
+    pub fingerprints: fingerprints::FingerprintTable,
     /// Fan-out for "something changed" pings to any connected dashboard.
     /// Deliberately carries no state of its own: a subscriber re-reads the
     /// analytics endpoints on a ping, so there is exactly one definition of
@@ -180,15 +382,43 @@ fn migrate_legacy_db(data_dir: &std::path::Path, db_path: &std::path::Path) -> s
     Ok(())
 }
 
+/// How long captured request/response bodies are kept, from
+/// `HARNESSWURM_TRAFFIC_RETENTION_DAYS`. Taken as the raw string so the
+/// parser stays a pure function the tests can exercise without touching
+/// the process env, which parallel tests share.
+fn parse_retention_days(value: Option<&str>) -> i64 {
+    const DEFAULT_DAYS: i64 = 30;
+    let Some(value) = value else { return DEFAULT_DAYS };
+    match value.trim().parse::<i64>() {
+        Ok(days) if days < 0 => {
+            eprintln!("Ignoring negative HARNESSWURM_TRAFFIC_RETENTION_DAYS '{value}'");
+            DEFAULT_DAYS
+        }
+        Ok(days) => days,
+        Err(_) => {
+            eprintln!(
+                "Ignoring unparseable HARNESSWURM_TRAFFIC_RETENTION_DAYS '{value}' (expected a number of days)"
+            );
+            DEFAULT_DAYS
+        }
+    }
+}
+
+fn retention_days_from_env() -> i64 {
+    parse_retention_days(std::env::var("HARNESSWURM_TRAFFIC_RETENTION_DAYS").ok().as_deref())
+}
+
 pub async fn run(config: ServerConfig) -> Result<()> {
     std::fs::create_dir_all(&config.data_dir)?;
 
     let agents_path = config.data_dir.join("agents.yaml");
     let pricing_path = config.data_dir.join("pricing.yaml");
     let providers_path = config.data_dir.join("providers.yaml");
+    let fingerprints_path = config.data_dir.join("fingerprints.yaml");
     seed_default_file(&agents_path, DEFAULT_AGENTS_YAML)?;
     seed_default_file(&pricing_path, DEFAULT_PRICING_YAML)?;
     seed_default_file(&providers_path, DEFAULT_PROVIDERS_YAML)?;
+    seed_default_file(&fingerprints_path, DEFAULT_FINGERPRINTS_YAML)?;
 
     let db_path = config.data_dir.join("harnesswurm.db");
     migrate_legacy_db(&config.data_dir, &db_path)?;
@@ -206,6 +436,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     }
 
     let pricing = pricing::PricingTable::load(&pricing_path);
+    let fingerprints = fingerprints::FingerprintTable::load(&fingerprints_path);
 
     let mut provider_table = ProviderTable::load(&providers_path);
     provider_table.apply_env_overrides();
@@ -228,8 +459,29 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         pricing,
         providers: std::sync::RwLock::new(provider_table),
         providers_path: providers_path.clone(),
+        fingerprints,
         events,
     });
+
+    // Captured bodies are the bulk of the database and the only part with
+    // privacy weight, so they age out on their own; the counts and costs
+    // derived from them stay. The loop rather than a one-shot keeps a
+    // long-running desktop app from growing without bound, not just a
+    // server that restarts daily.
+    let retention_days = retention_days_from_env();
+    if retention_days > 0 {
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            loop {
+                match db.prune_traffic_bodies(retention_days).await {
+                    Ok(0) => {}
+                    Ok(n) => println!("Pruned {n} traffic bodie(s) older than {retention_days} days"),
+                    Err(e) => eprintln!("Could not prune traffic bodies: {e}"),
+                }
+                tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
+            }
+        });
+    }
 
     // Permissive: this server only ever binds to loopback, and its callers
     // are the Vite dev server (http://localhost:5173) and the Tauri webview
@@ -241,12 +493,10 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     let state_for_log = state.clone();
 
     let app = Router::new()
-        .route("/v1/chat/completions", post(openai_proxy_handler))
-        .route("/v1/messages", post(anthropic_proxy_handler))
-        // Same two endpoints, addressed at one named provider — the way a
-        // client that can only be given a base URL picks its upstream.
-        .route("/p/:provider/v1/chat/completions", post(named_openai_proxy_handler))
-        .route("/p/:provider/v1/messages", post(named_anthropic_proxy_handler))
+        // Every proxy route is matched by the fallback dispatcher below:
+        // the main endpoints, the aux endpoints, and the /p/<provider> and
+        // /r/… prefixes share one handler that parses the path itself, so
+        // a new prefix shape can't drift out of sync with the routing.
         .route("/v1/providers", get(get_providers).put(put_providers))
         .route("/v1/analytics/experiments", get(get_experiments))
         .route("/v1/analytics/experiments/:id/metrics", get(get_experiment_metrics))
@@ -258,6 +508,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         .route("/v1/analytics/sessions", get(get_sessions))
         .route("/v1/analytics/limits", get(get_rate_limits))
         .route("/v1/analytics/events", get(get_events))
+        .fallback(proxy_dispatch)
         .layer(cors)
         .with_state(state);
 
@@ -526,12 +777,12 @@ async fn put_providers(
 }
 
 /// Which upstream this call goes to. A name given explicitly — in the path
-/// (`/p/<name>/…`) or in `X-Provider` — wins over the style's default, and
-/// an unknown one is refused rather than quietly forwarded to the hosted
-/// API under a name the caller didn't ask for.
+/// (`/p/<name>/…`) or in `X-Provider` — wins over the endpoint's default,
+/// and an unknown one is refused rather than quietly forwarded to the
+/// hosted API under a name the caller didn't ask for.
 fn resolve_upstream(
     providers: &ProviderTable,
-    style: ApiStyle,
+    endpoint: Endpoint,
     named: Option<&str>,
     headers: &HeaderMap,
 ) -> Result<Upstream, (StatusCode, String)> {
@@ -540,8 +791,12 @@ fn resolve_upstream(
         .map(str::trim)
         .filter(|name| !name.is_empty());
 
+    let style = endpoint
+        .required_style()
+        .unwrap_or_else(|| models_style_hint(headers));
+
     let Some(name) = requested else {
-        return Ok(Upstream::from(providers.default_for(style)));
+        return Ok(Upstream::for_endpoint(providers.default_for(style), endpoint));
     };
 
     let config = providers.by_name(name).ok_or_else(|| (
@@ -554,68 +809,118 @@ fn resolve_upstream(
 
     // Forwarding an OpenAI-shaped body to an Anthropic endpoint (or the
     // reverse) can only fail upstream, with a confusing error; say which
-    // route the provider actually belongs on instead.
-    if config.api != style {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Provider '{}' speaks the {} API, but this call came in on the {} endpoint. \
-                 Use {} instead.",
-                config.name,
-                config.api.as_str(),
-                style.as_str(),
-                match config.api {
-                    ApiStyle::OpenAI => "/p/<provider>/v1/chat/completions",
-                    ApiStyle::Anthropic => "/p/<provider>/v1/messages",
-                },
-            ),
-        ));
+    // route the provider actually belongs on instead. `/v1/models` is
+    // served by both styles, so it skips the check.
+    if let Some(required) = endpoint.required_style() {
+        if config.api != required {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Provider '{}' speaks the {} API, but this call came in on an endpoint the {} API serves. \
+                     Use {} instead.",
+                    config.name,
+                    config.api.as_str(),
+                    required.as_str(),
+                    match config.api {
+                        ApiStyle::OpenAI => "/p/<provider>/v1/chat/completions",
+                        ApiStyle::Anthropic => "/p/<provider>/v1/messages",
+                    },
+                ),
+            ));
+        }
     }
 
-    Ok(Upstream::from(config))
+    Ok(Upstream::for_endpoint(config, endpoint))
 }
 
-async fn openai_proxy_handler(
-    state: State<Arc<AppState>>,
-    headers: HeaderMap,
-    method: Method,
-    req: Request,
-) -> Result<Response, StatusCode> {
-    proxy_handler(ApiStyle::OpenAI, None, state.0, headers, method, req).await
+/// Which API family a bare `/v1/models` call belongs to. The endpoint exists
+/// on both, so the caller's own auth headers decide: `x-api-key` /
+/// `anthropic-version` mean an Anthropic-style client, anything else — a
+/// bearer token, or no auth at all from a local server — reads as
+/// OpenAI-style, the more common shape.
+fn models_style_hint(headers: &HeaderMap) -> ApiStyle {
+    for header in ["x-api-key", "anthropic-version", "anthropic-beta"] {
+        if headers.contains_key(header) {
+            return ApiStyle::Anthropic;
+        }
+    }
+    ApiStyle::OpenAI
 }
 
-async fn anthropic_proxy_handler(
-    state: State<Arc<AppState>>,
-    headers: HeaderMap,
-    method: Method,
-    req: Request,
-) -> Result<Response, StatusCode> {
-    proxy_handler(ApiStyle::Anthropic, None, state.0, headers, method, req).await
+/// Everything a call is recorded under. Three sources, most specific first:
+/// the run prefix in the URL (what the `harnesswurm run` wrapper sets), the
+/// `X-*-ID` headers, and — needing no cooperation from the agent at all —
+/// fingerprints of what it unavoidably sends: its User-Agent, and its
+/// system prompt.
+struct Attribution {
+    agent: String,
+    session: String,
+    experiment: Option<String>,
 }
 
-async fn named_openai_proxy_handler(
-    Path(provider): Path<String>,
-    state: State<Arc<AppState>>,
-    headers: HeaderMap,
-    method: Method,
-    req: Request,
-) -> Result<Response, StatusCode> {
-    proxy_handler(ApiStyle::OpenAI, Some(provider), state.0, headers, method, req).await
+fn resolve_attribution(
+    run: Option<&RunAttribution>,
+    headers: &HeaderMap,
+    body: Option<&Value>,
+    wire: Option<WireApi>,
+    fingerprints: &fingerprints::FingerprintTable,
+) -> Attribution {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(String::from)
+    };
+
+    let agent = run
+        .map(|r| r.agent.clone())
+        .or_else(|| header("X-Agent-ID"))
+        .or_else(|| {
+            let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok())?;
+            fingerprints.match_user_agent(user_agent).map(String::from)
+        })
+        .or_else(|| {
+            let prompt = fingerprints::system_prompt_text(wire?, body?)?;
+            fingerprints.match_system_prompt(&prompt).map(String::from)
+        })
+        .unwrap_or_else(|| "unknown_agent".to_string());
+
+    // With no labelled session, calls of the same task still belong
+    // together: agents resend the whole conversation each turn, so the
+    // first user message is a stable per-task key (see
+    // `fingerprints::auto_session_id`).
+    let session = run
+        .map(|r| r.session.clone())
+        .or_else(|| header("X-Session-ID"))
+        .or_else(|| body.and_then(fingerprints::auto_session_id))
+        .unwrap_or_else(|| "default_session".to_string());
+
+    let experiment = run
+        .and_then(|r| r.experiment.clone())
+        .or_else(|| header("X-Experiment-ID"));
+
+    Attribution { agent, session, experiment }
 }
 
-async fn named_anthropic_proxy_handler(
-    Path(provider): Path<String>,
-    state: State<Arc<AppState>>,
-    headers: HeaderMap,
-    method: Method,
+/// Catch-all for every proxy route. The main endpoints, the aux endpoints
+/// and the `/p/<provider>` / `/r/…` prefixes all share one handler because
+/// they share one job: the path (not the route registration) says where the
+/// call goes and who it belongs to, and a path parser is easier to keep
+/// honest than a dozen near-identical route handlers.
+async fn proxy_dispatch(
+    State(state): State<Arc<AppState>>,
     req: Request,
 ) -> Result<Response, StatusCode> {
-    proxy_handler(ApiStyle::Anthropic, Some(provider), state.0, headers, method, req).await
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+    let path = req.uri().path().to_string();
+    proxy_handler(&path, state, headers, method, req).await
 }
 
 async fn proxy_handler(
-    style: ApiStyle,
-    named_provider: Option<String>,
+    path_text: &str,
     state: Arc<AppState>,
     headers: HeaderMap,
     method: Method,
@@ -623,12 +928,22 @@ async fn proxy_handler(
 ) -> Result<Response, StatusCode> {
     let start = Instant::now();
 
+    let path = match parse_proxy_path(path_text) {
+        Ok(path) => path,
+        Err(message) => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                axum::Json(json!({ "error": { "message": message } })),
+            ).into_response())
+        }
+    };
+
     // Resolved before anything is recorded: a call that can't be routed is
     // a configuration mistake to report back, not a task to log as failed.
     let resolved = {
         // Scoped so the lock is released before anything awaits on it.
         let providers = state.providers.read().unwrap();
-        resolve_upstream(&providers, style, named_provider.as_deref(), &headers)
+        resolve_upstream(&providers, path.endpoint, path.provider.as_deref(), &headers)
     };
     let upstream = match resolved {
         Ok(upstream) => upstream,
@@ -637,27 +952,32 @@ async fn proxy_handler(
         }
     };
 
-    let agent_name = headers.get("X-Agent-ID")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown_agent");
+    let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX).await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let parsed_body: Option<Value> = serde_json::from_slice(&body_bytes).ok();
 
-    let session_id = headers.get("X-Session-ID")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("default_session");
+    let attribution = resolve_attribution(
+        path.run.as_ref(),
+        &headers,
+        parsed_body.as_ref(),
+        path.endpoint.wire(),
+        &state.fingerprints,
+    );
 
-    let agent_id = state.db.get_or_create_agent(agent_name).await
+    if !path.endpoint.is_recorded() {
+        return forward_pass_through(state, upstream, headers, method, body_bytes.to_vec()).await;
+    }
+    let wire = path.endpoint.wire().expect("recorded endpoints parse a wire format");
+
+    let agent_id = state.db.get_or_create_agent(&attribution.agent).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let experiment_id = match headers.get("X-Experiment-ID").and_then(|v| v.to_str().ok()) {
+    let experiment_id = match attribution.experiment.as_deref() {
         Some(name) => Some(state.db.get_or_create_experiment(name, None).await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?),
         None => None,
     };
 
-    let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX).await
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    let parsed_body: Option<Value> = serde_json::from_slice(&body_bytes).ok();
     let is_streaming = parsed_body.as_ref().and_then(|j| j["stream"].as_bool()).unwrap_or(false);
     let model_name = parsed_body.as_ref().and_then(|j| j["model"].as_str()).map(String::from);
     let task_preview = parsed_body.as_ref().and_then(extract_task_preview);
@@ -666,15 +986,15 @@ async fn proxy_handler(
         agent_id,
         experiment_id,
         task_preview,
-        Some(session_id.to_string()),
+        Some(attribution.session.clone()),
         model_name.clone(),
         Some(upstream.name.clone()),
     ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let call = CallContext {
         task_id,
-        agent_name: agent_name.to_string(),
-        session_id: session_id.to_string(),
+        agent_name: attribution.agent.clone(),
+        session_id: attribution.session.clone(),
         started: start,
     };
 
@@ -682,10 +1002,12 @@ async fn proxy_handler(
     let _ = state.db.save_traffic_request(task_id, &request_text).await;
     call.notify(&state, "task_started", session_state::STATUS_IN_FLIGHT);
 
-    let forward_body: Vec<u8> = match (&parsed_body, upstream.style, is_streaming) {
-        (Some(json), ApiStyle::OpenAI, true) => {
+    let forward_body: Vec<u8> = match (&parsed_body, wire, is_streaming) {
+        (Some(json), WireApi::OpenAi, true) => {
             // OpenAI only includes `usage` on the final streamed chunk when
-            // asked for it; without this, streamed token counts are 0.
+            // asked for it; without this, streamed token counts are 0. The
+            // Responses API needs no such nudge — its terminal event always
+            // carries usage.
             let mut j = json.clone();
             j["stream_options"] = json!({"include_usage": true});
             serde_json::to_vec(&j).unwrap_or_else(|_| body_bytes.to_vec())
@@ -728,10 +1050,53 @@ async fn proxy_handler(
     let latency = start.elapsed().as_millis() as i64;
 
     if is_streaming {
-        handle_streaming(state, upstream, response, task_id, model_name, latency, status, call).await
+        handle_streaming(state, upstream, wire, response, task_id, model_name, latency, status, call).await
     } else {
-        Ok(handle_unary(state, upstream, response, task_id, model_name, latency, status, call).await)
+        Ok(handle_unary(state, upstream, wire, response, task_id, model_name, latency, status, call).await)
     }
+}
+
+/// The aux endpoints (`/v1/models`, `count_tokens`): forwarded verbatim and
+/// recorded nowhere. They are questions about a call the agent is about to
+/// make, not calls themselves — answering them with a 404 is what used to
+/// make agents decide their provider was down.
+async fn forward_pass_through(
+    state: Arc<AppState>,
+    upstream: Upstream,
+    headers: HeaderMap,
+    method: Method,
+    body: Vec<u8>,
+) -> Result<Response, StatusCode> {
+    let mut proxy_req = state.client.request(method, &upstream.url);
+    for (name, value) in headers.iter() {
+        if forwards_upstream(name.as_str()) {
+            proxy_req = proxy_req.header(name.clone(), value.clone());
+        }
+    }
+    // A GET carries no body and needs no content-type; forcing one on
+    // every call would be harmless for the hosted APIs but is noise a
+    // strict local server may reject.
+    if !body.is_empty() {
+        proxy_req = proxy_req.header("Content-Type", "application/json");
+    }
+    let proxy_req = proxy_req.body(body);
+
+    let response = proxy_req.send().await.map_err(|e| {
+        eprintln!("Proxy error ({}): {}", upstream.url, e);
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let response_headers = response.headers().clone();
+    let bytes = response.bytes().await.unwrap_or_default();
+
+    let mut response_builder = Response::builder().status(status);
+    for (key, value) in response_headers.iter() {
+        response_builder = response_builder.header(key, value);
+    }
+    response_builder
+        .body(axum::body::Body::from(bytes))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// Whether an incoming request header is passed on to the provider.
@@ -776,12 +1141,24 @@ fn forwards_upstream(name: &str) -> bool {
 }
 
 /// Best-effort "what is this call actually asking for" summary, taken from
-/// the most recent user turn — both OpenAI and Anthropic request bodies use
-/// a `messages: [{role, content}]` shape, and `content` is either a plain
-/// string or a list of content blocks (only the text ones are used here).
+/// the most recent user turn — OpenAI and Anthropic request bodies use a
+/// `messages: [{role, content}]` shape, the Responses API the same shape
+/// under `input` (or a bare string). `content` is either a plain string or
+/// a list of content blocks (only the text ones are used here).
 fn extract_task_preview(body: &Value) -> Option<String> {
-    let messages = body.get("messages")?.as_array()?;
-    let last_user = messages.iter().rev().find(|m| m["role"] == "user")?;
+    let messages = body.get("messages").and_then(Value::as_array);
+    let last_user = messages
+        .and_then(|ms| ms.iter().rev().find(|m| m["role"] == "user").cloned())
+        .or_else(|| {
+            body.get("input")
+                .and_then(Value::as_array)
+                .and_then(|items| items.iter().rev().find(|m| m["role"] == "user").cloned())
+        })
+        .or_else(|| {
+            body.get("input").and_then(Value::as_str).map(|input| {
+                json!({ "role": "user", "content": input })
+            })
+        })?;
     let content = &last_user["content"];
 
     let text = if let Some(s) = content.as_str() {
@@ -800,9 +1177,25 @@ fn extract_task_preview(body: &Value) -> Option<String> {
     Some(normalized.chars().take(200).collect())
 }
 
-fn extract_usage(provider: ApiStyle, json: &Value) -> UsageInfo {
-    match provider {
-        ApiStyle::OpenAI => {
+/// The tool a Responses-API output item represents, if it is a tool
+/// execution: `function_call` items carry the invoked tool's `name`, the
+/// built-in tools (`web_search_call`, `file_search_call`, `local_shell_call`
+/// …) are named by their type — the `_call` suffix is the API's own
+/// convention for them.
+fn responses_tool_name(item: &Value) -> Option<&str> {
+    let item_type = item["type"].as_str()?;
+    if item_type == "function_call" {
+        return item["name"].as_str();
+    }
+    if item_type.ends_with("_call") {
+        return Some(item_type);
+    }
+    None
+}
+
+fn extract_usage(wire: WireApi, json: &Value) -> UsageInfo {
+    match wire {
+        WireApi::OpenAi => {
             let usage = &json["usage"];
             let total_prompt = usage["prompt_tokens"].as_i64().unwrap_or(0);
             let cache_read = usage["prompt_tokens_details"]["cached_tokens"].as_i64().unwrap_or(0);
@@ -814,7 +1207,7 @@ fn extract_usage(provider: ApiStyle, json: &Value) -> UsageInfo {
                 tool_calls_count: json["choices"][0]["message"]["tool_calls"].as_array().map(|a| a.len() as i64).unwrap_or(0),
             }
         }
-        ApiStyle::Anthropic => {
+        WireApi::Anthropic => {
             let usage = &json["usage"];
             UsageInfo {
                 prompt_tokens: usage["input_tokens"].as_i64().unwrap_or(0),
@@ -823,6 +1216,23 @@ fn extract_usage(provider: ApiStyle, json: &Value) -> UsageInfo {
                 cache_read_tokens: usage["cache_read_input_tokens"].as_i64().unwrap_or(0),
                 tool_calls_count: json["content"].as_array()
                     .map(|blocks| blocks.iter().filter(|b| b["type"] == "tool_use").count() as i64)
+                    .unwrap_or(0),
+            }
+        }
+        WireApi::Responses => {
+            // The Responses API reports `input_tokens` including cached ones,
+            // mirroring `prompt_tokens` on chat/completions. Tool calls ride
+            // in the output *items* rather than a `tool_calls` array.
+            let usage = &json["usage"];
+            let total_input = usage["input_tokens"].as_i64().unwrap_or(0);
+            let cache_read = usage["input_tokens_details"]["cached_tokens"].as_i64().unwrap_or(0);
+            UsageInfo {
+                prompt_tokens: (total_input - cache_read).max(0),
+                completion_tokens: usage["output_tokens"].as_i64().unwrap_or(0),
+                cache_creation_tokens: 0,
+                cache_read_tokens: cache_read,
+                tool_calls_count: json["output"].as_array()
+                    .map(|items| items.iter().filter(|item| responses_tool_name(item).is_some()).count() as i64)
                     .unwrap_or(0),
             }
         }
@@ -857,10 +1267,25 @@ fn extract_error_details(json: &Value) -> (Option<String>, Option<String>) {
 /// "the agent went off to run a tool" apart from "the agent is done and
 /// waiting for you". OpenAI calls it `finish_reason`, Anthropic
 /// `stop_reason`, with different vocabularies for the same three outcomes.
-fn extract_stop_reason(provider: ApiStyle, json: &Value) -> Option<String> {
-    match provider {
-        ApiStyle::OpenAI => json["choices"][0]["finish_reason"].as_str().map(String::from),
-        ApiStyle::Anthropic => json["stop_reason"].as_str().map(String::from),
+/// The Responses API has no such field; its `status` only names failure
+/// modes, so anything other than a completed response is surfaced — and a
+/// truncation is translated onto the shared `max_tokens` vocabulary so it
+/// lights up the same "Hit output limit" state as the other two formats.
+fn extract_stop_reason(wire: WireApi, json: &Value) -> Option<String> {
+    match wire {
+        WireApi::OpenAi => json["choices"][0]["finish_reason"].as_str().map(String::from),
+        WireApi::Anthropic => json["stop_reason"].as_str().map(String::from),
+        WireApi::Responses => {
+            let status = json["status"].as_str()?;
+            match status {
+                "completed" => None,
+                "incomplete" => {
+                    let reason = json["incomplete_details"]["reason"].as_str().unwrap_or_default();
+                    Some(if reason == "max_output_tokens" { "max_tokens" } else { "incomplete" }.to_string())
+                }
+                other => Some(other.to_string()),
+            }
+        }
     }
 }
 
@@ -877,16 +1302,19 @@ fn turn_awaits_human(stop_reason: Option<&str>, has_question: bool) -> bool {
 ///
 /// Unnamed tool calls are skipped rather than recorded as an empty name: a
 /// malformed fragment should not become a phantom tool in the breakdown.
-fn extract_tool_names(provider: ApiStyle, json: &Value) -> Vec<String> {
-    let names: Vec<&str> = match provider {
-        ApiStyle::OpenAI => json["choices"][0]["message"]["tool_calls"].as_array().map(|calls| {
+fn extract_tool_names(wire: WireApi, json: &Value) -> Vec<String> {
+    let names: Vec<&str> = match wire {
+        WireApi::OpenAi => json["choices"][0]["message"]["tool_calls"].as_array().map(|calls| {
             calls.iter().filter_map(|tc| tc["function"]["name"].as_str()).collect()
         }),
-        ApiStyle::Anthropic => json["content"].as_array().map(|blocks| {
+        WireApi::Anthropic => json["content"].as_array().map(|blocks| {
             blocks.iter()
                 .filter(|b| b["type"] == "tool_use")
                 .filter_map(|b| b["name"].as_str())
                 .collect()
+        }),
+        WireApi::Responses => json["output"].as_array().map(|items| {
+            items.iter().filter_map(responses_tool_name).collect()
         }),
     }.unwrap_or_default();
 
@@ -896,9 +1324,9 @@ fn extract_tool_names(provider: ApiStyle, json: &Value) -> Vec<String> {
 /// Scans the same tool-calls/content a response already carries for one
 /// matching a known "ask the human a question" convention. Unary twin of
 /// the streaming accumulate-then-scan path in handle_streaming.
-fn extract_agent_question(provider: ApiStyle, json: &Value) -> Option<(String, String)> {
-    match provider {
-        ApiStyle::OpenAI => {
+fn extract_agent_question(wire: WireApi, json: &Value) -> Option<(String, String)> {
+    match wire {
+        WireApi::OpenAi => {
             let tool_calls = json["choices"][0]["message"]["tool_calls"].as_array()?;
             tool_calls.iter().find_map(|tc| {
                 let name = tc["function"]["name"].as_str().unwrap_or("");
@@ -910,7 +1338,7 @@ fn extract_agent_question(provider: ApiStyle, json: &Value) -> Option<(String, S
                 agent_question::extract_question_text(&arguments).map(|text| (name.to_string(), text))
             })
         }
-        ApiStyle::Anthropic => {
+        WireApi::Anthropic => {
             let content = json["content"].as_array()?;
             content.iter().find_map(|block| {
                 if block["type"] != "tool_use" {
@@ -923,6 +1351,22 @@ fn extract_agent_question(provider: ApiStyle, json: &Value) -> Option<(String, S
                 agent_question::extract_question_text(&block["input"]).map(|text| (name.to_string(), text))
             })
         }
+        // A question tool arrives as a `function_call` output item whose
+        // arguments are a JSON string rather than an object.
+        WireApi::Responses => {
+            let items = json["output"].as_array()?;
+            items.iter().find_map(|item| {
+                if item["type"] != "function_call" {
+                    return None;
+                }
+                let name = item["name"].as_str().unwrap_or("");
+                if !agent_question::is_agent_question_tool(name) {
+                    return None;
+                }
+                let arguments: Value = serde_json::from_str(item["arguments"].as_str().unwrap_or("{}")).ok()?;
+                agent_question::extract_question_text(&arguments).map(|text| (name.to_string(), text))
+            })
+        }
     }
 }
 
@@ -930,6 +1374,7 @@ fn extract_agent_question(provider: ApiStyle, json: &Value) -> Option<(String, S
 async fn handle_unary(
     state: Arc<AppState>,
     upstream: Upstream,
+    wire: WireApi,
     res: reqwest::Response,
     task_id: i64,
     model_name: Option<String>,
@@ -943,17 +1388,17 @@ async fn handle_unary(
     let parsed_response: Option<Value> = serde_json::from_slice(&res_bytes).ok();
 
     let usage = parsed_response.as_ref()
-        .map(|json| extract_usage(upstream.style, json))
+        .map(|json| extract_usage(wire, json))
         .unwrap_or_default();
     let agent_question = parsed_response.as_ref()
-        .and_then(|json| extract_agent_question(upstream.style, json));
-    let stop_reason = parsed_response.as_ref().and_then(|json| extract_stop_reason(upstream.style, json));
+        .and_then(|json| extract_agent_question(wire, json));
+    let stop_reason = parsed_response.as_ref().and_then(|json| extract_stop_reason(wire, json));
     let (error_type, error_message) = parsed_response.as_ref()
         .map(extract_error_details)
         .unwrap_or((None, None));
 
     let tool_names = parsed_response.as_ref()
-        .map(|json| extract_tool_names(upstream.style, json))
+        .map(|json| extract_tool_names(wire, json))
         .unwrap_or_default();
 
     let response_text = String::from_utf8_lossy(&res_bytes).to_string();
@@ -1025,6 +1470,10 @@ struct StreamAccumulator {
     saw_terminal: bool,
     error_type: Option<String>,
     error_message: Option<String>,
+    /// The tail of the last chunk, when it did not end on a line boundary.
+    /// SSE events are line-framed but TCP chunks are not: a `data:` line
+    /// split across two chunks used to have each half parsed as nothing.
+    line_carry: String,
 }
 
 impl StreamAccumulator {
@@ -1046,38 +1495,59 @@ impl StreamAccumulator {
             agent_question::extract_question_text(&arguments).map(|text| (name.to_string(), text))
         })
     }
-}
 
-/// Folds one SSE chunk's `data: ` lines into the running totals. Chunk
-/// boundaries aren't guaranteed to land on line boundaries, so a `data: `
-/// line split across two chunks is missed — acceptable for a best-effort
-/// telemetry sidecar that isn't the billing source of truth.
-fn accumulate_openai_stream_chunk(text: &str, acc: &mut StreamAccumulator) {
-    for line in text.lines() {
-        let Some(data) = line.strip_prefix("data: ") else { continue };
-        if data.trim() == "[DONE]" {
-            acc.saw_terminal = true;
-            continue;
+    /// Feeds one raw chunk into the accumulator, parsing only the lines it
+    /// completes and carrying the remainder into the next chunk.
+    fn feed_chunk(&mut self, wire: WireApi, text: &str) {
+        self.line_carry.push_str(text);
+        while let Some(newline) = self.line_carry.find('\n') {
+            let rest = self.line_carry.split_off(newline + 1);
+            let line = std::mem::replace(&mut self.line_carry, rest);
+            self.feed_line(wire, line.trim_end_matches(['\r', '\n']));
         }
-        let Ok(json) = serde_json::from_str::<Value>(data) else { continue };
+    }
 
+    /// Flushes whatever was still mid-line when the stream ended, so a
+    /// final event sent without a trailing newline is not lost.
+    fn finish(&mut self, wire: WireApi) {
+        if !self.line_carry.is_empty() {
+            let line = std::mem::take(&mut self.line_carry);
+            self.feed_line(wire, line.trim_end_matches('\r'));
+        }
+    }
+
+    fn feed_line(&mut self, wire: WireApi, line: &str) {
+        let Some(data) = line.strip_prefix("data: ") else { return };
+        if data.trim() == "[DONE]" {
+            self.saw_terminal = true;
+            return;
+        }
+        let Ok(json) = serde_json::from_str::<Value>(data) else { return };
+        match wire {
+            WireApi::OpenAi => self.process_openai_event(&json),
+            WireApi::Anthropic => self.process_anthropic_event(&json),
+            WireApi::Responses => self.process_responses_event(&json),
+        }
+    }
+
+    fn process_openai_event(&mut self, json: &Value) {
         if !json["error"].is_null() {
-            let (error_type, message) = extract_error_details(&json);
-            acc.error_type = error_type;
-            acc.error_message = message;
+            let (error_type, message) = extract_error_details(json);
+            self.error_type = error_type;
+            self.error_message = message;
         }
 
         if let Some(usage_obj) = json.get("usage").filter(|u| !u.is_null()) {
             let total_prompt = usage_obj["prompt_tokens"].as_i64().unwrap_or(0);
             let cache_read = usage_obj["prompt_tokens_details"]["cached_tokens"].as_i64().unwrap_or(0);
-            acc.usage.prompt_tokens = (total_prompt - cache_read).max(0);
-            acc.usage.cache_read_tokens = cache_read;
-            acc.usage.completion_tokens = usage_obj["completion_tokens"].as_i64().unwrap_or(acc.usage.completion_tokens);
+            self.usage.prompt_tokens = (total_prompt - cache_read).max(0);
+            self.usage.cache_read_tokens = cache_read;
+            self.usage.completion_tokens = usage_obj["completion_tokens"].as_i64().unwrap_or(self.usage.completion_tokens);
         }
 
         // Sent once, on the final content chunk of the turn.
         if let Some(reason) = json["choices"][0]["finish_reason"].as_str() {
-            acc.stop_reason = Some(reason.to_string());
+            self.stop_reason = Some(reason.to_string());
         }
 
         if let Some(tool_calls) = json["choices"][0]["delta"]["tool_calls"].as_array() {
@@ -1088,9 +1558,9 @@ fn accumulate_openai_stream_chunk(text: &str, acc: &mut StreamAccumulator) {
                 let key = tc.get("index").map(|v| v.to_string())
                     .or_else(|| tc.get("id").and_then(|v| v.as_str()).map(String::from));
                 if let Some(key) = key {
-                    acc.tool_ids.insert(key.clone());
+                    self.tool_ids.insert(key.clone());
 
-                    let entry = agent_question::tool_call_entry(&mut acc.tool_calls, &key);
+                    let entry = agent_question::tool_call_entry(&mut self.tool_calls, &key);
                     if let Some(name) = tc["function"]["name"].as_str() {
                         entry.name = Some(name.to_string());
                     }
@@ -1101,30 +1571,25 @@ fn accumulate_openai_stream_chunk(text: &str, acc: &mut StreamAccumulator) {
             }
         }
     }
-}
 
-fn accumulate_anthropic_stream_chunk(text: &str, acc: &mut StreamAccumulator) {
-    for line in text.lines() {
-        let Some(data) = line.strip_prefix("data: ") else { continue };
-        let Ok(json) = serde_json::from_str::<Value>(data) else { continue };
-
+    fn process_anthropic_event(&mut self, json: &Value) {
         match json["type"].as_str() {
             Some("message_start") => {
                 let usage_obj = &json["message"]["usage"];
-                acc.usage.prompt_tokens = usage_obj["input_tokens"].as_i64().unwrap_or(0);
-                acc.usage.cache_creation_tokens = usage_obj["cache_creation_input_tokens"].as_i64().unwrap_or(0);
-                acc.usage.cache_read_tokens = usage_obj["cache_read_input_tokens"].as_i64().unwrap_or(0);
+                self.usage.prompt_tokens = usage_obj["input_tokens"].as_i64().unwrap_or(0);
+                self.usage.cache_creation_tokens = usage_obj["cache_creation_input_tokens"].as_i64().unwrap_or(0);
+                self.usage.cache_read_tokens = usage_obj["cache_read_input_tokens"].as_i64().unwrap_or(0);
             }
             Some("content_block_start") => {
                 if json["content_block"]["type"].as_str() == Some("tool_use") {
                     if let Some(id) = json["content_block"]["id"].as_str() {
-                        acc.tool_ids.insert(id.to_string());
+                        self.tool_ids.insert(id.to_string());
                     }
                     // Keyed by the block's stream index (not its id) so it
                     // lines up with content_block_delta below, which only
                     // carries the index, not the id, on each fragment.
                     if let Some(index) = json["index"].as_i64() {
-                        let entry = agent_question::tool_call_entry(&mut acc.tool_calls, &index.to_string());
+                        let entry = agent_question::tool_call_entry(&mut self.tool_calls, &index.to_string());
                         if let Some(name) = json["content_block"]["name"].as_str() {
                             entry.name = Some(name.to_string());
                         }
@@ -1134,25 +1599,69 @@ fn accumulate_anthropic_stream_chunk(text: &str, acc: &mut StreamAccumulator) {
             Some("content_block_delta") => {
                 if json["delta"]["type"].as_str() == Some("input_json_delta") {
                     if let (Some(index), Some(fragment)) = (json["index"].as_i64(), json["delta"]["partial_json"].as_str()) {
-                        agent_question::tool_call_entry(&mut acc.tool_calls, &index.to_string()).arguments.push_str(fragment);
+                        agent_question::tool_call_entry(&mut self.tool_calls, &index.to_string()).arguments.push_str(fragment);
                     }
                 }
             }
             Some("message_delta") => {
                 if let Some(out) = json["usage"]["output_tokens"].as_i64() {
-                    acc.usage.completion_tokens = out;
+                    self.usage.completion_tokens = out;
                 }
                 if let Some(reason) = json["delta"]["stop_reason"].as_str() {
-                    acc.stop_reason = Some(reason.to_string());
+                    self.stop_reason = Some(reason.to_string());
                 }
             }
-            Some("message_stop") => acc.saw_terminal = true,
+            Some("message_stop") => self.saw_terminal = true,
             // Anthropic can fail mid-stream (an overload after the headers
             // already said 200), which is only visible as an error event.
             Some("error") => {
-                let (error_type, message) = extract_error_details(&json);
-                acc.error_type = error_type;
-                acc.error_message = message;
+                let (error_type, message) = extract_error_details(json);
+                self.error_type = error_type;
+                self.error_message = message;
+            }
+            _ => {}
+        }
+    }
+
+    fn process_responses_event(&mut self, json: &Value) {
+        match json["type"].as_str() {
+            // A function call arriving incrementally: the item carries the
+            // tool's name up front, its arguments then stream in as string
+            // fragments — the same shape as Anthropic's content_block_start /
+            // input_json_delta pair, keyed by the output index.
+            Some("response.output_item.added") => {
+                let item = &json["item"];
+                if let (Some(index), Some(name)) = (json["output_index"].as_i64(), responses_tool_name(item)) {
+                    self.tool_ids.insert(index.to_string());
+                    agent_question::tool_call_entry(&mut self.tool_calls, &index.to_string())
+                        .name = Some(name.to_string());
+                }
+            }
+            Some("response.function_call_arguments.delta") => {
+                if let (Some(index), Some(fragment)) = (json["output_index"].as_i64(), json["delta"].as_str()) {
+                    agent_question::tool_call_entry(&mut self.tool_calls, &index.to_string())
+                        .arguments.push_str(fragment);
+                }
+            }
+            // The terminal events of a Responses stream; the final response
+            // object rides along and is where usage lives.
+            Some("response.completed") | Some("response.incomplete") => {
+                self.saw_terminal = true;
+                self.usage = extract_usage(WireApi::Responses, &json["response"]);
+                if json["type"] == "response.incomplete" {
+                    self.stop_reason = extract_stop_reason(WireApi::Responses, &json["response"]);
+                }
+            }
+            Some("response.failed") => {
+                self.saw_terminal = true;
+                let (error_type, message) = extract_error_details(&json["response"]);
+                self.error_type = error_type;
+                self.error_message = message;
+            }
+            Some("error") => {
+                let (error_type, message) = extract_error_details(json);
+                self.error_type = error_type;
+                self.error_message = message;
             }
             _ => {}
         }
@@ -1213,6 +1722,7 @@ fn classify_stream_outcome(
 async fn handle_streaming(
     state: Arc<AppState>,
     upstream: Upstream,
+    wire: WireApi,
     res: reqwest::Response,
     task_id: i64,
     model_name: Option<String>,
@@ -1249,11 +1759,9 @@ async fn handle_streaming(
 
         while let Some(chunk_text) = rx.recv().await {
             raw_text.push_str(&chunk_text);
-            match upstream.style {
-                ApiStyle::OpenAI => accumulate_openai_stream_chunk(&chunk_text, &mut acc),
-                ApiStyle::Anthropic => accumulate_anthropic_stream_chunk(&chunk_text, &mut acc),
-            }
+            acc.feed_chunk(wire, &chunk_text);
         }
+        acc.finish(wire);
         // The loop above ends when the last chunk has been forwarded, which
         // is the only moment the true wall-clock cost of a streamed call is
         // known — `latency` was measured back when the headers arrived.
@@ -1355,39 +1863,36 @@ mod tests {
 
     #[test]
     fn an_unnamed_call_goes_to_the_style_default() {
-        let upstream = resolve_upstream(&provider_table(), ApiStyle::OpenAI, None, &HeaderMap::new()).unwrap();
+        let upstream = resolve_upstream(&provider_table(), Endpoint::ChatCompletions, None, &HeaderMap::new()).unwrap();
         assert_eq!(upstream.name, "openai");
         assert_eq!(upstream.url, "https://api.openai.com/v1/chat/completions");
     }
 
     #[test]
     fn a_named_provider_is_forwarded_to_its_own_base_url() {
-        let upstream = resolve_upstream(&provider_table(), ApiStyle::OpenAI, Some("ollama"), &HeaderMap::new()).unwrap();
+        let upstream = resolve_upstream(&provider_table(), Endpoint::ChatCompletions, Some("ollama"), &HeaderMap::new()).unwrap();
         assert_eq!(upstream.name, "ollama");
         assert_eq!(upstream.url, "http://localhost:11434/v1/chat/completions");
-        // The name, not the wire format, is what the call is recorded under,
-        // so a local run doesn't show up in the dashboard as "openai".
-        assert_eq!(upstream.style, ApiStyle::OpenAI);
     }
 
     #[test]
     fn the_x_provider_header_selects_an_upstream_too() {
         let headers = header_map(&[("x-provider", "ollama")]);
-        let upstream = resolve_upstream(&provider_table(), ApiStyle::OpenAI, None, &headers).unwrap();
+        let upstream = resolve_upstream(&provider_table(), Endpoint::ChatCompletions, None, &headers).unwrap();
         assert_eq!(upstream.name, "ollama");
     }
 
     #[test]
     fn the_path_wins_over_the_header() {
         let headers = header_map(&[("x-provider", "ollama")]);
-        let upstream = resolve_upstream(&provider_table(), ApiStyle::OpenAI, Some("openai"), &headers).unwrap();
+        let upstream = resolve_upstream(&provider_table(), Endpoint::ChatCompletions, Some("openai"), &headers).unwrap();
         assert_eq!(upstream.name, "openai");
     }
 
     #[test]
     fn an_unknown_provider_is_refused_rather_than_sent_to_the_hosted_api() {
         let (status, message) = resolve_upstream(
-            &provider_table(), ApiStyle::OpenAI, Some("typo"), &HeaderMap::new(),
+            &provider_table(), Endpoint::ChatCompletions, Some("typo"), &HeaderMap::new(),
         ).unwrap_err();
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(message.contains("ollama"), "the error should list what is configured: {message}");
@@ -1396,7 +1901,7 @@ mod tests {
     #[test]
     fn a_provider_reached_on_the_wrong_style_endpoint_is_refused() {
         let (status, message) = resolve_upstream(
-            &provider_table(), ApiStyle::Anthropic, Some("ollama"), &HeaderMap::new(),
+            &provider_table(), Endpoint::Messages, Some("ollama"), &HeaderMap::new(),
         ).unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(message.contains("chat/completions"), "the error should name the right route: {message}");
@@ -1405,8 +1910,43 @@ mod tests {
     #[test]
     fn an_empty_provider_header_falls_back_to_the_default() {
         let headers = header_map(&[("x-provider", "   ")]);
-        let upstream = resolve_upstream(&provider_table(), ApiStyle::OpenAI, None, &headers).unwrap();
+        let upstream = resolve_upstream(&provider_table(), Endpoint::ChatCompletions, None, &headers).unwrap();
         assert_eq!(upstream.name, "openai");
+    }
+
+    #[test]
+    fn aux_endpoints_forward_to_their_own_upstream_paths() {
+        let models = resolve_upstream(&provider_table(), Endpoint::Models, None, &HeaderMap::new()).unwrap();
+        assert_eq!(models.url, "https://api.openai.com/v1/models");
+
+        let count = resolve_upstream(&provider_table(), Endpoint::CountTokens, None, &HeaderMap::new()).unwrap();
+        assert_eq!(count.url, "https://api.anthropic.com/v1/messages/count_tokens");
+
+        let responses = resolve_upstream(&provider_table(), Endpoint::Responses, Some("openai"), &HeaderMap::new()).unwrap();
+        assert_eq!(responses.url, "https://api.openai.com/v1/responses");
+    }
+
+    #[test]
+    fn a_bare_models_call_follows_the_callers_own_auth_style() {
+        // An Anthropic client authenticates with x-api-key and should reach
+        // the Anthropic default, not have its key forwarded to OpenAI.
+        let anthropic = header_map(&[("x-api-key", "sk-ant")]);
+        let upstream = resolve_upstream(&provider_table(), Endpoint::Models, None, &anthropic).unwrap();
+        assert_eq!(upstream.name, "anthropic");
+
+        // A bearer token (or no auth at all, e.g. a local server) reads as
+        // OpenAI-style, the more common shape of the two.
+        let openai = header_map(&[("authorization", "Bearer sk-xyz")]);
+        let upstream = resolve_upstream(&provider_table(), Endpoint::Models, None, &openai).unwrap();
+        assert_eq!(upstream.name, "openai");
+    }
+
+    #[test]
+    fn a_named_models_provider_is_served_regardless_of_style() {
+        // Both APIs serve /v1/models, so an anthropic provider is reachable
+        // on it without a style complaint.
+        let upstream = resolve_upstream(&provider_table(), Endpoint::Models, Some("anthropic"), &HeaderMap::new()).unwrap();
+        assert_eq!(upstream.url, "https://api.anthropic.com/v1/models");
     }
 
     #[test]
@@ -1416,6 +1956,174 @@ mod tests {
         let table = ProviderTable::parse(DEFAULT_PROVIDERS_YAML).expect("bundled providers.yaml parses");
         assert_eq!(table.default_for(ApiStyle::OpenAI).name, "openai");
         assert_eq!(table.default_for(ApiStyle::Anthropic).name, "anthropic");
+    }
+
+    #[test]
+    fn the_bundled_default_fingerprints_yaml_parses() {
+        // Same first-run argument as the providers file.
+        let table = fingerprints::FingerprintTable::parse(DEFAULT_FINGERPRINTS_YAML)
+            .expect("bundled fingerprints.yaml parses");
+        assert_eq!(table.match_user_agent("claude-cli/1.0.55"), Some("claude-code"));
+    }
+
+    #[test]
+    fn proxy_paths_parse_into_endpoint_provider_and_run() {
+        let bare = parse_proxy_path("/v1/chat/completions").unwrap();
+        assert_eq!(bare.endpoint, Endpoint::ChatCompletions);
+        assert!(bare.provider.is_none() && bare.run.is_none());
+
+        let named = parse_proxy_path("/p/ollama/v1/messages").unwrap();
+        assert_eq!(named.endpoint, Endpoint::Messages);
+        assert_eq!(named.provider.as_deref(), Some("ollama"));
+
+        let run = parse_proxy_path("/r/kilo/issue-1284/issue-1284-kilo/v1/messages").unwrap();
+        assert_eq!(run.endpoint, Endpoint::Messages);
+        let run = run.run.expect("run attribution present");
+        assert_eq!(run.agent, "kilo");
+        assert_eq!(run.experiment.as_deref(), Some("issue-1284"));
+        assert_eq!(run.session, "issue-1284-kilo");
+
+        let run_no_experiment = parse_proxy_path("/r/kilo/kilo-1/v1/chat/completions").unwrap();
+        let run = run_no_experiment.run.expect("run attribution present");
+        assert_eq!(run.agent, "kilo");
+        assert_eq!(run.experiment, None);
+        assert_eq!(run.session, "kilo-1");
+    }
+
+    #[test]
+    fn run_and_provider_prefixes_combine() {
+        let path = parse_proxy_path("/r/kilo/issue-1284/s-1/p/ollama/v1/chat/completions").unwrap();
+        assert_eq!(path.endpoint, Endpoint::ChatCompletions);
+        assert_eq!(path.provider.as_deref(), Some("ollama"));
+        let run = path.run.expect("run attribution present");
+        assert_eq!(run.experiment.as_deref(), Some("issue-1284"));
+    }
+
+    #[test]
+    fn count_tokens_is_not_swallowed_by_the_messages_tail() {
+        let path = parse_proxy_path("/v1/messages/count_tokens").unwrap();
+        assert_eq!(path.endpoint, Endpoint::CountTokens);
+
+        let nested = parse_proxy_path("/r/claude-code/e-1/s-1/v1/messages/count_tokens").unwrap();
+        assert_eq!(nested.endpoint, Endpoint::CountTokens);
+    }
+
+    #[test]
+    fn unknown_routes_and_prefixes_are_refused() {
+        assert!(parse_proxy_path("/v1/embeddings").is_err());
+        assert!(parse_proxy_path("/v1/messages/subscribe").is_err());
+        assert!(parse_proxy_path("/p/ollama/whatever/v1/messages").is_err());
+        // A run prefix needs two or three labelled segments, not one.
+        assert!(parse_proxy_path("/r/kilo/v1/messages").is_err());
+        assert!(parse_proxy_path("/favicon.ico").is_err());
+    }
+
+    #[test]
+    fn run_prefixes_round_trip_from_the_builder_the_wrapper_uses() {
+        let prefix = build_run_prefix("kilo", Some("issue-1284"), "issue-1284-kilo", None).unwrap();
+        assert_eq!(prefix, "/r/kilo/issue-1284/issue-1284-kilo");
+
+        let path = parse_proxy_path(&format!("{prefix}/v1/messages")).unwrap();
+        let run = path.run.expect("run attribution present");
+        assert_eq!((run.agent.as_str(), run.experiment.as_deref(), run.session.as_str()), ("kilo", Some("issue-1284"), "issue-1284-kilo"));
+
+        let with_provider = build_run_prefix("kilo", None, "s-1", Some("ollama")).unwrap();
+        let path = parse_proxy_path(&format!("{with_provider}/v1/chat/completions")).unwrap();
+        assert_eq!(path.provider.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn run_prefixes_reject_segments_that_cannot_travel_in_a_url() {
+        assert!(build_run_prefix("my agent", None, "s", None).is_err());
+        assert!(build_run_prefix("a/b", None, "s", None).is_err());
+        assert!(build_run_prefix("", None, "s", None).is_err());
+        assert!(build_run_prefix("a", None, "s p a c e", None).is_err());
+    }
+
+    fn fingerprints_table() -> fingerprints::FingerprintTable {
+        fingerprints::FingerprintTable::parse(
+            "fingerprints:\n  - agent: claude-code\n    user_agents: [\"claude-cli\"]\n    system_prompts: [\"You are Claude Code\"]\n",
+        )
+        .expect("test fingerprints parse")
+    }
+
+    #[test]
+    fn attribution_prefers_the_run_prefix_over_everything() {
+        let run = RunAttribution {
+            agent: "kilo".to_string(),
+            experiment: Some("e-1".to_string()),
+            session: "s-1".to_string(),
+        };
+        let headers = header_map(&[
+            ("X-Agent-ID", "header-agent"),
+            ("X-Session-ID", "header-session"),
+            ("X-Experiment-ID", "header-experiment"),
+            ("user-agent", "claude-cli/1.0"),
+        ]);
+        let attribution = resolve_attribution(Some(&run), &headers, None, None, &fingerprints_table());
+        assert_eq!((attribution.agent.as_str(), attribution.session.as_str()), ("kilo", "s-1"));
+        assert_eq!(attribution.experiment.as_deref(), Some("e-1"));
+    }
+
+    #[test]
+    fn attribution_headers_beat_fingerprints() {
+        let headers = header_map(&[
+            ("X-Agent-ID", "explicit"),
+            ("X-Session-ID", "explicit-session"),
+            ("user-agent", "claude-cli/1.0"),
+        ]);
+        let attribution = resolve_attribution(None, &headers, None, None, &fingerprints_table());
+        assert_eq!((attribution.agent.as_str(), attribution.session.as_str()), ("explicit", "explicit-session"));
+    }
+
+    #[test]
+    fn attribution_fingerprints_an_unlabelled_agent_from_what_it_sends() {
+        // A Claude Code request: no attribution headers, but a signature
+        // User-Agent and a signature system prompt.
+        let headers = header_map(&[("user-agent", "claude-cli/1.0.55 (external, cli)")]);
+        let body: Value = serde_json::from_str(
+            r#"{"system": "You are Claude Code, Anthropic's official CLI for Claude.",
+                "messages": [{"role": "user", "content": "fix the login bug"}]}"#,
+        )
+        .unwrap();
+
+        let by_user_agent = resolve_attribution(None, &headers, Some(&body), Some(WireApi::Anthropic), &fingerprints_table());
+        assert_eq!(by_user_agent.agent, "claude-code");
+
+        // SDK User-Agent that names no agent: the system prompt still
+        // identifies it.
+        let generic_headers = header_map(&[("user-agent", "python-requests/2.31")]);
+        let by_prompt = resolve_attribution(None, &generic_headers, Some(&body), Some(WireApi::Anthropic), &fingerprints_table());
+        assert_eq!(by_prompt.agent, "claude-code");
+    }
+
+    #[test]
+    fn attribution_without_any_signal_falls_back_to_an_auto_session() {
+        let headers = HeaderMap::new();
+        let body: Value = serde_json::from_str(
+            r#"{"messages": [{"role": "user", "content": "fix the login bug"}]}"#,
+        )
+        .unwrap();
+
+        let attribution = resolve_attribution(None, &headers, Some(&body), Some(WireApi::OpenAi), &fingerprints_table());
+        assert_eq!(attribution.agent, "unknown_agent");
+        assert!(attribution.session.starts_with("auto-"), "session {}", attribution.session);
+        assert_eq!(attribution.experiment, None);
+    }
+
+    #[test]
+    fn attribution_with_no_signals_at_all_uses_the_legacy_buckets() {
+        let attribution = resolve_attribution(None, &HeaderMap::new(), None, None, &fingerprints_table());
+        assert_eq!((attribution.agent.as_str(), attribution.session.as_str()), ("unknown_agent", "default_session"));
+    }
+
+    #[test]
+    fn retention_days_parse_leniently() {
+        assert_eq!(parse_retention_days(None), 30);
+        assert_eq!(parse_retention_days(Some("7")), 7);
+        assert_eq!(parse_retention_days(Some(" 0 ")), 0);
+        assert_eq!(parse_retention_days(Some("forever")), 30);
+        assert_eq!(parse_retention_days(Some("-1")), 30);
     }
 
     #[test]
@@ -1461,7 +2169,7 @@ mod tests {
             "usage": {"prompt_tokens": 100, "completion_tokens": 20, "prompt_tokens_details": {"cached_tokens": 30}}
         }"#).unwrap();
 
-        let usage = extract_usage(ApiStyle::OpenAI, &json);
+        let usage = extract_usage(WireApi::OpenAi, &json);
         assert_eq!(usage.prompt_tokens, 70);
         assert_eq!(usage.cache_read_tokens, 30);
         assert_eq!(usage.cache_creation_tokens, 0);
@@ -1479,7 +2187,7 @@ mod tests {
             ]}}]
         }"#).unwrap();
         assert_eq!(
-            extract_tool_names(ApiStyle::OpenAI, &openai),
+            extract_tool_names(WireApi::OpenAi, &openai),
             vec!["read_file", "read_file", "bash"],
         );
 
@@ -1491,7 +2199,7 @@ mod tests {
             ]
         }"#).unwrap();
         assert_eq!(
-            extract_tool_names(ApiStyle::Anthropic, &anthropic),
+            extract_tool_names(WireApi::Anthropic, &anthropic),
             vec!["read_file", "read_file"],
         );
     }
@@ -1504,14 +2212,14 @@ mod tests {
                 {"function": {"name": "bash"}}
             ]}}]
         }"#).unwrap();
-        assert_eq!(extract_tool_names(ApiStyle::OpenAI, &json), vec!["bash"]);
+        assert_eq!(extract_tool_names(WireApi::OpenAi, &json), vec!["bash"]);
     }
 
     #[test]
     fn a_response_with_no_tools_names_none() {
         let json: Value = serde_json::from_str(r#"{"choices": [{"message": {"content": "done"}}]}"#).unwrap();
-        assert!(extract_tool_names(ApiStyle::OpenAI, &json).is_empty());
-        assert!(extract_tool_names(ApiStyle::Anthropic, &json).is_empty());
+        assert!(extract_tool_names(WireApi::OpenAi, &json).is_empty());
+        assert!(extract_tool_names(WireApi::Anthropic, &json).is_empty());
     }
 
     #[test]
@@ -1521,7 +2229,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\"}}]}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"c2\",\"function\":{\"name\":\"bash\"}}]}}]}\n\n",
         ] {
-            accumulate_openai_stream_chunk(chunk, &mut acc);
+            acc.feed_chunk(WireApi::OpenAi, chunk);
         }
 
         assert_eq!(acc.tool_names(), vec!["read_file", "bash"]);
@@ -1537,7 +2245,7 @@ mod tests {
             "usage": {"input_tokens": 50, "output_tokens": 15, "cache_creation_input_tokens": 200, "cache_read_input_tokens": 400}
         }"#).unwrap();
 
-        let usage = extract_usage(ApiStyle::Anthropic, &json);
+        let usage = extract_usage(WireApi::Anthropic, &json);
         assert_eq!(usage.prompt_tokens, 50);
         assert_eq!(usage.cache_creation_tokens, 200);
         assert_eq!(usage.cache_read_tokens, 400);
@@ -1551,22 +2259,10 @@ mod tests {
 
         // First fragment carries `id`; the continuation fragment for the
         // same call only carries `index` — both must resolve to one call.
-        accumulate_openai_stream_chunk(
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"foo\"}}]}}]}\n\n",
-            &mut acc,
-        );
-        accumulate_openai_stream_chunk(
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n",
-            &mut acc,
-        );
-        accumulate_openai_stream_chunk(
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"function\":{\"name\":\"bar\"}}]}}]}\n\n",
-            &mut acc,
-        );
-        accumulate_openai_stream_chunk(
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":25,\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n\ndata: [DONE]\n\n",
-            &mut acc,
-        );
+        acc.feed_chunk(WireApi::OpenAi, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"foo\"}}]}}]}\n\n");
+        acc.feed_chunk(WireApi::OpenAi, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n");
+        acc.feed_chunk(WireApi::OpenAi, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"function\":{\"name\":\"bar\"}}]}}]}\n\n");
+        acc.feed_chunk(WireApi::OpenAi, "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":25,\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n\ndata: [DONE]\n\n");
 
         assert_eq!(acc.tool_ids.len(), 2);
         assert_eq!(acc.usage.prompt_tokens, 80);
@@ -1578,18 +2274,9 @@ mod tests {
     fn anthropic_stream_accumulates_across_events() {
         let mut acc = StreamAccumulator::default();
 
-        accumulate_anthropic_stream_chunk(
-            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":50,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":5}}}\n\n",
-            &mut acc,
-        );
-        accumulate_anthropic_stream_chunk(
-            "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\"}}\n\n",
-            &mut acc,
-        );
-        accumulate_anthropic_stream_chunk(
-            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n",
-            &mut acc,
-        );
+        acc.feed_chunk(WireApi::Anthropic, "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":50,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":5}}}\n\n");
+        acc.feed_chunk(WireApi::Anthropic, "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\"}}\n\n");
+        acc.feed_chunk(WireApi::Anthropic, "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n");
 
         assert_eq!(acc.usage.prompt_tokens, 50);
         assert_eq!(acc.usage.cache_creation_tokens, 10);
@@ -1607,7 +2294,7 @@ mod tests {
             ]}}]
         }"#).unwrap();
 
-        let result = extract_agent_question(ApiStyle::OpenAI, &json);
+        let result = extract_agent_question(WireApi::OpenAi, &json);
         assert_eq!(result, Some(("ask_followup_question".to_string(), "Which file?".to_string())));
     }
 
@@ -1619,7 +2306,7 @@ mod tests {
             ]}}]
         }"#).unwrap();
 
-        assert_eq!(extract_agent_question(ApiStyle::OpenAI, &json), None);
+        assert_eq!(extract_agent_question(WireApi::OpenAi, &json), None);
     }
 
     #[test]
@@ -1633,7 +2320,7 @@ mod tests {
             ]
         }"#).unwrap();
 
-        let result = extract_agent_question(ApiStyle::Anthropic, &json);
+        let result = extract_agent_question(WireApi::Anthropic, &json);
         assert_eq!(result, Some(("AskUserQuestion".to_string(), "Use TypeScript?".to_string())));
     }
 
@@ -1660,7 +2347,7 @@ mod tests {
 
         for chunk in &chunks {
             let line = format!("data: {}\n\n", chunk);
-            accumulate_openai_stream_chunk(&line, &mut acc);
+            acc.feed_chunk(WireApi::OpenAi, &line);
         }
 
         assert_eq!(acc.tool_calls.len(), 1);
@@ -1674,18 +2361,9 @@ mod tests {
     fn anthropic_stream_reconstructs_fragmented_question_input() {
         let mut acc = StreamAccumulator::default();
 
-        accumulate_anthropic_stream_chunk(
-            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"ask_followup_question\"}}\n\n",
-            &mut acc,
-        );
-        accumulate_anthropic_stream_chunk(
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"question\\\": \\\"Use \"}}\n\n",
-            &mut acc,
-        );
-        accumulate_anthropic_stream_chunk(
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"TypeScript?\\\"}\"}}\n\n",
-            &mut acc,
-        );
+        acc.feed_chunk(WireApi::Anthropic, "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"ask_followup_question\"}}\n\n");
+        acc.feed_chunk(WireApi::Anthropic, "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"question\\\": \\\"Use \"}}\n\n");
+        acc.feed_chunk(WireApi::Anthropic, "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"TypeScript?\\\"}\"}}\n\n");
 
         assert_eq!(acc.tool_calls.len(), 1);
         let (_, entry) = &acc.tool_calls[0];
@@ -1738,19 +2416,16 @@ mod tests {
     #[test]
     fn stop_reason_is_read_from_each_providers_field() {
         let openai: Value = serde_json::from_str(r#"{"choices":[{"finish_reason":"tool_calls"}]}"#).unwrap();
-        assert_eq!(extract_stop_reason(ApiStyle::OpenAI, &openai).as_deref(), Some("tool_calls"));
+        assert_eq!(extract_stop_reason(WireApi::OpenAi, &openai).as_deref(), Some("tool_calls"));
 
         let anthropic: Value = serde_json::from_str(r#"{"stop_reason":"end_turn"}"#).unwrap();
-        assert_eq!(extract_stop_reason(ApiStyle::Anthropic, &anthropic).as_deref(), Some("end_turn"));
+        assert_eq!(extract_stop_reason(WireApi::Anthropic, &anthropic).as_deref(), Some("end_turn"));
     }
 
     #[test]
     fn openai_stream_records_the_finish_reason() {
         let mut acc = StreamAccumulator::default();
-        accumulate_openai_stream_chunk(
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
-            &mut acc,
-        );
+        acc.feed_chunk(WireApi::OpenAi, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
 
         assert_eq!(acc.stop_reason.as_deref(), Some("stop"));
         assert!(acc.saw_terminal);
@@ -1759,24 +2434,18 @@ mod tests {
     #[test]
     fn anthropic_stream_records_stop_reason_and_terminal_event() {
         let mut acc = StreamAccumulator::default();
-        accumulate_anthropic_stream_chunk(
-            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}\n\n",
-            &mut acc,
-        );
+        acc.feed_chunk(WireApi::Anthropic, "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}\n\n");
         assert_eq!(acc.stop_reason.as_deref(), Some("tool_use"));
         assert!(!acc.saw_terminal, "the stream has not ended yet");
 
-        accumulate_anthropic_stream_chunk("data: {\"type\":\"message_stop\"}\n\n", &mut acc);
+        acc.feed_chunk(WireApi::Anthropic, "data: {\"type\":\"message_stop\"}\n\n");
         assert!(acc.saw_terminal);
     }
 
     #[test]
     fn an_error_event_mid_stream_is_captured_despite_a_200() {
         let mut acc = StreamAccumulator::default();
-        accumulate_anthropic_stream_chunk(
-            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
-            &mut acc,
-        );
+        acc.feed_chunk(WireApi::Anthropic, "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n");
 
         let outcome = classify_stream_outcome(&acc, "", StatusCode::OK, false, 10, 20);
         assert_eq!(outcome.status, session_state::STATUS_OVERLOADED);
@@ -1787,10 +2456,7 @@ mod tests {
     #[test]
     fn a_stream_that_stops_without_its_terminal_marker_is_interrupted() {
         let mut acc = StreamAccumulator::default();
-        accumulate_anthropic_stream_chunk(
-            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
-            &mut acc,
-        );
+        acc.feed_chunk(WireApi::Anthropic, "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n");
 
         let outcome = classify_stream_outcome(&acc, "", StatusCode::OK, false, 10, 900);
         assert_eq!(outcome.status, session_state::STATUS_INTERRUPTED);
@@ -1800,10 +2466,7 @@ mod tests {
     #[test]
     fn a_completed_stream_that_ended_its_turn_is_waiting_on_the_human() {
         let mut acc = StreamAccumulator::default();
-        accumulate_anthropic_stream_chunk(
-            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
-            &mut acc,
-        );
+        acc.feed_chunk(WireApi::Anthropic, "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n");
 
         let outcome = classify_stream_outcome(&acc, "", StatusCode::OK, false, 10, 20);
         assert_eq!(outcome.status, session_state::STATUS_OK);
@@ -1823,6 +2486,275 @@ mod tests {
         assert_eq!(outcome.error_type.as_deref(), Some("rate_limit_error"));
         assert_eq!(outcome.http_status, Some(429));
         assert!(!outcome.awaiting_input);
+    }
+
+    /// The bug this catches: a `data:` line split across two TCP chunks used
+    /// to be missed entirely — the first half parsed as nothing, the second
+    /// as garbage — so token counts and stop reasons silently came out as 0.
+    #[test]
+    fn a_data_line_split_across_chunks_is_still_parsed() {
+        let mut acc = StreamAccumulator::default();
+        let event = r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":20}}}"#;
+        let (first, second) = event.split_at(event.len() / 2);
+
+        acc.feed_chunk(WireApi::OpenAi, first);
+        assert!(acc.usage.prompt_tokens == 0, "nothing is parsed from a partial line");
+        acc.feed_chunk(WireApi::OpenAi, second);
+        acc.feed_chunk(WireApi::OpenAi, "\n\ndata: [DONE]\n\n");
+
+        assert_eq!(acc.usage.prompt_tokens, 80);
+        assert_eq!(acc.usage.cache_read_tokens, 20);
+        assert_eq!(acc.usage.completion_tokens, 7);
+        assert_eq!(acc.stop_reason.as_deref(), Some("stop"));
+        assert!(acc.saw_terminal);
+    }
+
+    #[test]
+    fn an_anthropic_line_split_across_chunks_is_still_parsed() {
+        let mut acc = StreamAccumulator::default();
+        let event = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":42}}}"#;
+        let (first, second) = event.split_at(event.len() / 2);
+
+        acc.feed_chunk(WireApi::Anthropic, first);
+        acc.feed_chunk(WireApi::Anthropic, second);
+        acc.feed_chunk(WireApi::Anthropic, "\n\n");
+
+        assert_eq!(acc.usage.prompt_tokens, 42);
+    }
+
+    #[test]
+    fn a_final_event_without_a_trailing_newline_is_not_lost() {
+        let mut acc = StreamAccumulator::default();
+        acc.feed_chunk(WireApi::Anthropic, "data: {\"type\":\"message_stop\"}");
+        acc.finish(WireApi::Anthropic);
+        assert!(acc.saw_terminal);
+    }
+
+    #[test]
+    fn responses_stream_usage_arrives_on_the_terminal_event() {
+        let mut acc = StreamAccumulator::default();
+        acc.feed_chunk(
+            WireApi::Responses,
+            "event: response.completed\n",
+        );
+        acc.feed_chunk(
+            WireApi::Responses,
+            &format!(
+                "data: {}\n\n",
+                json!({
+                    "type": "response.completed",
+                    "response": {"status": "completed", "usage": {
+                        "input_tokens": 210, "output_tokens": 33,
+                        "input_tokens_details": {"cached_tokens": 60}
+                    }}
+                })
+            ),
+        );
+
+        assert!(acc.saw_terminal);
+        assert_eq!(acc.usage.prompt_tokens, 150);
+        assert_eq!(acc.usage.cache_read_tokens, 60);
+        assert_eq!(acc.usage.completion_tokens, 33);
+
+        // A stream that never reached its terminal event is interrupted,
+        // same rule as the other two formats.
+        let cut = StreamAccumulator::default();
+        let outcome = classify_stream_outcome(&cut, "", StatusCode::OK, false, 10, 500);
+        assert_eq!(outcome.status, session_state::STATUS_INTERRUPTED);
+    }
+
+    #[test]
+    fn responses_stream_failure_is_classified_from_its_event() {
+        let mut acc = StreamAccumulator::default();
+        acc.feed_chunk(
+            WireApi::Responses,
+            &format!(
+                "data: {}\n\n",
+                json!({
+                    "type": "response.failed",
+                    "response": {"error": {"type": "invalid_api_key", "message": "bad key"}}
+                })
+            ),
+        );
+
+        assert!(acc.saw_terminal);
+        let outcome = classify_stream_outcome(&acc, "", StatusCode::OK, false, 10, 20);
+        assert_eq!(outcome.status, session_state::STATUS_ERROR);
+        assert_eq!(outcome.error_type.as_deref(), Some("invalid_api_key"));
+    }
+
+    #[test]
+    fn responses_unary_usage_splits_out_cached_tokens() {
+        let json: Value = serde_json::from_str(
+            r#"{"status": "completed", "usage": {
+                "input_tokens": 300, "output_tokens": 12,
+                "input_tokens_details": {"cached_tokens": 250}
+            }}"#,
+        )
+        .unwrap();
+
+        let usage = extract_usage(WireApi::Responses, &json);
+        assert_eq!(usage.prompt_tokens, 50);
+        assert_eq!(usage.cache_read_tokens, 250);
+        assert_eq!(usage.completion_tokens, 12);
+    }
+
+    #[test]
+    fn responses_unary_names_function_and_builtin_tool_calls() {
+        let json: Value = serde_json::from_str(r#"{
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "summary": []},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "looking"}]},
+                {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{\"cmd\":\"ls\"}"},
+                {"type": "web_search_call", "id": "ws1", "status": "completed"},
+                {"type": "function_call", "call_id": "c2", "name": "shell", "arguments": "{}"},
+                {"type": "function_call", "call_id": "c3", "arguments": "{}"}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }"#).unwrap();
+
+        // Same shell twice is two calls; a function_call without a name is
+        // skipped rather than becoming a phantom tool; the built-in search
+        // is named by its type.
+        assert_eq!(
+            extract_tool_names(WireApi::Responses, &json),
+            vec!["shell", "web_search_call", "shell"],
+        );
+        let usage = extract_usage(WireApi::Responses, &json);
+        assert_eq!(usage.tool_calls_count, 3);
+    }
+
+    #[test]
+    fn responses_unary_question_from_a_function_call() {
+        let json: Value = serde_json::from_str(r#"{
+            "status": "completed",
+            "output": [
+                {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+                {"type": "function_call", "call_id": "c2", "name": "AskUserQuestion",
+                 "arguments": "{\"questions\":[{\"question\":\"Use TypeScript?\"}]}"}
+            ]
+        }"#).unwrap();
+
+        let result = extract_agent_question(WireApi::Responses, &json);
+        assert_eq!(result, Some(("AskUserQuestion".to_string(), "Use TypeScript?".to_string())));
+    }
+
+    #[test]
+    fn responses_incomplete_maps_max_output_tokens_onto_the_shared_vocabulary() {
+        let truncated: Value = serde_json::from_str(
+            r#"{"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_stop_reason(WireApi::Responses, &truncated).as_deref(), Some("max_tokens"));
+
+        let other: Value = serde_json::from_str(
+            r#"{"status": "incomplete", "incomplete_details": {"reason": "content_filter"}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_stop_reason(WireApi::Responses, &other).as_deref(), Some("incomplete"));
+
+        let done: Value = serde_json::from_str(r#"{"status": "completed"}"#).unwrap();
+        assert_eq!(extract_stop_reason(WireApi::Responses, &done), None);
+    }
+
+    #[test]
+    fn responses_stream_accumulates_function_calls_from_item_events() {
+        let mut acc = StreamAccumulator::default();
+
+        // The name rides on the item event; the arguments arrive as fragments.
+        acc.feed_chunk(
+            WireApi::Responses,
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"name\":\"AskUserQuestion\",\"arguments\":\"\"}}\n\n",
+        );
+        acc.feed_chunk(
+            WireApi::Responses,
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"question\\\": \\\"Add \"}\n\n",
+        );
+        acc.feed_chunk(
+            WireApi::Responses,
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"tests?\\\"}\"}\n\n",
+        );
+        // A second, non-question function call; and message/reasoning items
+        // that must not count as tools.
+        acc.feed_chunk(
+            WireApi::Responses,
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\"fc_2\",\"name\":\"shell\"}}\n\n",
+        );
+        acc.feed_chunk(
+            WireApi::Responses,
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":3,\"item\":{\"type\":\"message\",\"role\":\"assistant\"}}\n\n",
+        );
+        acc.feed_chunk(
+            WireApi::Responses,
+            &format!(
+                "data: {}\n\n",
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "status": "completed",
+                        "output": [
+                            {"type": "function_call", "call_id": "c1", "name": "AskUserQuestion",
+                             "arguments": "{\"question\": \"Add tests?\"}"},
+                            {"type": "function_call", "call_id": "c2", "name": "shell", "arguments": "{}"}
+                        ],
+                        "usage": {"input_tokens": 40, "output_tokens": 9}
+                    }
+                })
+            ),
+        );
+
+        assert!(acc.saw_terminal);
+        assert_eq!(acc.tool_names(), vec!["AskUserQuestion", "shell"]);
+        assert_eq!(acc.usage.tool_calls_count, 2);
+        assert_eq!(acc.usage.prompt_tokens, 40);
+
+        // The turn asked the human a question via fragmented arguments.
+        assert_eq!(
+            acc.agent_question(),
+            Some(("AskUserQuestion".to_string(), "Add tests?".to_string()))
+        );
+        let outcome = classify_stream_outcome(&acc, "", StatusCode::OK, true, 10, 20);
+        assert!(outcome.awaiting_input);
+    }
+
+    #[test]
+    fn responses_stream_incomplete_maps_onto_max_tokens() {
+        let mut acc = StreamAccumulator::default();
+        acc.feed_chunk(
+            WireApi::Responses,
+            &format!(
+                "data: {}\n\n",
+                json!({
+                    "type": "response.incomplete",
+                    "response": {
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_output_tokens"},
+                        "usage": {"input_tokens": 30, "output_tokens": 100}
+                    }
+                })
+            ),
+        );
+
+        assert!(acc.saw_terminal);
+        let outcome = classify_stream_outcome(&acc, "", StatusCode::OK, false, 10, 20);
+        assert_eq!(outcome.status, session_state::STATUS_OK);
+        assert_eq!(outcome.stop_reason.as_deref(), Some("max_tokens"));
+    }
+
+    #[test]
+    fn task_preview_reads_the_responses_input_field() {
+        let array: Value = serde_json::from_str(
+            r#"{"input": [
+                {"role": "user", "content": "fix the login bug"},
+                {"role": "assistant", "content": "done"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_task_preview(&array).as_deref(), Some("fix the login bug"));
+
+        let string: Value = serde_json::from_str(r#"{"input": "write the README"}"#).unwrap();
+        assert_eq!(extract_task_preview(&string).as_deref(), Some("write the README"));
     }
 
     #[test]

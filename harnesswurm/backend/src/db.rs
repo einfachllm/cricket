@@ -309,6 +309,26 @@ impl Database {
         Ok(result.rows_affected())
     }
 
+    /// Clears the captured request/response bodies of calls older than
+    /// `days`. The task rows, metrics and verdicts stay — they are small,
+    /// and they are the history; only the bulky, privacy-heavy bodies age
+    /// out. Returns how many traffic rows were touched, worth logging so a
+    /// silent misconfiguration (an absurd retention) shows up in the counts.
+    pub async fn prune_traffic_bodies(&self, days: i64) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE traffic SET request_body = NULL, response_body = NULL
+             WHERE (request_body IS NOT NULL OR response_body IS NOT NULL)
+               AND task_id IN (
+                   SELECT id FROM tasks WHERE timestamp <= datetime('now', ?)
+               )",
+        )
+        .bind(format!("-{days} days"))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
     async fn add_column_if_missing(pool: &SqlitePool, table: &str, column: &str, ddl_type: &str) -> Result<()> {
         let existing: Vec<String> = sqlx::query(&format!("PRAGMA table_info({table})"))
             .fetch_all(pool)
@@ -1343,6 +1363,47 @@ mod tests {
         let traffic = db.get_task_traffic(task_id).await?.expect("traffic row should exist");
         assert_eq!(traffic["request_body"], "{\"model\":\"gpt-4o\"}");
         assert_eq!(traffic["response_body"], "{\"id\":\"resp_1\"}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prune_clears_bodies_of_old_calls_and_keeps_everything_recent() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let agent_id = db.get_or_create_agent("test_agent").await?;
+
+        let old_task = db.create_task(agent_id, None, None, None, None, None).await?;
+        let new_task = db.create_task(agent_id, None, None, None, None, None).await?;
+        db.save_traffic_request(old_task, "old request").await?;
+        db.save_traffic_response(old_task, "old response").await?;
+        db.save_agent_question(old_task, "ask_followup_question", "Which file?").await?;
+        db.save_traffic_request(new_task, "new request").await?;
+        db.save_traffic_response(new_task, "new response").await?;
+
+        // Age only the first call past the retention window; task rows are
+        // created with CURRENT_TIMESTAMP, so this is the only way to make
+        // "older than N days" true in a test.
+        sqlx::query("UPDATE tasks SET timestamp = datetime('now', '-40 days') WHERE id = ?")
+            .bind(old_task)
+            .execute(&db.pool)
+            .await?;
+
+        let pruned = db.prune_traffic_bodies(30).await?;
+        assert_eq!(pruned, 1);
+
+        let old = db.get_task_traffic(old_task).await?.expect("row survives");
+        assert!(old["request_body"].is_null(), "old body is gone");
+        assert!(old["response_body"].is_null(), "old body is gone");
+        // The captured question outlives the bodies: it is one line, and it
+        // is what the "Waiting for you" status shows.
+        assert_eq!(old["agent_question_text"], "Which file?");
+
+        let new = db.get_task_traffic(new_task).await?.expect("row survives");
+        assert_eq!(new["request_body"], "new request");
+        assert_eq!(new["response_body"], "new response");
+
+        // A second sweep finds nothing to do.
+        assert_eq!(db.prune_traffic_bodies(30).await?, 0);
 
         Ok(())
     }

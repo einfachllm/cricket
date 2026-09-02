@@ -6,8 +6,18 @@ Anthropic-compatible agents.
 
 ## Features
 - **Proxy Mode**: Intercepts requests to LLM providers — OpenAI-style
-  (`/v1/chat/completions`) and Anthropic-style (`/v1/messages`) — and forwards
-  them unmodified to the real API.
+  (`/v1/chat/completions`), Anthropic-style (`/v1/messages`), and the aux
+  endpoints agents call as part of their loop (`/v1/models`,
+  `/v1/messages/count_tokens`, `/v1/responses`) — and forwards them
+  unmodified to the real API.
+- **Agent auto-attribution**: Most agents can't send custom headers, so
+  calls without `X-Agent-ID` are attributed by fingerprint instead — a
+  recognizable `User-Agent`, or a system prompt that names the agent
+  (`fingerprints.yaml`). Unlabelled sessions are grouped by a stable hash
+  of the task's first user message. No agent cooperation required.
+- **Run wrapper**: `harnesswurm run` points any agent at the proxy with the
+  agent, experiment and session carried in the base URL itself — see
+  [Running an agent under an experiment](#running-an-agent-under-an-experiment).
 - **Configurable providers**: Where each call is forwarded to is edited in the
   desktop app's Settings tab (or in `providers.yaml`), so the hosted APIs, a
   gateway, or a model server on localhost (Ollama, vLLM, LM Studio, llama.cpp,
@@ -42,7 +52,8 @@ Anthropic-compatible agents.
    ```
    The server listens on `http://127.0.0.1:8081` by default; override with
    the `BIND_ADDR` env var. State (the database, `agents.yaml`,
-   `pricing.yaml`, `providers.yaml`) lives in the current directory.
+   `pricing.yaml`, `providers.yaml`, `fingerprints.yaml`) lives in the
+   current directory.
 
 ### Embedding
 
@@ -52,7 +63,7 @@ spawns `harnesswurm_backend::run(ServerConfig { bind_addr, data_dir })` from
 its own startup, so the desktop app is a single process with no separate
 `cargo run` needed. Point `data_dir` at wherever makes sense for the embedding
 host (a proper per-OS app data directory for a packaged app); `agents.yaml`,
-`pricing.yaml` and `providers.yaml` are seeded there from the bundled defaults
+`pricing.yaml`, `providers.yaml` and `fingerprints.yaml` are seeded there from the bundled defaults
 on first run if missing, and left alone (still user-editable) after that.
 
 ## Usage
@@ -67,13 +78,26 @@ own), so no proxy-specific auth setup is needed. To send a call somewhere else (
 gateway), add it to `providers.yaml` and address it by name: see
 [Providers](#providers).
 
-### Required/optional headers
-- `X-Agent-ID`: Name of the agent (e.g., `kilo`, `opencode`).
-- `X-Session-ID`: Unique identifier for the current task/session.
-- `X-Experiment-ID` *(optional)*: Groups calls for comparison, e.g. run the
-  same task under `X-Experiment-ID: baseline` and again under
-  `X-Experiment-ID: with-smart-skills`, then compare their metrics via the
-  analytics API or the desktop app's Analytics/Traffic tabs.
+### Attribution — who made this call
+
+Three sources, most specific first. Nothing is mandatory anymore; a
+completely unconfigured agent still gets sensible attribution.
+
+1. **Run prefix in the URL** — `/r/<agent>/<experiment>/<session>/v1/…` or
+   `/r/<agent>/<session>/v1/…`. This is what the `harnesswurm run` wrapper
+   sets, and it is the one channel every agent supports, because it needs
+   nothing beyond the base URL they all let you configure.
+2. **Headers** — `X-Agent-ID`, `X-Session-ID`, and the optional
+   `X-Experiment-ID` (groups calls for comparison), for clients that *can*
+   send custom headers.
+3. **Fingerprints** — no agent cooperation needed at all. `fingerprints.yaml`
+   maps recognizable `User-Agent` headers (`claude-cli/1.x` …) and
+   system-prompt openings ("You are Claude Code…") to agent names;
+   Claude Code is seeded, and the Traffic tab shows what your other tools
+   actually send, so extending it is copy-paste. An explicit header or run
+   prefix always beats a fingerprint. Without a labelled session, calls are
+   grouped as `auto-<hash>` by the conversation's *first* user message —
+   the turns of one task stay together, and a new task starts a new session.
 
 ### Cost pricing
 `pricing.yaml` ships with a small starter set of models. It is **not** an
@@ -97,8 +121,8 @@ npm run tauri dev
 
 That opens the window with the proxy already listening on
 `127.0.0.1:8081`. State lives in the OS app-data directory (not the current
-working directory), and `agents.yaml` / `pricing.yaml` / `providers.yaml` are
-seeded there on first run.
+working directory), and `agents.yaml` / `pricing.yaml` / `providers.yaml` /
+`fingerprints.yaml` are seeded there on first run.
 
 To get an app you can just double-click, with no toolchain at all:
 
@@ -122,7 +146,7 @@ cd desktop && npm run dev               # http://localhost:5173
 
 Run `cargo run` from the same directory each time — the standalone binary
 keeps its state (`harnesswurm.db`, `agents.yaml`, `pricing.yaml`,
-`providers.yaml`) in the
+`providers.yaml`, `fingerprints.yaml`) in the
 current directory, which is a *different* database from the one the packaged
 app uses. Don't run both at once: whichever grabs port 8081 first wins, and
 the UI will quietly show that one's data.
@@ -175,19 +199,26 @@ of the path the client appends:
 | OpenAI-compatible (appends `/chat/completions`) | `http://localhost:8081/v1` |
 | Anthropic-compatible (appends `/v1/messages`) | `http://localhost:8081` |
 
+The aux endpoints are proxied on the same base URLs — `/v1/models`,
+`/v1/messages/count_tokens`, `/v1/responses` — so an agent probing
+connectivity or pre-counting its context gets a real answer instead of a
+404 that looks like a dead provider. `/v1/responses` (the Responses API the
+Codex CLI speaks) is recorded like any other call, with token, cache and
+tool-call counts — `function_call` items by their tool's name, built-in
+tools (`web_search_call` …) by their type. `models` and `count_tokens` are
+forwarded unrecorded — they are questions *about* a call, not calls.
+
 Those two go to the provider marked `default` for that style in
 `providers.yaml`. To reach a specific provider instead, put its name in the
 base URL — `http://localhost:8081/p/ollama/v1` and
-`http://localhost:8081/p/ollama` respectively. See [Providers](#providers).
+`http://localhost:8081/p/ollama` respectively (the same prefix works on the
+aux endpoints). See [Providers](#providers).
 
 Most agents expose this as an environment variable or a config field
-(`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, a `baseUrl` setting…); the exact name
-varies per tool.
-
-**Known gap:** `X-Agent-ID` and `X-Session-ID` are how calls are attributed,
-and most agents send neither — those calls all collapse into a single
-`unknown_agent` / `default_session` bucket. If your agent can set custom
-headers, set them; if not, per-agent attribution isn't available yet.
+(`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, a `baseUrl` setting…); the exact
+name varies per tool — or skip this section entirely and use
+[`harnesswurm run`](#running-an-agent-under-an-experiment), which sets them
+for you.
 
 ### Running the tests
 ```bash
@@ -315,6 +346,12 @@ quietly become permanent. They are deliberately *not* named `OPENAI_BASE_URL` /
 `ANTHROPIC_BASE_URL`: those are usually already set to point a client **at**
 this proxy, and honoring them here would make Harnesswurm forward to itself.
 
+`HARNESSWURM_TRAFFIC_RETENTION_DAYS` (default 30) ages captured
+request/response bodies out of the database — they are the bulk of it and
+the only part with privacy weight. The task rows, counts, costs and
+verdicts built from them stay. `0` keeps bodies forever. Pruning runs on
+startup and then every six hours.
+
 ## Agent status
 
 Different agents (Claude Code, Kilo, opencode, aider, Cursor…) share no
@@ -353,15 +390,49 @@ Two caveats worth knowing:
 Calls left open by a killed process are closed out as *Interrupted* on the
 next startup, so nothing shows as permanently "Thinking".
 
-## Comparing two agents on the same task
+## Running an agent under an experiment
 
-Point both agents at the proxy with the **same** `X-Experiment-ID` and a
-different `X-Agent-ID` / `X-Session-ID`:
+`harnesswurm run` is the way to point a real agent at the proxy when you
+care about attribution: it carries the agent, experiment and session in the
+base URL itself, sets `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` on the child
+process, and propagates its exit code.
 
 ```bash
-# terminal 1
+cd harnesswurm/backend
+cargo run --bin harnesswurm -- run --experiment issue-1284 --agent kilo -- kilo code
+cargo run --bin harnesswurm -- run --experiment issue-1284 --agent claude-code -- claude
+```
+
+It prints the base URLs it set and spawns the command. Every call the agent
+makes — either API style, models and count_tokens included — lands under
+that agent, that experiment, and a generated session id like
+`issue-1284-kilo-18c2f04d-9a31`, ready for the comparison view.
+
+- `--session <id>` overrides the generated session id (use it to resume a
+  labelled run).
+- `--provider <name>` routes through a specific `providers.yaml` entry
+  instead of the style default.
+- `--addr <host:port>` targets a proxy other than
+  `$HARNESSWURM_ADDR` / `127.0.0.1:8081` — the desktop app's embedded one,
+  or a remote box.
+
+The same paths work by hand, without the wrapper:
+`http://localhost:8081/r/<agent>/<experiment>/<session>/v1` for an
+OpenAI-compatible client (drop the `/v1` for Anthropic-compatible), and
+`/r/<agent>/<session>/v1` when there is no experiment to group under.
+
+## Comparing two agents on the same task
+
+Wrap both agents with the same `--experiment` — or set the headers by hand
+if you prefer:
+
+```bash
+# via the wrapper (recommended — needs nothing from the agent)
+harnesswurm run --experiment issue-1284 --agent kilo         -- kilo code
+harnesswurm run --experiment issue-1284 --agent claude-code  -- claude
+
+# by hand, on every call
 X-Agent-ID: kilo         X-Session-ID: issue-1284-kilo    X-Experiment-ID: issue-1284
-# terminal 2
 X-Agent-ID: claude-code  X-Session-ID: issue-1284-claude  X-Experiment-ID: issue-1284
 ```
 
