@@ -31,9 +31,10 @@ server to deploy.
 
 ## Commands
 
-Backend (Rust — run from `harnesswurm/backend`):
+Backend (Rust — run from `harnesswurm/backend`, or repo root via `npm run <script>`):
 - Build: `cargo build`
 - Test: `cargo test`
+- All suites at once (repo root): `npm run checks` (desktop typecheck + vitest, backend cargo test + clippy)
 - Lint: `cargo clippy --lib --bins` (three warnings are pre-existing on
   main; fix only warnings you introduced)
 - Standalone server: `BIND_ADDR=127.0.0.1:8091 cargo run` (state lives in
