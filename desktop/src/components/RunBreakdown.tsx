@@ -133,7 +133,7 @@ function PhaseColumns({ stacks }: { stacks: StackedPhase[] }) {
               return (
                 <path key={part.key} d={path} fill={part.color}>
                   <title>
-                    {`${label} · ${part.label}: ${formatTokens(part.value)} (${Math.round((part.value / (stack?.total ?? 1)) * 100)}%)`}
+                    {`${label} · ${part.label}: ${formatTokens(part.value)} tokens (${Math.round((part.value / (stack?.total ?? 1)) * 100)}%) across ${stack?.calls ?? 0} call${(stack?.calls ?? 0) === 1 ? "" : "s"}`}
                   </title>
                 </path>
               );
@@ -191,7 +191,10 @@ function ToolBars({ tools }: { tools: ToolUsage[] }) {
             <span className="w-28 shrink-0 truncate font-mono text-gray-600" title={tool.tool_name}>
               {tool.tool_name}
             </span>
-            <div className="flex-1 h-2 bg-gray-100 rounded-sm overflow-hidden">
+            <div
+              className="flex-1 h-2 bg-gray-100 rounded-sm overflow-hidden"
+              title={`${tool.tool_name}: ${formatTokens(tool.input_tokens)} tokens across ${tool.call_count} call${tool.call_count === 1 ? "" : "s"}`}
+            >
               {/* One hue for every bar: length carries the magnitude, so
                   shading by size would spend the colour channel twice. */}
               <div className="h-full rounded-sm" style={{ width: `${share * 100}%`, backgroundColor: SERIES[0].color }} />

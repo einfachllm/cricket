@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { Activity, TrendingUp, DollarSign } from 'lucide-react';
 import ExperimentComparison from './ExperimentComparison';
 import RunBreakdown from './RunBreakdown';
@@ -25,6 +25,15 @@ interface Experiment {
   id: number;
   name: string;
   description: string;
+}
+
+export function tokensByModel(metrics: MetricData[]): { model: string; tokens: number }[] {
+  const sums = new Map<string, number>();
+  for (const m of metrics) {
+    const key = m.model_name ?? "unknown";
+    sums.set(key, (sums.get(key) ?? 0) + m.prompt_tokens + m.completion_tokens);
+  }
+  return [...sums.entries()].map(([model, tokens]) => ({ model, tokens })).sort((a, b) => b.tokens - a.tokens);
 }
 
 const AnalyticsDashboard = () => {
@@ -161,7 +170,7 @@ const AnalyticsDashboard = () => {
             <div className="h-96 w-full">
               <h3 className="text-lg font-semibold mb-4 text-gray-700">Token Usage Over Time</h3>
               <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={metrics}>
+                <AreaChart data={metrics}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} />
                   <XAxis
                     dataKey="timestamp"
@@ -169,17 +178,35 @@ const AnalyticsDashboard = () => {
                     minTickGap={30}
                   />
                   <YAxis />
-                  <Tooltip />
+                  <Tooltip formatter={(value) => Number(value).toLocaleString()} />
                   <Legend />
-                  <Line type="monotone" dataKey="prompt_tokens" stroke="#3b82f6" strokeWidth={2} dot={false} />
-                  <Line type="monotone" dataKey="completion_tokens" stroke="#10b981" strokeWidth={2} dot={false} />
-                </LineChart>
+                  <Area type="monotone" dataKey="prompt_tokens" stroke="#3b82f6" fill="#3b82f6" fillOpacity={0.3} strokeWidth={2} dot={false} />
+                  <Area type="monotone" dataKey="completion_tokens" stroke="#10b981" fill="#10b981" fillOpacity={0.3} strokeWidth={2} dot={false} />
+                  <Area type="monotone" dataKey="cache_read_tokens" stroke="#a855f7" fill="#a855f7" fillOpacity={0.3} strokeWidth={2} dot={false} />
+                </AreaChart>
               </ResponsiveContainer>
             </div>
           ) : (
             <Empty title="Select an experiment" hint="Select an experiment to view detailed metrics" />
           )}
           </Card>
+          {!loading && metrics.length > 0 && (
+            <Card>
+              <div className="h-96 w-full">
+                <h3 className="text-lg font-semibold mb-4 text-gray-700">Tokens by Model</h3>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={tokensByModel(metrics)} layout="vertical">
+                    <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+                    <XAxis type="number" />
+                    <YAxis type="category" dataKey="model" width={120} />
+                    <Tooltip formatter={(value) => Number(value).toLocaleString()} />
+                    <Legend />
+                    <Bar dataKey="tokens" fill="#3b82f6" />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </Card>
+          )}
         </div>
       </div>
     </div>
