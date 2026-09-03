@@ -163,6 +163,22 @@ export interface ToolUsage {
   cost: number;
 }
 
+export interface MetricPoint {
+  task_id: number;
+  agent_name: string;
+  session_key: string;
+  timestamp: string;
+  model_name: string | null;
+  provider: string | null;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  tool_calls_count: number;
+  latency_ms: number;
+  cost_estimate: number | null;
+}
+
 export interface ExperimentBreakdown {
   phases: PhaseSlice[];
   tools: ToolUsage[];

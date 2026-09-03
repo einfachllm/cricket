@@ -573,6 +573,9 @@ impl Database {
     pub async fn get_experiment_metrics(&self, experiment_id: i64) -> Result<Vec<Value>> {
         let rows = sqlx::query(
             "SELECT
+                t.id as task_id,
+                a.name as agent_name,
+                COALESCE(t.session_id, '') as session_key,
                 t.timestamp,
                 t.model_name,
                 t.provider,
@@ -584,6 +587,7 @@ impl Database {
                 m.latency_ms,
                 m.cost_estimate
              FROM tasks t
+             JOIN agents a ON t.agent_id = a.id
              JOIN metrics m ON t.id = m.task_id
              WHERE t.experiment_id = ?
              ORDER BY t.timestamp ASC"
@@ -594,6 +598,9 @@ impl Database {
 
         let metrics = rows.iter().map(|row| {
             json!({
+                "task_id": row.get::<i64, _>("task_id"),
+                "agent_name": row.get::<String, _>("agent_name"),
+                "session_key": row.get::<String, _>("session_key"),
                 "timestamp": row.get::<String, _>("timestamp"),
                 "model_name": row.get::<Option<String>, _>("model_name"),
                 "provider": row.get::<Option<String>, _>("provider"),
@@ -2260,7 +2267,7 @@ mod tests {
         let rows = db.get_experiment_metrics(experiments[0].0).await?;
         assert!(!rows.is_empty());
         for row in &rows {
-            require_keys(row, &["timestamp", "model_name", "provider", "prompt_tokens", "completion_tokens", "cache_creation_tokens", "cache_read_tokens", "tool_calls_count", "latency_ms", "cost_estimate"], "metrics");
+            require_keys(row, &["task_id", "agent_name", "session_key", "timestamp", "model_name", "provider", "prompt_tokens", "completion_tokens", "cache_creation_tokens", "cache_read_tokens", "tool_calls_count", "latency_ms", "cost_estimate"], "metrics");
         }
         Ok(())
     }

@@ -3,23 +3,10 @@ import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, L
 import { Activity, TrendingUp, DollarSign } from 'lucide-react';
 import ExperimentComparison from './ExperimentComparison';
 import RunBreakdown from './RunBreakdown';
-import { fetchJson, formatCost, type RunGrouping } from '../lib/api';
+import { fetchJson, formatCost, type MetricPoint, type RunGrouping } from '../lib/api';
 import Card from './ui/Card';
 import Empty from './ui/Empty';
 import Skeleton from './ui/Skeleton';
-
-interface MetricData {
-  timestamp: string;
-  model_name: string | null;
-  provider: string | null;
-  prompt_tokens: number;
-  completion_tokens: number;
-  cache_creation_tokens: number;
-  cache_read_tokens: number;
-  tool_calls_count: number;
-  latency_ms: number;
-  cost_estimate: number | null;
-}
 
 interface Experiment {
   id: number;
@@ -27,7 +14,7 @@ interface Experiment {
   description: string;
 }
 
-export function tokensByModel(metrics: MetricData[]): { model: string; tokens: number }[] {
+export function tokensByModel(metrics: MetricPoint[]): { model: string; tokens: number }[] {
   const sums = new Map<string, number>();
   for (const m of metrics) {
     const key = m.model_name ?? "unknown";
@@ -39,7 +26,7 @@ export function tokensByModel(metrics: MetricData[]): { model: string; tokens: n
 const AnalyticsDashboard = () => {
   const [experiments, setExperiments] = useState<Experiment[]>([]);
   const [selectedExperiment, setSelectedExperiment] = useState<string | null>(null);
-  const [metrics, setMetrics] = useState<MetricData[]>([]);
+  const [metrics, setMetrics] = useState<MetricPoint[]>([]);
   const [loading, setLoading] = useState(false);
   // Lifted so the comparison and the breakdown always count in the same
   // unit — two cards disagreeing about what a run is would be worse than
@@ -67,7 +54,7 @@ const AnalyticsDashboard = () => {
   const fetchMetrics = async (id: string) => {
     setLoading(true);
     try {
-      setMetrics(await fetchJson<MetricData[]>(`/v1/analytics/experiments/${id}/metrics`));
+      setMetrics(await fetchJson<MetricPoint[]>(`/v1/analytics/experiments/${id}/metrics`));
     } catch (error) {
       console.error('Error fetching metrics:', error);
     } finally {
