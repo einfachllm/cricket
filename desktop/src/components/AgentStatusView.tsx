@@ -118,7 +118,7 @@ function SessionCard({ session }: { session: SessionSummary }) {
   const attentionRing = session.needs_attention ? 'ring-1 ring-amber-200' : '';
 
   return (
-    <div className={`rounded-2xl bg-[#151a23] border border-slate-200/80 border-l-[3px] ${accent} ${attentionRing} p-5 space-y-3 shadow-[0_1px_2px_rgba(15,23,42,0.03)] transition-all hover:-translate-y-0.5 hover:shadow-[0_10px_30px_rgba(15,23,42,0.07)]`}>
+    <div className={`rounded-2xl bg-[#151a23] border border-white/10 border-l-[3px] ${accent} ${attentionRing} p-5 space-y-3 shadow-[0_1px_2px_rgba(15,23,42,0.03)] transition-all hover:-translate-y-0.5 hover:shadow-[0_10px_30px_rgba(15,23,42,0.07)]`}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
@@ -150,7 +150,7 @@ function SessionCard({ session }: { session: SessionSummary }) {
       )}
 
       <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-slate-400 pt-2 border-t border-white/5">
-        <span className="font-mono text-gray-600">{session.model_name ?? 'unknown model'}</span>
+        <span className="font-mono text-slate-400">{session.model_name ?? 'unknown model'}</span>
         <span>{session.call_count} call{session.call_count === 1 ? '' : 's'}</span>
         <span title="Input / output tokens across the session">
           {formatTokens(session.input_tokens)} in / {formatTokens(session.output_tokens)} out
