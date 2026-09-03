@@ -424,11 +424,28 @@ OpenAI-compatible client (drop the `/v1` for Anthropic-compatible), and
 ### Zero-setup recipes
 
 ```bash
-harnesswurm run --experiment issue-1284 --agent opencode -- opencode run "Fix the login redirect"
 harnesswurm run --experiment issue-1284 --agent claude-code -- claude -p "Fix the login redirect"
 ```
 
 Attribution travels in the base URL so no headers are needed.
+
+opencode does not honor the wrapper's `ANTHROPIC_BASE_URL` /
+`OPENAI_BASE_URL` injection — its documented override is
+`provider.options.baseURL` in `opencode.json`
+(https://opencode.ai/docs/providers). Point it at the same `/r/` prefix
+URL from above (pick a stable session name, same shape
+`build_run_prefix` produces: `/r/<agent>/<experiment>/<session>`), then
+run `opencode run "…"` normally:
+
+```json
+{
+  "provider": {
+    "anthropic": {
+      "options": { "baseURL": "http://127.0.0.1:8081/r/opencode/issue-1284/my-session" }
+    }
+  }
+}
+```
 
 ## Comparing two agents on the same task
 
