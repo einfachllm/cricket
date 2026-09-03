@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Radio, RefreshCw, X, MessageCircleQuestion } from 'lucide-react';
-import { API_BASE, formatCost } from '../lib/api';
+import { fetchJson, formatCost, formatTimestampUtc } from '../lib/api';
 
 interface TaskSummary {
   task_id: number;
@@ -113,8 +113,7 @@ const TrafficView = () => {
   const fetchTasks = async () => {
     setLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/v1/analytics/tasks`);
-      const data = await response.json();
+      const data = await fetchJson<TaskSummary[]>('/v1/analytics/tasks');
       setTasks(data);
     } catch (error) {
       console.error('Error fetching tasks:', error);
@@ -138,8 +137,7 @@ const TrafficView = () => {
     let cancelled = false;
     const controller = new AbortController();
     setTrafficLoading(true);
-    fetch(`${API_BASE}/v1/analytics/tasks/${selectedId}/traffic`, { signal: controller.signal })
-      .then((res) => (res.ok ? res.json() : Promise.reject(res.status)))
+    fetchJson<TaskTraffic>(`/v1/analytics/tasks/${selectedId}/traffic`, { signal: controller.signal })
       .then((data) => {
         if (!cancelled) setTraffic(data);
       })
@@ -163,7 +161,7 @@ const TrafficView = () => {
     .filter((t) => !questionsOnly || !!t.agent_question_text);
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="page-wrap">
       <div className="flex justify-between items-center">
         <h2 className="text-3xl font-bold text-gray-800 flex items-center gap-2">
           <Radio size={28} className="text-blue-600" />
@@ -199,7 +197,7 @@ const TrafficView = () => {
         </div>
       </div>
 
-      <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+      <div className="surface overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead className="bg-gray-50 text-gray-500 uppercase text-xs">
@@ -228,7 +226,7 @@ const TrafficView = () => {
                   }`}
                 >
                   <td className="px-4 py-3 text-gray-500 whitespace-nowrap">
-                    {new Date(task.timestamp + 'Z').toLocaleTimeString()}
+                    {formatTimestampUtc(task.timestamp)}
                   </td>
                   <td className="px-4 py-3 font-medium text-gray-800">{task.agent_name}</td>
                   <td className="px-4 py-3 text-gray-600 max-w-xs truncate" title={task.task_description || ''}>
@@ -272,7 +270,7 @@ const TrafficView = () => {
       </div>
 
       {selectedId !== null && (
-        <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6 space-y-4">
+        <div className="surface p-6 space-y-4">
           <div className="flex justify-between items-start gap-4">
             <div>
               <h3 className="text-lg font-semibold text-gray-700">

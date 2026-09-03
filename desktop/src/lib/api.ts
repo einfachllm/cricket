@@ -263,3 +263,9 @@ export function proxyBaseUrl(provider: { name: string; api: ProviderApiStyle }):
   const prefix = `${API_BASE}/p/${provider.name}`;
   return provider.api === 'openai' ? `${prefix}/v1` : prefix;
 }
+
+export function formatTimestampUtc(iso: string | null | undefined): string {
+  if (!iso) return "–";
+  const normalized = iso.endsWith("Z") ? iso : `${iso}Z`;
+  return new Date(normalized).toLocaleTimeString();
+}
