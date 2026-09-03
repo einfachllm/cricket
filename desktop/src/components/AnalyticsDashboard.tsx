@@ -3,7 +3,7 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Responsi
 import { Activity, TrendingUp, DollarSign } from 'lucide-react';
 import ExperimentComparison from './ExperimentComparison';
 import RunBreakdown from './RunBreakdown';
-import { fetchJson, type RunGrouping } from '../lib/api';
+import { fetchJson, formatCost, type RunGrouping } from '../lib/api';
 import Card from './ui/Card';
 import Empty from './ui/Empty';
 import Skeleton from './ui/Skeleton';
@@ -81,7 +81,7 @@ const AnalyticsDashboard = () => {
   return (
     <div className="page-wrap">
       <div className="flex justify-between items-center">
-        <h2 className="text-3xl font-bold text-gray-800">Experiment Analytics</h2>
+        <h2 className="text-3xl font-bold text-slate-100">Experiment Analytics</h2>
         <div className="flex gap-4">
             <div className="bg-blue-100 text-blue-800 px-4 py-2 rounded-lg flex items-center gap-2">
                 <Activity size={20} />
@@ -97,18 +97,18 @@ const AnalyticsDashboard = () => {
       <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
         <Card>
           <p className="text-sm text-gray-500 uppercase font-semibold">Total Prompt Tokens</p>
-          <p className="text-2xl font-bold text-gray-800">{summary.totalPrompt.toLocaleString()}</p>
+          <p className="text-2xl font-bold text-slate-100">{summary.totalPrompt.toLocaleString()}</p>
         </Card>
         <Card>
           <p className="text-sm text-gray-500 uppercase font-semibold">Total Completion Tokens</p>
-          <p className="text-2xl font-bold text-gray-800">{summary.totalCompletion.toLocaleString()}</p>
+          <p className="text-2xl font-bold text-slate-100">{summary.totalCompletion.toLocaleString()}</p>
         </Card>
         <Card>
           <p className="text-sm text-gray-500 uppercase font-semibold flex items-center gap-1">
             <DollarSign size={14} /> Total Cost
           </p>
-          <p className="text-2xl font-bold text-gray-800">
-            {summary.totalCost < 0.01 ? `$${summary.totalCost.toFixed(5)}` : `$${summary.totalCost.toFixed(4)}`}
+          <p className="text-2xl font-bold text-slate-100">
+            {formatCost(summary.totalCost)}
           </p>
           {summary.pricedCount < metrics.length && (
             <p className="text-xs text-gray-400 mt-1">
@@ -118,7 +118,7 @@ const AnalyticsDashboard = () => {
         </Card>
         <Card>
           <p className="text-sm text-gray-500 uppercase font-semibold">Total Requests</p>
-          <p className="text-2xl font-bold text-gray-800">{metrics.length}</p>
+          <p className="text-2xl font-bold text-slate-100">{metrics.length}</p>
         </Card>
       </div>
 
@@ -133,7 +133,7 @@ const AnalyticsDashboard = () => {
                 className={`w-full text-left px-4 py-3 rounded-lg transition-colors ${
                   selectedExperiment === exp.id.toString()
                     ? 'bg-blue-600 text-white shadow-md'
-                    : 'bg-gray-50 text-gray/70 hover:bg-gray-100'
+                    : 'bg-gray-50 text-slate-500 hover:bg-gray-100'
                 }`}
               >
                 <p className="font-medium truncate">{exp.name}</p>

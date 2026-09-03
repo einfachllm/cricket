@@ -74,11 +74,11 @@ function QuotaBar({ label, remaining, limit }: { label: string; remaining: numbe
 
   return (
     <div className="space-y-1 min-w-[9rem]">
-      <div className="flex justify-between text-xs text-gray-500">
+      <div className="flex justify-between text-xs text-slate-400">
         <span>{label}</span>
         <span className="font-mono">{formatTokens(remaining)} / {formatTokens(limit)}</span>
       </div>
-      <div className="h-1.5 w-full rounded-full bg-gray-200 overflow-hidden">
+      <div className="h-1.5 w-full rounded-full bg-white/10 overflow-hidden">
         <div className={`h-full rounded-full ${color}`} style={{ width: `${ratio * 100}%` }} />
       </div>
     </div>
@@ -118,19 +118,19 @@ function SessionCard({ session }: { session: SessionSummary }) {
   const attentionRing = session.needs_attention ? 'ring-1 ring-amber-200' : '';
 
   return (
-    <div className={`rounded-2xl bg-white border border-slate-200/80 border-l-[3px] ${accent} ${attentionRing} p-5 space-y-3 shadow-[0_1px_2px_rgba(15,23,42,0.03)] transition-all hover:-translate-y-0.5 hover:shadow-[0_10px_30px_rgba(15,23,42,0.07)]`}>
+    <div className={`rounded-2xl bg-[#151a23] border border-slate-200/80 border-l-[3px] ${accent} ${attentionRing} p-5 space-y-3 shadow-[0_1px_2px_rgba(15,23,42,0.03)] transition-all hover:-translate-y-0.5 hover:shadow-[0_10px_30px_rgba(15,23,42,0.07)]`}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            <Bot size={16} className="text-gray-400 shrink-0" />
-            <span className="font-semibold text-gray-800 truncate">{session.agent_name}</span>
+            <Bot size={16} className="text-slate-400 shrink-0" />
+            <span className="font-semibold text-slate-100 truncate">{session.agent_name}</span>
             {session.experiment_name && (
               <span className="px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 text-xs shrink-0">
                 {session.experiment_name}
               </span>
             )}
           </div>
-          <p className="text-xs text-gray-400 font-mono truncate mt-1" title={session.session_id ?? ''}>
+          <p className="text-xs text-slate-400 font-mono truncate mt-1" title={session.session_id ?? ''}>
             {session.session_id ?? 'no session id'}
           </p>
         </div>
@@ -138,24 +138,24 @@ function SessionCard({ session }: { session: SessionSummary }) {
       </div>
 
       {session.state_detail && (
-        <p className={`text-sm ${session.needs_attention ? 'text-gray-800' : 'text-gray-500'}`}>
+        <p className={`text-sm ${session.needs_attention ? 'text-slate-100' : 'text-slate-400'}`}>
           {session.state_detail}
         </p>
       )}
 
       {session.last_task_description && (
-        <p className="text-xs text-gray-400 line-clamp-2" title={session.last_task_description}>
+        <p className="text-xs text-slate-400 line-clamp-2" title={session.last_task_description}>
           Last turn: {session.last_task_description}
         </p>
       )}
 
-      <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-gray-500 pt-2 border-t border-gray-50">
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-slate-400 pt-2 border-t border-white/5">
         <span className="font-mono text-gray-600">{session.model_name ?? 'unknown model'}</span>
         <span>{session.call_count} call{session.call_count === 1 ? '' : 's'}</span>
         <span title="Input / output tokens across the session">
           {formatTokens(session.input_tokens)} in / {formatTokens(session.output_tokens)} out
         </span>
-        <span className="font-semibold text-gray-700">
+        <span className="font-semibold text-slate-200">
           {session.unpriced_calls === session.call_count ? '–' : formatCost(session.total_cost)}
         </span>
         <span className="flex items-center gap-1">
