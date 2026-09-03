@@ -8,6 +8,8 @@
 //! ```text
 //! harnesswurm run --experiment issue-1284 --agent kilo -- kilo code
 //! harnesswurm run --experiment issue-1284 --agent claude-code -- claude
+//! harnesswurm run --experiment issue-1284 --agent opencode -- opencode run "Fix the login redirect"
+//! harnesswurm run --experiment issue-1284 --agent claude-code -- claude -p "Fix the login redirect"
 //! ```
 //!
 //! Both agents then appear as runs of the same experiment, ready to compare
@@ -121,4 +123,48 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
         // shell, which saw the same wait status.
         None => ExitCode::FAILURE,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &str) -> Vec<String> {
+        s.split(' ').map(str::to_string).collect()
+    }
+
+    #[test]
+    fn missing_subcommand_is_an_error() {
+        assert!(run(args("--agent x -- echo hi")).is_err());
+    }
+
+    #[test]
+    fn missing_separator_is_an_error() {
+        assert_eq!(
+            run(args("run --agent x echo hi")).unwrap_err(),
+            "no '--' separating the flags from the command to run"
+        );
+    }
+
+    #[test]
+    fn missing_agent_is_an_error() {
+        assert!(run(args("run -- echo hi")).is_err());
+    }
+
+    #[test]
+    fn unknown_flag_is_an_error() {
+        assert!(run(args("run --agent x --bogus y -- echo hi")).is_err());
+    }
+
+    #[test]
+    fn anthropic_base_url_reaches_the_child() {
+        let code = run(args("run --agent recipe-test --experiment recipe -- printenv ANTHROPIC_BASE_URL")).unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn openai_base_url_reaches_the_child() {
+        let code = run(args("run --agent recipe-test --experiment recipe -- printenv OPENAI_BASE_URL")).unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
 }

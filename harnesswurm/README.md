@@ -421,6 +421,15 @@ The same paths work by hand, without the wrapper:
 OpenAI-compatible client (drop the `/v1` for Anthropic-compatible), and
 `/r/<agent>/<session>/v1` when there is no experiment to group under.
 
+### Zero-setup recipes
+
+```bash
+harnesswurm run --experiment issue-1284 --agent opencode -- opencode run "Fix the login redirect"
+harnesswurm run --experiment issue-1284 --agent claude-code -- claude -p "Fix the login redirect"
+```
+
+Attribution travels in the base URL so no headers are needed.
+
 ## Comparing two agents on the same task
 
 Wrap both agents with the same `--experiment` — or set the headers by hand
