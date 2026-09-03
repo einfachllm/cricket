@@ -2213,4 +2213,55 @@ mod tests {
         assert!(!is_valid_verdict("maybe"));
         assert!(!is_valid_verdict(""));
     }
+
+    fn require_keys(value: &Value, keys: &[&str], what: &str) {
+        let obj = value.as_object().unwrap_or_else(|| panic!("{what} row is not an object"));
+        for key in keys {
+            assert!(obj.contains_key(*key), "{what} row missing key `{key}`: {value}");
+        }
+    }
+
+    async fn seeded_one_finished_task() -> Result<Database> {
+        let db = Database::new("sqlite::memory:").await?;
+        let agent = db.get_or_create_agent("contract").await?;
+        let exp = db.get_or_create_experiment("contract-exp", None).await?;
+        let task = db.create_task(agent, Some(exp), Some("contract task".into()), Some("s1".into()), Some("gpt-4o".into()), Some("openai".into())).await?;
+        db.finish_task(task, &ok_outcome("stop", false)).await?;
+        db.log_metric(task, 100, 50, 0, 0, 1, 1200, Some(0.0001)).await?;
+        Ok(db)
+    }
+
+    #[tokio::test]
+    async fn analytics_sessions_match_frontend_session_summary() -> Result<()> {
+        let db = seeded_one_finished_task().await?;
+        let rows = db.get_sessions(50).await?;
+        assert!(!rows.is_empty());
+        for row in &rows {
+            require_keys(row, &["agent_name", "session_id", "state", "state_label", "needs_attention", "call_count", "input_tokens", "output_tokens", "total_cost", "model_name", "provider"], "sessions");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analytics_recent_tasks_match_traffic_view() -> Result<()> {
+        let db = seeded_one_finished_task().await?;
+        let rows = db.get_recent_tasks(50).await?;
+        assert!(!rows.is_empty());
+        for row in &rows {
+            require_keys(row, &["task_id", "agent_name", "model_name", "provider", "session_id", "timestamp", "prompt_tokens", "completion_tokens", "tool_calls_count", "cost_estimate", "status"], "recent_tasks");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn analytics_metrics_match_dashboard() -> Result<()> {
+        let db = seeded_one_finished_task().await?;
+        let experiments = db.get_all_experiments().await?;
+        let rows = db.get_experiment_metrics(experiments[0].0).await?;
+        assert!(!rows.is_empty());
+        for row in &rows {
+            require_keys(row, &["timestamp", "model_name", "provider", "prompt_tokens", "completion_tokens", "cache_creation_tokens", "cache_read_tokens", "tool_calls_count", "latency_ms", "cost_estimate"], "metrics");
+        }
+        Ok(())
+    }
 }
