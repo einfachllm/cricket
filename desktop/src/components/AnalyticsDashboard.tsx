@@ -1,9 +1,12 @@
 import React, { useEffect, useState } from 'react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, BarChart, Bar } from 'recharts';
-import { Activity, TrendingUp, AlertCircle, DollarSign } from 'lucide-react';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { Activity, TrendingUp, DollarSign } from 'lucide-react';
 import ExperimentComparison from './ExperimentComparison';
 import RunBreakdown from './RunBreakdown';
-import type { RunGrouping } from '../lib/api';
+import { fetchJson, type RunGrouping } from '../lib/api';
+import Card from './ui/Card';
+import Empty from './ui/Empty';
+import Skeleton from './ui/Skeleton';
 
 interface MetricData {
   timestamp: string;
@@ -46,9 +49,7 @@ const AnalyticsDashboard = () => {
 
   const fetchExperiments = async () => {
     try {
-      const response = await fetch('http://localhost:8081/v1/analytics/experiments');
-      const data = await response.json();
-      setExperiments(data);
+      setExperiments(await fetchJson<Experiment[]>('/v1/analytics/experiments'));
     } catch (error) {
       console.error('Error fetching experiments:', error);
     }
@@ -57,9 +58,7 @@ const AnalyticsDashboard = () => {
   const fetchMetrics = async (id: string) => {
     setLoading(true);
     try {
-      const response = await fetch(`http://localhost:8081/v1/analytics/experiments/${id}/metrics`);
-      const data = await response.json();
-      setMetrics(data);
+      setMetrics(await fetchJson<MetricData[]>(`/v1/analytics/experiments/${id}/metrics`));
     } catch (error) {
       console.error('Error fetching metrics:', error);
     } finally {
@@ -80,7 +79,7 @@ const AnalyticsDashboard = () => {
   const summary = getSummary();
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="page-wrap">
       <div className="flex justify-between items-center">
         <h2 className="text-3xl font-bold text-gray-800">Experiment Analytics</h2>
         <div className="flex gap-4">
@@ -96,15 +95,15 @@ const AnalyticsDashboard = () => {
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
-        <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+        <Card>
           <p className="text-sm text-gray-500 uppercase font-semibold">Total Prompt Tokens</p>
           <p className="text-2xl font-bold text-gray-800">{summary.totalPrompt.toLocaleString()}</p>
-        </div>
-        <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+        </Card>
+        <Card>
           <p className="text-sm text-gray-500 uppercase font-semibold">Total Completion Tokens</p>
           <p className="text-2xl font-bold text-gray-800">{summary.totalCompletion.toLocaleString()}</p>
-        </div>
-        <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+        </Card>
+        <Card>
           <p className="text-sm text-gray-500 uppercase font-semibold flex items-center gap-1">
             <DollarSign size={14} /> Total Cost
           </p>
@@ -116,15 +115,15 @@ const AnalyticsDashboard = () => {
               {metrics.length - summary.pricedCount} task(s) on an unpriced model, excluded
             </p>
           )}
-        </div>
-        <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+        </Card>
+        <Card>
           <p className="text-sm text-gray-500 uppercase font-semibold">Total Requests</p>
           <p className="text-2xl font-bold text-gray-800">{metrics.length}</p>
-        </div>
+        </Card>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-        <div className="lg:col-span-1 bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+        <Card className="lg:col-span-1 p-4">
           <h3 className="text-lg font-semibold mb-4 text-gray-700">Experiments</h3>
           <div className="space-y-2">
             {experiments.map((exp) => (
@@ -143,7 +142,7 @@ const AnalyticsDashboard = () => {
             ))}
             {experiments.length === 0 && <p className="text-gray-400 text-sm">No experiments found.</p>}
           </div>
-        </div>
+        </Card>
 
         <div className="lg:col-span-3 space-y-6">
           {selectedExperiment && (
@@ -155,19 +154,17 @@ const AnalyticsDashboard = () => {
           )}
           {selectedExperiment && <RunBreakdown experimentId={selectedExperiment} grouping={grouping} />}
 
-          <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+          <Card>
           {loading ? (
-            <div className="h-64 flex items-center justify-center">
-              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
-            </div>
+            <Skeleton className="h-64" />
           ) : metrics.length > 0 ? (
             <div className="h-96 w-full">
               <h3 className="text-lg font-semibold mb-4 text-gray-700">Token Usage Over Time</h3>
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={metrics}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} />
-                  <XAxis 
-                    dataKey="timestamp" 
+                  <XAxis
+                    dataKey="timestamp"
                     tickFormatter={(tick) => new Date(tick).toLocaleTimeString()}
                     minTickGap={30}
                   />
@@ -180,12 +177,9 @@ const AnalyticsDashboard = () => {
               </ResponsiveContainer>
             </div>
           ) : (
-            <div className="h-64 flex flex-col items-center justify-center text-gray-400">
-              <AlertCircle size={48} className="mb-4 opacity-20" />
-              <p>Select an experiment to view detailed metrics</p>
-            </div>
+            <Empty title="Select an experiment" hint="Select an experiment to view detailed metrics" />
           )}
-          </div>
+          </Card>
         </div>
       </div>
     </div>
