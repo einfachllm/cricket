@@ -210,6 +210,28 @@ mod tests {
     }
 
     #[test]
+    fn opencode_user_agent_matches_the_versioned_ua() {
+        let t = table(
+            "fingerprints:\n  - agent: opencode\n    user_agents: [\"opencode/\"]\n",
+        );
+        assert_eq!(t.match_user_agent("opencode/1.17.13"), Some("opencode"));
+        assert_eq!(t.match_user_agent("OPENCODE/1.17.13"), Some("opencode"));
+        assert_eq!(t.match_user_agent("python-requests/2.31"), None);
+    }
+
+    #[test]
+    fn opencode_system_prompt_matches_the_environment_line() {
+        let t = table(
+            "fingerprints:\n  - agent: opencode\n    system_prompts: [\"You are powered by the model named\"]\n",
+        );
+        assert_eq!(
+            t.match_system_prompt("You are powered by the model named claude-sonnet-4-5. The exact model ID is anthropic/claude-sonnet-4-5"),
+            Some("opencode")
+        );
+        assert_eq!(t.match_system_prompt("You are a helpful assistant."), None);
+    }
+
+    #[test]
     fn file_order_breaks_ties_first_match_wins() {
         let t = table(
             "fingerprints:\n\

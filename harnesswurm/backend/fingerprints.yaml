@@ -21,6 +21,10 @@ fingerprints:
     user_agents: ["claude-cli"]
     system_prompts: ["You are Claude Code"]
 
+  - agent: "opencode"
+    user_agents: ["opencode/"]
+    system_prompts: ["You are powered by the model named"]
+
   # Same shape for anything else:
   # - agent: "aider"
   #   user_agents: ["aider"]
