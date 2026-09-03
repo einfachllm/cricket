@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Radio, RefreshCw, X, MessageCircleQuestion } from 'lucide-react';
 import { fetchJson, formatCost, formatTimestampUtc } from '../lib/api';
+import { CollapsibleJson } from './CollapsibleJson';
 
 interface TaskSummary {
   task_id: number;
@@ -79,13 +80,24 @@ function formatDuration(task: TaskSummary): string {
   return ms === null || ms === undefined ? '–' : `${ms}ms`;
 }
 
-function formatJson(raw: string | null): string {
-  if (!raw) return '(no data captured)';
-  try {
-    return JSON.stringify(JSON.parse(raw), null, 2);
-  } catch {
-    return raw;
-  }
+export const PAGE_SIZE = 50;
+
+export function filterTasks(
+  tasks: TaskSummary[],
+  query: string,
+  agentFilter: string,
+  questionsOnly: boolean,
+): TaskSummary[] {
+  const q = query.trim().toLowerCase();
+  return tasks
+    .filter((t) => agentFilter === 'all' || t.agent_name === agentFilter)
+    .filter((t) => !questionsOnly || !!t.agent_question_text)
+    .filter(
+      (t) =>
+        q === '' ||
+        t.agent_name.toLowerCase().includes(q) ||
+        (t.task_description ?? '').toLowerCase().includes(q),
+    );
 }
 
 function ProviderBadge({ provider }: { provider: string | null }) {
@@ -105,6 +117,8 @@ const TrafficView = () => {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [agentFilter, setAgentFilter] = useState<string>('all');
   const [questionsOnly, setQuestionsOnly] = useState(false);
+  const [query, setQuery] = useState('');
+  const [page, setPage] = useState(0);
   const [loading, setLoading] = useState(false);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [traffic, setTraffic] = useState<TaskTraffic | null>(null);
@@ -156,9 +170,10 @@ const TrafficView = () => {
   }, [selectedId]);
 
   const agents = Array.from(new Set(tasks.map((t) => t.agent_name))).sort();
-  const visibleTasks = tasks
-    .filter((t) => agentFilter === 'all' || t.agent_name === agentFilter)
-    .filter((t) => !questionsOnly || !!t.agent_question_text);
+  const visibleTasks = filterTasks(tasks, query, agentFilter, questionsOnly);
+  const pageCount = Math.max(1, Math.ceil(visibleTasks.length / PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const pagedTasks = visibleTasks.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE);
 
   return (
     <div className="page-wrap">
@@ -168,9 +183,15 @@ const TrafficView = () => {
           Traffic
         </h2>
         <div className="flex items-center gap-3">
+          <input
+            value={query}
+            onChange={(e) => { setQuery(e.target.value); setPage(0); }}
+            placeholder="Search agent or task..."
+            className="border border-gray-200 rounded-lg px-3 py-2 text-sm bg-white"
+          />
           <select
             value={agentFilter}
-            onChange={(e) => setAgentFilter(e.target.value)}
+            onChange={(e) => { setAgentFilter(e.target.value); setPage(0); }}
             className="border border-gray-200 rounded-lg px-3 py-2 text-sm bg-white"
           >
             <option value="all">All agents</option>
@@ -182,7 +203,7 @@ const TrafficView = () => {
             <input
               type="checkbox"
               checked={questionsOnly}
-              onChange={(e) => setQuestionsOnly(e.target.checked)}
+              onChange={(e) => { setQuestionsOnly(e.target.checked); setPage(0); }}
               className="rounded border-gray-300"
             />
             Questions only
@@ -217,7 +238,7 @@ const TrafficView = () => {
               </tr>
             </thead>
             <tbody>
-              {visibleTasks.map((task) => (
+              {pagedTasks.map((task) => (
                 <tr
                   key={task.task_id}
                   onClick={() => setSelectedId(task.task_id)}
@@ -266,6 +287,25 @@ const TrafficView = () => {
               {loading ? 'Loading...' : 'No traffic captured yet. Point an agent at this proxy and run a task.'}
             </p>
           )}
+          {visibleTasks.length > 0 && (
+            <div className="flex items-center justify-between px-4 py-3 border-t border-gray-100 text-sm text-gray-600">
+              <button
+                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                disabled={safePage === 0}
+                className="px-3 py-1 rounded-lg border border-gray-200 disabled:opacity-50"
+              >
+                Prev
+              </button>
+              <span>Page {safePage + 1} of {pageCount}</span>
+              <button
+                onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
+                disabled={safePage >= pageCount - 1}
+                className="px-3 py-1 rounded-lg border border-gray-200 disabled:opacity-50"
+              >
+                Next
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
@@ -303,15 +343,15 @@ const TrafficView = () => {
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <div>
                 <p className="text-xs uppercase font-semibold text-gray-400 mb-2">Request</p>
-                <pre className="bg-gray-900 text-gray-100 text-xs rounded-lg p-4 overflow-auto max-h-96 whitespace-pre-wrap break-words">
-                  {formatJson(traffic?.request_body ?? null)}
-                </pre>
+                <div className="bg-gray-900 text-gray-100 text-xs rounded-lg p-4 overflow-auto max-h-96 whitespace-pre-wrap break-words">
+                  <CollapsibleJson raw={traffic?.request_body ?? null} />
+                </div>
               </div>
               <div>
                 <p className="text-xs uppercase font-semibold text-gray-400 mb-2">Response</p>
-                <pre className="bg-gray-900 text-gray-100 text-xs rounded-lg p-4 overflow-auto max-h-96 whitespace-pre-wrap break-words">
-                  {formatJson(traffic?.response_body ?? null)}
-                </pre>
+                <div className="bg-gray-900 text-gray-100 text-xs rounded-lg p-4 overflow-auto max-h-96 whitespace-pre-wrap break-words">
+                  <CollapsibleJson raw={traffic?.response_body ?? null} />
+                </div>
               </div>
             </div>
           )}
