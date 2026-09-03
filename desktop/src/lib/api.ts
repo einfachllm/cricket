@@ -4,6 +4,43 @@
 
 export const API_BASE = 'http://localhost:8081';
 
+let apiBaseOverride: string | null = null;
+
+/// Highest precedence: the URL the Tauri shell reports (port it actually bound).
+export function setApiBase(url: string): void {
+  apiBaseOverride = url;
+}
+
+/// Test-only reset; never call from app code.
+export function resetApiBaseForTests(): void {
+  apiBaseOverride = null;
+}
+
+function envApiBase(): string | null {
+  const viaVite = (import.meta as any)?.env?.VITE_HARNESSWURM_API_BASE as string | undefined;
+  return viaVite && viaVite.length > 0 ? viaVite : null;
+}
+
+/// Resolution order: explicit (Tauri) > Vite env > compiled default.
+export function resolvedApiBase(): string {
+  return apiBaseOverride ?? envApiBase() ?? API_BASE;
+}
+
+/// Call once at app boot. Outside Tauri (plain Vite browser) the invoke
+/// rejects and the default/env value stands — that is the fallback, not an error.
+export async function initBackendUrl(): Promise<void> {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    const url = await Promise.race([
+      invoke<string>('get_backend_url'),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('backend url timeout')), 2000)),
+    ]);
+    if (url) setApiBase(url);
+  } catch {
+    // Browser dev or invoke unavailable: resolvedApiBase() falls back.
+  }
+}
+
 /// The states `session_state::derive_state` can return, mirrored here as a
 /// union so a `switch` over them is exhaustive at compile time. `unknown`
 /// covers rows recorded before status tracking existed.
@@ -147,7 +184,7 @@ export interface ProviderLimits {
 }
 
 export async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(API_BASE + path, init);
+  const response = await fetch(resolvedApiBase() + path, init);
   if (!response.ok) {
     throw new Error(`${path} responded ${response.status}`);
   }
@@ -241,7 +278,7 @@ export async function fetchProviders(): Promise<ProviderConfig[]> {
 /// backend's own message says which entry is wrong — so it is surfaced
 /// rather than replaced with a generic failure.
 export async function saveProviders(providers: ProviderDraft[]): Promise<ProviderConfig[]> {
-  const response = await fetch(API_BASE + '/v1/providers', {
+  const response = await fetch(resolvedApiBase() + '/v1/providers', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ providers }),
@@ -260,7 +297,7 @@ export async function saveProviders(providers: ProviderDraft[]): Promise<Provide
 /// Anthropic style appends `/v1/messages`, which is why they differ by the
 /// trailing `/v1`.
 export function proxyBaseUrl(provider: { name: string; api: ProviderApiStyle }): string {
-  const prefix = `${API_BASE}/p/${provider.name}`;
+  const prefix = `${resolvedApiBase()}/p/${provider.name}`;
   return provider.api === 'openai' ? `${prefix}/v1` : prefix;
 }
 

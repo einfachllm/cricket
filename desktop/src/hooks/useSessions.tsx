@@ -1,5 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
-import { API_BASE, ProviderLimits, SessionSummary, fetchJson } from '../lib/api';
+import { initBackendUrl, resolvedApiBase, ProviderLimits, SessionSummary, fetchJson } from '../lib/api';
 
 /// Live session state, shared by every view that needs it.
 ///
@@ -64,21 +64,28 @@ export function SessionsProvider({ children }: { children: React.ReactNode }) {
   }, [refresh]);
 
   useEffect(() => {
-    // Absent under jsdom in tests, and in any browser without SSE support;
-    // polling above already keeps the view correct without it.
-    if (typeof EventSource === 'undefined') return;
+    let active = true;
+    let source: EventSource | null = null;
 
-    const source = new EventSource(`${API_BASE}/v1/analytics/events`);
-    source.onopen = () => setLive(true);
-    source.onerror = () => setLive(false);
-    source.onmessage = () => {
-      if (debounce.current) clearTimeout(debounce.current);
-      debounce.current = setTimeout(refresh, REFRESH_DEBOUNCE_MS);
-    };
+    initBackendUrl().then(() => {
+      if (!active) return;
+      // Absent under jsdom in tests, and in any browser without SSE support;
+      // polling above already keeps the view correct without it.
+      if (typeof EventSource === 'undefined') return;
+
+      source = new EventSource(`${resolvedApiBase()}/v1/analytics/events`);
+      source.onopen = () => setLive(true);
+      source.onerror = () => setLive(false);
+      source.onmessage = () => {
+        if (debounce.current) clearTimeout(debounce.current);
+        debounce.current = setTimeout(refresh, REFRESH_DEBOUNCE_MS);
+      };
+    });
 
     return () => {
+      active = false;
       if (debounce.current) clearTimeout(debounce.current);
-      source.close();
+      source?.close();
     };
   }, [refresh]);
 
