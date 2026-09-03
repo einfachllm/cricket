@@ -1,8 +1,11 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { AlertTriangle, Check, CircleDot, Clock, HelpCircle, Split, Trophy, X } from 'lucide-react';
+import { AlertTriangle, Check, ChevronDown, ChevronRight, CircleDot, Clock, HelpCircle, Split, Trophy, X } from 'lucide-react';
 import {
+  ExperimentBreakdown,
+  MetricPoint,
   RunComparison,
   RunGrouping,
+  ToolUsage,
   Verdict,
   fetchJson,
   formatCost,
@@ -10,6 +13,8 @@ import {
   humanizeSecs,
   setVerdict,
 } from '../lib/api';
+import { selectRunCalls } from './RunFilters';
+import RunDetail from './RunDetail';
 
 /// Whether a run's cost total is the whole story. A run that touched a model
 /// missing from `pricing.yaml` sums to less than it really cost — at the
@@ -382,10 +387,14 @@ function RunRow({
   run,
   isWinner,
   onVerdict,
+  selected,
+  onSelect,
 }: {
   run: RunComparison;
   isWinner: boolean;
   onVerdict: (run: RunComparison, verdict: Verdict | null) => void;
+  selected: boolean;
+  onSelect: (run: RunComparison) => void;
 }) {
   const issues = run.error_calls + run.rate_limited_calls;
 
@@ -398,7 +407,15 @@ function RunRow({
           ) : (
             <CircleDot size={14} className="text-gray-300 shrink-0" />
           )}
-          <span className="font-semibold text-gray-800">{run.agent_name}</span>
+          <button
+            type="button"
+            onClick={() => onSelect(run)}
+            aria-expanded={selected}
+            className="flex items-center gap-1 font-semibold text-gray-800 hover:text-gray-600"
+          >
+            {selected ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            {run.agent_name}
+          </button>
         </div>
         <p className="text-xs text-gray-400 font-mono truncate max-w-[16rem]" title={run.session_id ?? ''}>
           {run.sessions > 1 ? `${run.sessions} sessions merged` : (run.session_id ?? 'no session id')}
@@ -487,6 +504,9 @@ const ExperimentComparison = ({
   onGroupingChange: (grouping: RunGrouping) => void;
 }) => {
   const [runs, setRuns] = useState<RunComparison[]>([]);
+  const [metricsForDetail, setMetricsForDetail] = useState<MetricPoint[]>([]);
+  const [breakdownTools, setBreakdownTools] = useState<ToolUsage[]>([]);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
 
@@ -495,6 +515,13 @@ const ExperimentComparison = ({
       setRuns(await fetchJson<RunComparison[]>(
         `/v1/analytics/experiments/${experimentId}/comparison?group=${grouping}`,
       ));
+      setMetricsForDetail(await fetchJson<MetricPoint[]>(
+        `/v1/analytics/experiments/${experimentId}/metrics`,
+      ));
+      const breakdown = await fetchJson<ExperimentBreakdown>(
+        `/v1/analytics/experiments/${experimentId}/breakdown?group=${grouping}`,
+      );
+      setBreakdownTools(breakdown.tools);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -581,15 +608,26 @@ const ExperimentComparison = ({
             </thead>
             <tbody className="divide-y divide-gray-100">
               {ordered.map((run) => (
-                <RunRow
-                  key={`${run.agent_name}:${run.session_key}`}
-                  run={run}
-                  isWinner={
-                    ranking.winner?.agent_name === run.agent_name &&
-                    ranking.winner?.session_key === run.session_key
-                  }
-                  onVerdict={onVerdict}
-                />
+                <React.Fragment key={`${run.agent_name}:${run.session_key}`}>
+                  <RunRow
+                    run={run}
+                    isWinner={
+                      ranking.winner?.agent_name === run.agent_name &&
+                      ranking.winner?.session_key === run.session_key
+                    }
+                    onVerdict={onVerdict}
+                    selected={selectedKey === `${run.agent_name}::${run.session_key}`}
+                    onSelect={(selected) => setSelectedKey((current) => {
+                      const key = `${selected.agent_name}::${selected.session_key}`;
+                      return current === key ? null : key;
+                    })}
+                  />
+                  {selectedKey === `${run.agent_name}::${run.session_key}` && (
+                    <tr><td colSpan={COLUMNS.length}>
+                      <RunDetail run={run} calls={selectRunCalls(metricsForDetail, run, grouping)} tools={breakdownTools} />
+                    </td></tr>
+                  )}
+                </React.Fragment>
               ))}
             </tbody>
           </table>

@@ -120,7 +120,11 @@ const TrafficView = () => {
   const [query, setQuery] = useState('');
   const [page, setPage] = useState(0);
   const [loading, setLoading] = useState(false);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [selectedId, setSelectedId] = useState<number | null>(() => {
+    const raw = new URLSearchParams(window.location.search).get("task");
+    const parsed = raw === null ? NaN : Number(raw);
+    return Number.isInteger(parsed) ? parsed : null;
+  });
   const [traffic, setTraffic] = useState<TaskTraffic | null>(null);
   const [trafficLoading, setTrafficLoading] = useState(false);
 
