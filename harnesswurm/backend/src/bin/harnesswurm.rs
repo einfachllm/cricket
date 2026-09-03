@@ -2,7 +2,7 @@
 //! experiment, without asking the agent to send any header it can't send.
 //!
 //! The attribution (agent, experiment, session) is carried in the base URL
-//! itself — the knob env-knob agents expose — and this wrapper is what
+//! itself — the one knob most agents expose: the base URL they call — and this wrapper is what
 //! puts it there. opencode instead takes the same `/r/` URL via
 //! `opencode.json` `provider.options.baseURL` rather than env, so it is
 //! configured by hand (see the README Zero-setup recipes) rather than
@@ -10,7 +10,6 @@
 //!
 //! ```text
 //! harnesswurm run --experiment issue-1284 --agent kilo -- kilo code
-//! harnesswurm run --experiment issue-1284 --agent claude-code -- claude
 //! harnesswurm run --experiment issue-1284 --agent claude-code -- claude -p "Fix the login redirect"
 //! ```
 //!
