@@ -149,4 +149,28 @@ mod tests {
         let cost = table.estimate_cost("mini", "anthropic", 1_000_000, 0, 0, 0).unwrap();
         assert!((cost - 9.0).abs() < 1e-9);
     }
+
+    #[test]
+    fn new_flagship_prefixes_match_dated_variants() {
+        // One dated-variant case per prefix added in the pricing refresh;
+        // the gpt-5-mini case also guards the longest-prefix rule inside
+        // the new GPT-5 family ("gpt-5" alone would price it at 5x).
+        let table = table_with(&[
+            ("claude-opus-5", "anthropic", 5.0, 0.50, 25.0),
+            ("claude-sonnet-5", "anthropic", 2.0, 0.20, 10.0),
+            ("gpt-5", "openai", 1.25, 0.125, 10.0),
+            ("gpt-5-mini", "openai", 0.25, 0.025, 2.0),
+            ("gpt-5-nano", "openai", 0.05, 0.005, 0.40),
+        ]);
+        for (dated_id, provider, expected) in [
+            ("claude-opus-5-20251101", "anthropic", 5.0),
+            ("claude-sonnet-5-20251101", "anthropic", 2.0),
+            ("gpt-5-2025-08-07", "openai", 1.25),
+            ("gpt-5-mini-2025-08-07", "openai", 0.25),
+            ("gpt-5-nano-2025-08-07", "openai", 0.05),
+        ] {
+            let cost = table.estimate_cost(dated_id, provider, 1_000_000, 0, 0, 0).unwrap();
+            assert!((cost - expected).abs() < 1e-9, "{dated_id}");
+        }
+    }
 }
