@@ -17,7 +17,15 @@ export function resetApiBaseForTests(): void {
 }
 
 function envApiBase(): string | null {
-  const viaVite = (import.meta as any)?.env?.VITE_HARNESSWURM_API_BASE as string | undefined;
+  // Two spellings, one variable, because no single access form works
+  // everywhere: Vite (dev and build) serves the value on `import.meta.env`,
+  // while under Vitest `vi.stubEnv` writes `process.env` and the
+  // `import.meta.env` snapshot there does not see the stub. `globalThis`
+  // keeps the Node spelling out of the browser's type-checkable surface —
+  // there is no `process` in a webview, so the lookup is simply undefined.
+  const viaImportMeta = (import.meta as any).env?.VITE_HARNESSWURM_API_BASE as string | undefined;
+  const viaProcess = (globalThis as any)?.process?.env?.VITE_HARNESSWURM_API_BASE as string | undefined;
+  const viaVite = viaImportMeta ?? viaProcess;
   return viaVite && viaVite.length > 0 ? viaVite : null;
 }
 
@@ -90,6 +98,12 @@ export interface SessionSummary {
   requests_limit: number | null;
   tokens_remaining: number | null;
   tokens_limit: number | null;
+  /// Present when the proxy's waste detector saw this session burning calls
+  /// without progress — the same tool call with identical arguments repeated,
+  /// or the same failure coming back unchanged. Optional so fixtures and
+  /// older payloads stay valid; a session without waste simply omits them.
+  waste_kind?: string | null;
+  waste_detail?: string | null;
 }
 
 /// Whether a run actually solved what it was given. Nothing in the proxied

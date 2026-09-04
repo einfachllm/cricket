@@ -1,6 +1,7 @@
 use sqlx::{sqlite::SqlitePool, Row};
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 use crate::rate_limits::RateLimitSnapshot;
 use crate::session_state::{self, LastCall, STATUS_IN_FLIGHT, STATUS_INTERRUPTED};
@@ -22,6 +23,15 @@ pub struct TaskOutcome {
     /// Wall-clock time until the response was fully consumed. Only this
     /// number answers "how long was the agent actually blocked" on a stream.
     pub duration_ms: Option<i64>,
+}
+
+/// One tool invocation from a response, in the order it appeared. `args_hash`
+/// fingerprints the arguments so identical repeat calls are recognisable in
+/// the session history; None when the arguments were missing or unreadable.
+#[derive(Debug, Clone)]
+pub struct RecordedToolCall {
+    pub name: String,
+    pub args_hash: Option<String>,
 }
 
 /// How many recent quota readings to fold when answering "what are my
@@ -241,6 +251,21 @@ impl Database {
                 tool_name TEXT NOT NULL,
                 call_count INTEGER NOT NULL,
                 PRIMARY KEY (task_id, tool_name),
+                FOREIGN KEY(task_id) REFERENCES tasks(id)
+            );"
+        ).execute(&pool).await?;
+
+        // The same invocations in response order, with an argument
+        // fingerprint, so the session view can tell "grepping five
+        // different patterns" from "grepping the same pattern five times".
+        // `task_tools` above stays aggregated because the breakdown only
+        // ever asks it for totals.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS task_tool_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                tool_name TEXT NOT NULL,
+                args_hash TEXT,
                 FOREIGN KEY(task_id) REFERENCES tasks(id)
             );"
         ).execute(&pool).await?;
@@ -546,6 +571,24 @@ impl Database {
             .bind(task_id)
             .bind(name)
             .bind(count)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// The ordered twin of `save_tool_calls`: one row per invocation, in
+    /// response order, carrying the argument fingerprint the waste detector
+    /// matches on. Insertion order is the sequence — `id` is read back in.
+    pub async fn save_tool_call_sequence(&self, task_id: i64, tools: &[RecordedToolCall]) -> Result<()> {
+        for tool in tools {
+            sqlx::query(
+                "INSERT INTO task_tool_calls (task_id, tool_name, args_hash) VALUES (?, ?, ?)"
+            )
+            .bind(task_id)
+            .bind(&tool.name)
+            .bind(&tool.args_hash)
             .execute(&self.pool)
             .await?;
         }
@@ -1282,6 +1325,7 @@ impl Database {
                 GROUP BY agent_id, session_id
              )
              SELECT
+                agg.agent_id AS agent_id,
                 a.name AS agent_name,
                 agg.session_id AS session_id,
                 agg.call_count AS call_count,
@@ -1326,6 +1370,15 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
+        // Waste detection needs more than the last call — it looks for
+        // repetition across the session's recent history — so the tail of
+        // every paged session is fetched alongside the page itself.
+        let page_ids: Vec<i64> = rows
+            .iter()
+            .map(|row| row.get::<i64, _>("last_task_id"))
+            .collect();
+        let history = self.get_recent_call_history(&page_ids).await?;
+
         let sessions = rows.iter().map(|row| {
             let last_call = LastCall {
                 status: row.get::<Option<String>, _>("last_status"),
@@ -1346,14 +1399,24 @@ impl Database {
                 .get::<Option<i64>, _>("dismissed_up_to_task_id")
                 .is_some_and(|marker| marker >= row.get::<i64, _>("last_task_id"));
 
+            let key = (
+                row.get::<i64, _>("agent_id"),
+                row.get::<Option<String>, _>("session_id"),
+            );
+            let waste = history
+                .get(&key)
+                .and_then(|calls| session_state::detect_waste(calls));
+
             json!({
                 "agent_name": row.get::<String, _>("agent_name"),
                 "session_id": row.get::<Option<String>, _>("session_id"),
                 "state": state.state,
                 "state_label": state.label,
                 "state_detail": state.detail,
-                "needs_attention": state.needs_attention && !dismissed,
+                "needs_attention": (state.needs_attention || waste.is_some()) && !dismissed,
                 "dismissed": dismissed,
+                "waste_kind": waste.as_ref().map(|w| w.kind),
+                "waste_detail": waste.as_ref().map(|w| w.detail.clone()),
                 "call_count": row.get::<i64, _>("call_count"),
                 "first_seen": row.get::<Option<String>, _>("first_seen"),
                 "last_seen": row.get::<Option<String>, _>("last_seen"),
@@ -1381,6 +1444,85 @@ impl Database {
         }).collect();
 
         Ok(sessions)
+    }
+
+    /// The tail of each paged session's call history, oldest first, with the
+    /// tool fingerprints the waste detector matches on. Keyed by
+    /// `(agent_id, session_id)`; a missing key just means no history.
+    ///
+    /// One query for the whole page rather than one per session: this runs
+    /// on every poll. `page` holds each session's newest task id, which
+    /// yields the `(agent_id, session_id)` pairs without a row-value IN —
+    /// whose equality semantics would silently drop NULL session ids.
+    async fn get_recent_call_history(
+        &self,
+        page: &[i64],
+    ) -> Result<HashMap<(i64, Option<String>), Vec<session_state::RecentCall>>> {
+        let mut history = HashMap::new();
+        if page.is_empty() {
+            return Ok(history);
+        }
+
+        let placeholders = vec!["?"; page.len()].join(",");
+        let sql = format!(
+            r#"
+            WITH page AS (
+                SELECT agent_id, session_id FROM tasks WHERE id IN ({placeholders})
+            ),
+            recent AS (
+                SELECT t.id, t.agent_id, t.session_id, t.status, t.error_type, t.error_message,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY t.agent_id, t.session_id ORDER BY t.id DESC
+                       ) AS rn
+                FROM tasks t
+                JOIN page p ON t.agent_id = p.agent_id AND t.session_id IS p.session_id
+            )
+            SELECT r.id AS task_id, r.agent_id, r.session_id,
+                   r.status, r.error_type, r.error_message,
+                   ttc.tool_name, ttc.args_hash
+            FROM recent r
+            LEFT JOIN task_tool_calls ttc ON ttc.task_id = r.id
+            WHERE r.rn <= {window}
+            ORDER BY r.agent_id, r.session_id, r.id, ttc.id
+            "#,
+            window = session_state::RECENT_CALL_WINDOW,
+        );
+        let mut query = sqlx::query(&sql);
+        for task_id in page {
+            query = query.bind(task_id);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+
+        // Rows arrive grouped by session and ascending by (task id, tool
+        // row), so a new database call is exactly a change of task id.
+        let mut last_key: Option<(i64, Option<String>)> = None;
+        let mut last_task_id: Option<i64> = None;
+        for row in rows {
+            let key = (
+                row.get::<i64, _>("agent_id"),
+                row.get::<Option<String>, _>("session_id"),
+            );
+            let task_id = row.get::<i64, _>("task_id");
+            if last_key.as_ref() != Some(&key) || last_task_id != Some(task_id) {
+                history.entry(key.clone()).or_default().push(session_state::RecentCall {
+                    status: row.get::<Option<String>, _>("status"),
+                    error_type: row.get::<Option<String>, _>("error_type"),
+                    error_message: row.get::<Option<String>, _>("error_message"),
+                    tool_calls: Vec::new(),
+                });
+                last_key = Some(key);
+                last_task_id = Some(task_id);
+            }
+            if let Some(name) = row.get::<Option<String>, _>("tool_name") {
+                let call = history.get_mut(last_key.as_ref().unwrap()).unwrap().last_mut().unwrap();
+                call.tool_calls.push(session_state::ToolFingerprint {
+                    name,
+                    args_hash: row.get::<Option<String>, _>("args_hash"),
+                });
+            }
+        }
+
+        Ok(history)
     }
 
     /// The current quota picture per provider. Rate-limit headers arrive on
@@ -1956,6 +2098,56 @@ mod tests {
         assert_eq!(tasks[0]["http_status"], 401);
         assert_eq!(tasks[0]["error_type"], "authentication_error");
         assert_eq!(tasks[0]["duration_ms"], 95);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_repeating_tool_loop_flags_the_session_for_attention() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let agent_id = db.get_or_create_agent("kilo").await?;
+
+        // Three turns, each grepping the exact same pattern — no progress.
+        for _ in 0..3 {
+            let task_id = db.create_task(agent_id, None, None, Some("s1".to_string()), None, None).await?;
+            db.finish_task(task_id, &ok_outcome("tool_use", false)).await?;
+            db.save_tool_call_sequence(task_id, &[
+                RecordedToolCall { name: "grep".to_string(), args_hash: Some("aaaa".to_string()) },
+            ]).await?;
+        }
+
+        let sessions = db.get_sessions(10).await?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["needs_attention"], true, "a loop wants a human to look");
+        assert_eq!(sessions[0]["waste_kind"], "tool_loop");
+        assert!(sessions[0]["waste_detail"].as_str().unwrap().contains("`grep` called 3×"));
+
+        // Dismissing quiets it like any other attention state.
+        db.dismiss_session("kilo", Some("s1")).await?;
+        let sessions = db.get_sessions(10).await?;
+        assert_eq!(sessions[0]["needs_attention"], false);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordinary_tool_use_does_not_flag_the_session() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let agent_id = db.get_or_create_agent("kilo").await?;
+
+        // The same tool, but every call on fresh arguments: exploration.
+        for pattern in ["a", "b", "c"] {
+            let task_id = db.create_task(agent_id, None, None, Some("s1".to_string()), None, None).await?;
+            db.finish_task(task_id, &ok_outcome("tool_use", false)).await?;
+            db.save_tool_call_sequence(task_id, &[
+                RecordedToolCall { name: "grep".to_string(), args_hash: Some(pattern.to_string()) },
+            ]).await?;
+        }
+
+        let sessions = db.get_sessions(10).await?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["needs_attention"], false);
+        assert!(sessions[0]["waste_kind"].is_null());
 
         Ok(())
     }

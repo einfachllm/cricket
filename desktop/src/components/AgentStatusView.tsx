@@ -13,6 +13,7 @@ import {
   Loader2,
   MessageCircleQuestion,
   Moon,
+  Repeat,
   Scissors,
   Trash2,
   Wifi,
@@ -222,6 +223,13 @@ function SessionCard({ session }: { session: SessionSummary }) {
       {session.state_detail && (
         <p className={`text-xs leading-relaxed ${session.needs_attention ? 'text-slate-100' : 'text-slate-400'}`}>
           {session.state_detail}
+        </p>
+      )}
+
+      {session.waste_detail && (
+        <p className="flex items-start gap-1.5 text-xs text-amber-300">
+          <Repeat size={12} className="mt-0.5 shrink-0" />
+          {session.waste_detail}
         </p>
       )}
 

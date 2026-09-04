@@ -24,7 +24,7 @@ pub mod providers;
 pub mod rate_limits;
 pub mod session_state;
 
-use db::TaskOutcome;
+use db::{RecordedToolCall, TaskOutcome};
 use providers::{ApiStyle, ProviderTable, WireApi};
 
 /// Capacity of the live-event fan-out. A slow dashboard that falls this far
@@ -1354,29 +1354,74 @@ fn turn_awaits_human(stop_reason: Option<&str>, has_question: bool) -> bool {
     has_question || matches!(stop_reason, Some("end_turn") | Some("stop"))
 }
 
-/// Every tool name a unary response called, in order and with repeats kept
+/// Stable 64-bit FNV-1a. `std`'s hasher is ruled out on purpose: these
+/// hashes live in the database and are compared across app versions, so the
+/// same arguments must hash the same forever.
+fn fnv1a(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Canonical bytes for a parsed argument object. serde_json maps are
+/// key-sorted, so the same arguments hash identically however the model
+/// ordered the keys.
+fn hash_args_value(value: &Value) -> String {
+    fnv1a(value.to_string().as_bytes())
+}
+
+/// Fingerprints an argument string the way the wire carries it (OpenAI and
+/// Responses style). Unparseable arguments fall back to the raw string —
+/// still deterministic — and empty arguments hash to None, because a
+/// missing fingerprint must mean "nothing to compare", not "empty call".
+fn hash_args_str(raw: &str) -> Option<String> {
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(match serde_json::from_str::<Value>(raw) {
+        Ok(value) => hash_args_value(&value),
+        Err(_) => fnv1a(raw.as_bytes()),
+    })
+}
+
+/// Every tool call a unary response made, in order and with repeats kept
 /// — the same tool twice in one turn is two calls, and the attribution in
-/// `get_experiment_tool_usage` depends on that count being right.
+/// `get_experiment_tool_usage` depends on that count being right. Each
+/// invocation also carries an argument fingerprint, because the session
+/// waste detector matches on this sequence.
 ///
 /// Unnamed tool calls are skipped rather than recorded as an empty name: a
 /// malformed fragment should not become a phantom tool in the breakdown.
-fn extract_tool_names(wire: WireApi, json: &Value) -> Vec<String> {
-    let names: Vec<&str> = match wire {
+fn extract_tool_calls(wire: WireApi, json: &Value) -> Vec<RecordedToolCall> {
+    fn record(name: &str, args_hash: Option<String>) -> RecordedToolCall {
+        RecordedToolCall { name: name.to_string(), args_hash }
+    }
+    match wire {
         WireApi::OpenAi => json["choices"][0]["message"]["tool_calls"].as_array().map(|calls| {
-            calls.iter().filter_map(|tc| tc["function"]["name"].as_str()).collect()
+            calls.iter().filter_map(|tc| {
+                let name = tc["function"]["name"].as_str()?;
+                Some(record(name, hash_args_str(tc["function"]["arguments"].as_str().unwrap_or(""))))
+            }).collect()
         }),
         WireApi::Anthropic => json["content"].as_array().map(|blocks| {
             blocks.iter()
                 .filter(|b| b["type"] == "tool_use")
-                .filter_map(|b| b["name"].as_str())
+                .filter_map(|b| {
+                    let name = b["name"].as_str()?;
+                    Some(record(name, Some(hash_args_value(&b["input"]))))
+                })
                 .collect()
         }),
         WireApi::Responses => json["output"].as_array().map(|items| {
-            items.iter().filter_map(responses_tool_name).collect()
+            items.iter().filter_map(|item| {
+                let name = responses_tool_name(item)?;
+                Some(record(name, hash_args_str(item["arguments"].as_str().unwrap_or(""))))
+            }).collect()
         }),
-    }.unwrap_or_default();
-
-    names.into_iter().map(String::from).collect()
+    }.unwrap_or_default()
 }
 
 /// Scans the same tool-calls/content a response already carries for one
@@ -1455,14 +1500,16 @@ async fn handle_unary(
         .map(extract_error_details)
         .unwrap_or((None, None));
 
-    let tool_names = parsed_response.as_ref()
-        .map(|json| extract_tool_names(wire, json))
+    let tool_calls = parsed_response.as_ref()
+        .map(|json| extract_tool_calls(wire, json))
         .unwrap_or_default();
 
     let response_text = String::from_utf8_lossy(&res_bytes).to_string();
     let _ = state.db.save_traffic_response(task_id, &response_text).await;
-    if !tool_names.is_empty() {
-        let _ = state.db.save_tool_calls(task_id, &tool_names).await;
+    if !tool_calls.is_empty() {
+        let names: Vec<String> = tool_calls.iter().map(|tc| tc.name.clone()).collect();
+        let _ = state.db.save_tool_calls(task_id, &names).await;
+        let _ = state.db.save_tool_call_sequence(task_id, &tool_calls).await;
     }
     if let Some((tool, text)) = &agent_question {
         let _ = state.db.save_agent_question(task_id, tool, text).await;
@@ -1536,10 +1583,14 @@ struct StreamAccumulator {
 
 impl StreamAccumulator {
     /// Every tool the stream named, in first-seen order and with repeats
-    /// kept. A fragment whose name never arrived is dropped rather than
-    /// recorded blank — see `extract_tool_names` for the unary twin.
-    fn tool_names(&self) -> Vec<String> {
-        self.tool_calls.iter().filter_map(|(_, acc)| acc.name.clone()).collect()
+    /// kept, each fingerprinted from its accumulated arguments. A fragment
+    /// whose name never arrived is dropped rather than recorded blank — see
+    /// `extract_tool_calls` for the unary twin.
+    fn tool_records(&self) -> Vec<RecordedToolCall> {
+        self.tool_calls.iter().filter_map(|(_, acc)| {
+            let name = acc.name.clone()?;
+            Some(RecordedToolCall { name, args_hash: hash_args_str(&acc.arguments) })
+        }).collect()
     }
 
     /// Reconstructs the question the agent asked, if it asked one.
@@ -1849,9 +1900,11 @@ async fn handle_streaming(
             cost,
         ).await;
         let _ = state.db.save_traffic_response(task_id, &raw_text).await;
-        let tool_names = acc.tool_names();
-        if !tool_names.is_empty() {
-            let _ = state.db.save_tool_calls(task_id, &tool_names).await;
+        let tool_calls = acc.tool_records();
+        if !tool_calls.is_empty() {
+            let names: Vec<String> = tool_calls.iter().map(|tc| tc.name.clone()).collect();
+            let _ = state.db.save_tool_calls(task_id, &names).await;
+            let _ = state.db.save_tool_call_sequence(task_id, &tool_calls).await;
         }
         if let Some((tool, text)) = &agent_question {
             let _ = state.db.save_agent_question(task_id, tool, text).await;
@@ -2235,8 +2288,12 @@ mod tests {
         assert_eq!(usage.tool_calls_count, 2);
     }
 
+    fn tool_call_names(calls: &[RecordedToolCall]) -> Vec<String> {
+        calls.iter().map(|tc| tc.name.clone()).collect()
+    }
+
     #[test]
-    fn unary_tool_names_keep_repeats_from_either_provider() {
+    fn unary_tool_calls_keep_repeats_from_either_provider() {
         let openai: Value = serde_json::from_str(r#"{
             "choices": [{"message": {"tool_calls": [
                 {"function": {"name": "read_file"}},
@@ -2245,7 +2302,7 @@ mod tests {
             ]}}]
         }"#).unwrap();
         assert_eq!(
-            extract_tool_names(WireApi::OpenAi, &openai),
+            tool_call_names(&extract_tool_calls(WireApi::OpenAi, &openai)),
             vec!["read_file", "read_file", "bash"],
         );
 
@@ -2257,31 +2314,51 @@ mod tests {
             ]
         }"#).unwrap();
         assert_eq!(
-            extract_tool_names(WireApi::Anthropic, &anthropic),
+            tool_call_names(&extract_tool_calls(WireApi::Anthropic, &anthropic)),
             vec!["read_file", "read_file"],
         );
     }
 
     #[test]
-    fn unary_tool_names_skip_calls_that_never_named_a_tool() {
+    fn identical_arguments_fingerprint_alike_and_differing_ones_do_not() {
+        // The waste detector's whole premise: the same call is recognisable
+        // across turns, differently-argumented calls are not confused with it.
+        let openai: Value = serde_json::from_str(r#"{
+            "choices": [{"message": {"tool_calls": [
+                {"function": {"name": "grep", "arguments": "{\"pattern\":\"foo\"}"}},
+                {"function": {"name": "grep", "arguments": "{ \"pattern\": \"foo\" }"}},
+                {"function": {"name": "grep", "arguments": "{\"pattern\":\"bar\"}"}},
+                {"function": {"name": "grep"}}
+            ]}}]
+        }"#).unwrap();
+        let calls = extract_tool_calls(WireApi::OpenAi, &openai);
+        assert_eq!(calls[0].args_hash, calls[1].args_hash, "key order and spacing must not matter");
+        assert_ne!(calls[0].args_hash, calls[2].args_hash, "different arguments must differ");
+        assert_eq!(calls[3].args_hash, None, "missing arguments carry no fingerprint");
+    }
+
+    #[test]
+    fn unary_tool_calls_skip_calls_that_never_named_a_tool() {
         let json: Value = serde_json::from_str(r#"{
             "choices": [{"message": {"tool_calls": [
                 {"function": {"arguments": "{}"}},
-                {"function": {"name": "bash"}}
+                {"function": {"name": "bash", "arguments": "{}"}}
             ]}}]
         }"#).unwrap();
-        assert_eq!(extract_tool_names(WireApi::OpenAi, &json), vec!["bash"]);
+        let calls = extract_tool_calls(WireApi::OpenAi, &json);
+        assert_eq!(tool_call_names(&calls), vec!["bash"]);
+        assert!(calls[0].args_hash.is_some(), "empty-object arguments still fingerprint");
     }
 
     #[test]
     fn a_response_with_no_tools_names_none() {
         let json: Value = serde_json::from_str(r#"{"choices": [{"message": {"content": "done"}}]}"#).unwrap();
-        assert!(extract_tool_names(WireApi::OpenAi, &json).is_empty());
-        assert!(extract_tool_names(WireApi::Anthropic, &json).is_empty());
+        assert!(extract_tool_calls(WireApi::OpenAi, &json).is_empty());
+        assert!(extract_tool_calls(WireApi::Anthropic, &json).is_empty());
     }
 
     #[test]
-    fn streamed_tool_names_come_from_the_accumulated_fragments() {
+    fn streamed_tool_calls_come_from_the_accumulated_fragments() {
         let mut acc = StreamAccumulator::default();
         for chunk in [
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\"}}]}}]}\n\n",
@@ -2290,7 +2367,7 @@ mod tests {
             acc.feed_chunk(WireApi::OpenAi, chunk);
         }
 
-        assert_eq!(acc.tool_names(), vec!["read_file", "bash"]);
+        assert_eq!(tool_call_names(&acc.tool_records()), vec!["read_file", "bash"]);
     }
 
     #[test]
@@ -2675,10 +2752,12 @@ mod tests {
         // Same shell twice is two calls; a function_call without a name is
         // skipped rather than becoming a phantom tool; the built-in search
         // is named by its type.
+        let calls = extract_tool_calls(WireApi::Responses, &json);
         assert_eq!(
-            extract_tool_names(WireApi::Responses, &json),
+            tool_call_names(&calls),
             vec!["shell", "web_search_call", "shell"],
         );
+        assert_ne!(calls[0].args_hash, calls[2].args_hash, "same tool, different arguments");
         let usage = extract_usage(WireApi::Responses, &json);
         assert_eq!(usage.tool_calls_count, 3);
     }
@@ -2763,7 +2842,7 @@ mod tests {
         );
 
         assert!(acc.saw_terminal);
-        assert_eq!(acc.tool_names(), vec!["AskUserQuestion", "shell"]);
+        assert_eq!(tool_call_names(&acc.tool_records()), vec!["AskUserQuestion", "shell"]);
         assert_eq!(acc.usage.tool_calls_count, 2);
         assert_eq!(acc.usage.prompt_tokens, 40);
 

@@ -7,8 +7,8 @@
 //! same loop — send a turn, either get tool calls back (and go run them) or
 //! get a plain answer back (and hand control to the human).
 //!
-//! Kept separate from the DB and HTTP layers so the rules are one pure
-//! function that can be tested without a database or a provider.
+//! Kept separate from the DB and HTTP layers so the rules are pure
+//! functions that can be tested without a database or a provider.
 
 use serde::Serialize;
 
@@ -90,6 +90,148 @@ pub fn humanize_secs(secs: i64) -> String {
 
 fn is_tool_stop(stop_reason: Option<&str>) -> bool {
     matches!(stop_reason, Some("tool_use") | Some("tool_calls"))
+}
+
+/// One recorded tool invocation: what was called, plus a fingerprint of the
+/// arguments it was called with. The fingerprint is what separates "the
+/// agent grepping five different patterns" (normal exploration) from "the
+/// agent grepping the same pattern five times" (a loop). Null for rows
+/// recorded before fingerprints existed — those never match, so legacy
+/// history stays silent rather than crying wolf.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolFingerprint {
+    pub name: String,
+    pub args_hash: Option<String>,
+}
+
+/// The tail of one session's call history, oldest first — enough context
+/// for `detect_waste` to see repetition across calls.
+#[derive(Debug, Clone, Default)]
+pub struct RecentCall {
+    pub status: Option<String>,
+    pub error_type: Option<String>,
+    pub error_message: Option<String>,
+    pub tool_calls: Vec<ToolFingerprint>,
+}
+
+/// A detected pattern that burns calls without making progress. Surfaced on
+/// the session card and folded into the attention badge: nobody watches an
+/// agent spin, that is exactly what the sidecar is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasteSignal {
+    /// Machine-readable kind: `tool_loop` or `error_loop`.
+    pub kind: &'static str,
+    /// What a human reads on the session card.
+    pub detail: String,
+}
+
+/// How many recent calls per session feed the detector. Generous enough to
+/// cover the longest cycle below with room for interleaved noise.
+pub const RECENT_CALL_WINDOW: i64 = 12;
+
+/// Identical failures needed before the same error is called a loop. Two is
+/// how a normal retry looks; three in a row with the very same message means
+/// nothing is changing between attempts.
+const ERROR_LOOP_MIN: usize = 3;
+
+/// The shortest repeating cycle searched for. Beyond period 3 a "loop" is
+/// indistinguishable from an ordinary plan.
+const TOOL_LOOP_MAX_PERIOD: usize = 3;
+
+/// A cycle must repeat this many times to count. Three reads of the same
+/// file with the same arguments in a row is already waste; anything shorter
+/// is how agents normally double-check.
+const TOOL_LOOP_REPS: usize = 3;
+
+fn same_failed_call(a: &RecentCall, b: &RecentCall) -> bool {
+    a.status.as_deref() == Some(STATUS_ERROR)
+        && b.status.as_deref() == Some(STATUS_ERROR)
+        && a.error_type == b.error_type
+        && a.error_message == b.error_message
+}
+
+fn fingerprint_eq(a: &ToolFingerprint, b: &ToolFingerprint) -> bool {
+    a.name == b.name && a.args_hash.is_some() && a.args_hash == b.args_hash
+}
+
+/// Detects calls spent without progress, from the session's recent history.
+///
+/// Two patterns, checked in order:
+///
+/// - **Error loop** — a trailing run of identical failures. Trailing only:
+///   if the newest call succeeded, whatever loop came before it is broken.
+/// - **Tool loop** — the shortest suffix of the flattened tool sequence
+///   (oldest to newest) that repeats the same fingerprint cycle three
+///   times. Exact fingerprints only, so repeated tool *names* with fresh
+///   arguments stay normal work.
+pub fn detect_waste(calls: &[RecentCall]) -> Option<WasteSignal> {
+    let failures = calls
+        .iter()
+        .rev()
+        .take_while(|call| call.status.as_deref() == Some(STATUS_ERROR))
+        .count();
+    if failures >= ERROR_LOOP_MIN {
+        // Every call in the trailing run matches the last one by
+        // `same_failed_call`, which chains transitively from the newest.
+        let newest = &calls[calls.len() - 1];
+        let all_same = calls[calls.len() - failures..]
+            .iter()
+            .all(|call| same_failed_call(call, newest));
+        if all_same {
+            return Some(WasteSignal {
+                kind: "error_loop",
+                detail: format!(
+                    "The last {failures} calls all failed with the same error{} — retrying is not fixing it",
+                    newest
+                        .error_type
+                        .as_deref()
+                        .map(|t| format!(" ({t})"))
+                        .unwrap_or_default()
+                ),
+            });
+        }
+    }
+
+    let mut fingerprints: Vec<&ToolFingerprint> =
+        calls.iter().flat_map(|call| call.tool_calls.iter()).collect();
+    if fingerprints.len() > RECENT_CALL_WINDOW as usize * TOOL_LOOP_MAX_PERIOD {
+        fingerprints = fingerprints.split_off(fingerprints.len() - RECENT_CALL_WINDOW as usize * TOOL_LOOP_MAX_PERIOD);
+    }
+
+    for period in 1..=TOOL_LOOP_MAX_PERIOD {
+        let needed = period * TOOL_LOOP_REPS;
+        if fingerprints.len() < needed {
+            continue;
+        }
+        let tail_start = fingerprints.len() - needed;
+        let cycle: Vec<&ToolFingerprint> = fingerprints[tail_start..tail_start + period].to_vec();
+        let repeats = (0..needed).all(|i| fingerprint_eq(fingerprints[tail_start + i], cycle[i % period]));
+        if repeats {
+            let detail = if period == 1 {
+                // Report the whole trailing run, not just the minimum —
+                // five identical calls in a row should not read as three.
+                let run = fingerprints
+                    .iter()
+                    .rev()
+                    .take_while(|f| fingerprint_eq(f, cycle[0]))
+                    .count();
+                format!(
+                    "`{}` called {run}× in a row with identical arguments",
+                    cycle[0].name
+                )
+            } else {
+                format!(
+                    "Repeating the same {}-step cycle {}×: {}",
+                    period,
+                    TOOL_LOOP_REPS,
+                    cycle.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(" → ")
+                )
+            };
+            return Some(WasteSignal { kind: "tool_loop", detail });
+        }
+    }
+
+    None
 }
 
 /// Maps the last call on a session onto a human-facing state.
@@ -357,5 +499,121 @@ mod tests {
         assert_eq!(humanize_secs(3600), "1h");
         assert_eq!(humanize_secs(86_400), "1d");
         assert_eq!(humanize_secs(-3), "just now");
+    }
+
+    fn error_call(message: &str) -> RecentCall {
+        RecentCall {
+            status: Some(STATUS_ERROR.to_string()),
+            error_type: Some("invalid_request_error".to_string()),
+            error_message: Some(message.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn tool_call(name: &str, args: &str) -> RecentCall {
+        RecentCall {
+            status: Some(STATUS_OK.to_string()),
+            tool_calls: vec![ToolFingerprint {
+                name: name.to_string(),
+                args_hash: Some(args.to_string()),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn three_identical_failures_in_a_row_are_an_error_loop() {
+        let calls = vec![error_call("quota blown"), error_call("quota blown"), error_call("quota blown")];
+        let waste = detect_waste(&calls).expect("three identical failures");
+        assert_eq!(waste.kind, "error_loop");
+        assert!(waste.detail.contains("3 calls"));
+        assert!(waste.detail.contains("invalid_request_error"));
+    }
+
+    #[test]
+    fn two_failures_are_just_a_retry() {
+        let calls = vec![error_call("quota blown"), error_call("quota blown")];
+        assert!(detect_waste(&calls).is_none());
+    }
+
+    #[test]
+    fn failures_with_different_messages_are_healthy_iteration() {
+        let calls = vec![
+            error_call("missing field: name"),
+            error_call("missing field: age"),
+            error_call("missing field: email"),
+        ];
+        assert!(detect_waste(&calls).is_none());
+    }
+
+    #[test]
+    fn a_success_after_the_failures_breaks_the_loop() {
+        let calls = vec![
+            error_call("quota blown"),
+            error_call("quota blown"),
+            RecentCall { status: Some(STATUS_OK.to_string()), ..Default::default() },
+        ];
+        assert!(detect_waste(&calls).is_none());
+    }
+
+    #[test]
+    fn rate_limited_retries_are_never_called_a_loop() {
+        // Backing off and retrying a 429 is exactly what the agent should do.
+        let limited = RecentCall { status: Some(STATUS_RATE_LIMITED.to_string()), ..Default::default() };
+        let calls = vec![limited.clone(), limited.clone(), limited];
+        assert!(detect_waste(&calls).is_none());
+    }
+
+    #[test]
+    fn three_identical_tool_calls_are_a_loop() {
+        let calls = vec![tool_call("bash", "ls"), tool_call("bash", "ls"), tool_call("bash", "ls")];
+        let waste = detect_waste(&calls).expect("same command three times");
+        assert_eq!(waste.kind, "tool_loop");
+        assert!(waste.detail.contains("`bash` called 3×"));
+    }
+
+    #[test]
+    fn the_same_tool_with_fresh_arguments_is_normal_work() {
+        let calls = vec![
+            tool_call("grep", "pattern=a"),
+            tool_call("grep", "pattern=b"),
+            tool_call("grep", "pattern=c"),
+        ];
+        assert!(detect_waste(&calls).is_none());
+    }
+
+    #[test]
+    fn an_alternating_two_step_cycle_is_a_loop() {
+        let calls = vec![
+            tool_call("read_file", "f=main.rs"),
+            tool_call("bash", "cargo build"),
+            tool_call("read_file", "f=main.rs"),
+            tool_call("bash", "cargo build"),
+            tool_call("read_file", "f=main.rs"),
+            tool_call("bash", "cargo build"),
+        ];
+        let waste = detect_waste(&calls).expect("read → build × 3");
+        assert_eq!(waste.kind, "tool_loop");
+        assert!(waste.detail.contains("2-step cycle"));
+        assert!(waste.detail.contains("read_file → bash"));
+    }
+
+    #[test]
+    fn fingerprints_without_argument_hashes_never_match() {
+        // Rows recorded before fingerprints existed must stay silent.
+        let legacy = RecentCall {
+            status: Some(STATUS_OK.to_string()),
+            tool_calls: vec![ToolFingerprint { name: "bash".to_string(), args_hash: None }],
+            ..Default::default()
+        };
+        let calls = vec![legacy.clone(), legacy.clone(), legacy];
+        assert!(detect_waste(&calls).is_none());
+    }
+
+    #[test]
+    fn a_short_history_has_nothing_to_repeat() {
+        let calls = vec![tool_call("bash", "ls"), tool_call("bash", "ls")];
+        assert!(detect_waste(&calls).is_none());
+        assert!(detect_waste(&[]).is_none());
     }
 }

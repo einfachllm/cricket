@@ -15,20 +15,11 @@ import {
 } from '../lib/api';
 import { selectRunCalls } from './RunFilters';
 import RunDetail from './RunDetail';
+import { costIsKnown, costPositions, dominatedFailedSpend, runIsFinal, spendBreakdown } from './SpendBreakdown';
 
-/// Whether a run's cost total is the whole story. A run that touched a model
-/// missing from `pricing.yaml` sums to less than it really cost — at the
-/// extreme, to $0.00 — so it must never be ranked against a fully priced one.
-export function costIsKnown(run: RunComparison): boolean {
-  return run.call_count > 0 && run.unpriced_calls === 0;
-}
-
-/// Whether the run is done spending. A run with a call still open has a
-/// running tally, not a total, and ranking it against a finished one would
-/// declare a winner that is still on the clock.
-export function runIsFinal(run: RunComparison): boolean {
-  return run.in_flight_calls === 0;
-}
+// The "cost is known / run is final" predicates live in SpendBreakdown, the
+// module that shares them; re-exported here for the existing importers.
+export { costIsKnown, runIsFinal };
 
 /// Cheapest first, but runs whose cost is only partly known sink to the
 /// bottom rather than winning on an understated total.
@@ -308,6 +299,90 @@ function Headline({ ranking, runCount }: { ranking: Ranking; runCount: number })
   );
 }
 
+/// The experiment's spend cut by outcome, with every counted run placed on
+/// one log-cost strip. This is the cost-vs-outcome picture a resolve count
+/// alone cannot give — the literature's (SWE-Effi's) point being that what
+/// *failing* costs is the number worth watching.
+function SpendCard({
+  runs,
+  winner,
+  spend,
+}: {
+  runs: RunComparison[];
+  winner: RunComparison | null;
+  spend: ReturnType<typeof spendBreakdown>;
+}) {
+  const counted = runs.filter((run) => costIsKnown(run) && runIsFinal(run));
+  const positions = costPositions(counted.map((run) => run.total_cost));
+  const costs = counted.map((run) => run.total_cost);
+  const rows: { verdict: Verdict | null; y: number; label: string; color: string }[] = [
+    { verdict: 'solved', y: 14, label: 'Solved', color: '#34d399' },
+    { verdict: 'failed', y: 30, label: 'Failed', color: '#f87171' },
+    { verdict: null, y: 46, label: 'Unjudged', color: '#94a3b8' },
+  ];
+
+  const dominated = dominatedFailedSpend(runs);
+  const caption =
+    dominated !== null && dominated > 0
+      ? `${formatCost(dominated)} of the failed spend went to runs dearer than the cheapest solve — pure loss.`
+      : spend.failureMultiplier !== null
+        ? `Failed attempts cost ${spend.failureMultiplier.toFixed(1)}× a solved one, on average.`
+        : 'Mark runs solved or failed to see what failing costs you.';
+
+  return (
+    <div className="space-y-3 border-t border-white/5 px-4 py-4">
+      <div className="flex items-baseline justify-between gap-3 flex-wrap">
+        <h3 className="text-base font-semibold text-slate-200">Spend by outcome</h3>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+          <span className="text-emerald-300">Solved {formatCost(spend.solvedSpend)}</span>
+          <span className="text-red-300">Failed {formatCost(spend.failedSpend)}</span>
+          <span className="text-slate-400">Unjudged {formatCost(spend.unjudgedSpend)}</span>
+          <span className="font-semibold text-slate-200">Total {formatCost(spend.totalSpend)}</span>
+        </div>
+      </div>
+
+      <svg
+        viewBox="0 0 300 58"
+        className="w-full"
+        role="img"
+        aria-label="Every run placed by cost on a log scale: solved runs green, failed runs red, unjudged runs grey"
+      >
+        {rows.map(({ label, y }) => (
+          <text key={label} x={2} y={y + 3} fontSize={9} fill="#64748b">{label}</text>
+        ))}
+        {counted.map((run, index) => {
+          const row = rows.find((r) => r.verdict === run.verdict) ?? rows[2];
+          const isWinner =
+            winner !== null && winner.agent_name === run.agent_name && winner.session_key === run.session_key;
+          return (
+            <circle
+              key={`${run.agent_name}:${run.session_key}`}
+              cx={62 + positions[index] * 234}
+              cy={row.y}
+              r={isWinner ? 5 : 4}
+              fill={row.color}
+              fillOpacity={isWinner ? 1 : 0.75}
+              stroke={isWinner ? '#fbbf24' : 'none'}
+              strokeWidth={2}
+            >
+              <title>{`${run.agent_name} · ${run.verdict ?? 'unjudged'} · ${formatCost(run.total_cost)}`}</title>
+            </circle>
+          );
+        })}
+        <text x={62} y={56} fontSize={8} fill="#475569">{formatCost(Math.min(...costs))}</text>
+        <text x={298} y={56} fontSize={8} fill="#475569" textAnchor="end">{formatCost(Math.max(...costs))}</text>
+      </svg>
+
+      <p className="text-xs text-slate-500">{caption}</p>
+      {spend.excludedRuns > 0 && (
+        <p className="text-xs text-slate-600">
+          {spend.excludedRuns} run{spend.excludedRuns === 1 ? '' : 's'} left out — still running, or partly unpriced.
+        </p>
+      )}
+    </div>
+  );
+}
+
 /// Per-agent totals. The headline names the cheapest winning *run*; this is
 /// the question underneath it — which agent is cheaper at this kind of work —
 /// and it is a different answer as soon as an agent needs more than one try.
@@ -546,6 +621,7 @@ const ExperimentComparison = ({
   const ordered = sortRuns(runs);
   const ranking = rankRuns(runs);
   const fragmented = fragmentedAgents(runs);
+  const spend = spendBreakdown(runs);
 
   return (
     <div className="bg-[#151a23] rounded-2xl border border-white/10 overflow-hidden">
@@ -582,6 +658,10 @@ const ExperimentComparison = ({
           <p className="text-sm text-slate-500">Loading runs…</p>
         )}
       </div>
+
+      {ordered.length > 0 && spend.countedRuns > 0 && (
+        <SpendCard runs={ordered} winner={ranking.winner} spend={spend} />
+      )}
 
       {ordered.length > 0 && (
         <div className="overflow-x-auto">

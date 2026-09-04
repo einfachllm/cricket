@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Radio, RefreshCw, X, MessageCircleQuestion } from 'lucide-react';
 import { fetchJson, formatCost, formatTimestampUtc, formatTokens } from '../lib/api';
 import { CollapsibleJson } from './CollapsibleJson';
+import { cacheStats } from './CacheStats';
 
 interface TaskSummary {
   task_id: number;
@@ -99,6 +100,79 @@ export function filterTasks(
         (t.task_description ?? '').toLowerCase().includes(q) ||
         (t.session_id ?? '').toLowerCase().includes(q),
     );
+}
+
+function CacheMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg bg-white/[0.04] px-2 py-1.5">
+      <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-500">{label}</p>
+      <p className="text-sm font-semibold text-slate-100">{value}</p>
+    </div>
+  );
+}
+
+/// The cache story of the calls in view: how much input the provider served
+/// from cache versus read fresh, and how much of every token was context
+/// re-sent rather than output generated. The strongest cost lever there is
+/// — hit-rate gaps between agents reach 2× in effective price — and only a
+/// proxy can see it, because it sits on every call.
+function CachePanel({ tasks }: { tasks: TaskSummary[] }) {
+  const stats = cacheStats(tasks);
+  if (!stats) return null;
+  const { overall } = stats;
+
+  return (
+    <div className="surface space-y-3 p-4">
+      <div className="flex items-baseline justify-between gap-2">
+        <h3 className="text-sm font-semibold text-slate-200">Cache &amp; context</h3>
+        <span className="text-xs text-slate-500">{overall.calls} calls in view</span>
+      </div>
+
+      <div className="grid grid-cols-3 gap-2">
+        <CacheMetric label="Cache hit" value={overall.hitRate === null ? '–' : `${Math.round(overall.hitRate * 100)}%`} />
+        <CacheMetric label="Input share" value={overall.inputShare === null ? '–' : `${Math.round(overall.inputShare * 100)}%`} />
+        <CacheMetric label="Avg context" value={overall.avgInput === null ? '–' : formatTokens(overall.avgInput)} />
+      </div>
+
+      {stats.perAgent.length > 1 && (
+        <div className="space-y-2">
+          {stats.perAgent.map((agent) => {
+            const input = agent.freshInput + agent.cacheCreation + agent.cacheRead;
+            const segments = [
+              { label: 'cache read', color: '#1baf7a', value: agent.cacheRead },
+              { label: 'cache write', color: '#eb6834', value: agent.cacheCreation },
+              { label: 'fresh input', color: '#2a78d6', value: agent.freshInput },
+            ];
+            return (
+              <div key={agent.agent} className="space-y-1">
+                <div className="flex items-baseline justify-between gap-2 text-xs">
+                  <span className="truncate text-slate-300">{agent.agent}</span>
+                  <span className="shrink-0 text-slate-500">
+                    {agent.hitRate === null ? '–' : `${Math.round(agent.hitRate * 100)}%`} cached
+                  </span>
+                </div>
+                <div className="flex h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
+                  {input > 0 && segments.map((segment) => (
+                    <div
+                      key={segment.label}
+                      className="h-full"
+                      style={{ width: `${(segment.value / input) * 100}%`, backgroundColor: segment.color }}
+                      title={`${agent.agent} — ${segment.label}: ${formatTokens(segment.value)} tokens`}
+                    />
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+          <div className="flex items-center gap-3 text-[10px] text-slate-500">
+            <span className="inline-flex items-center gap-1"><span className="h-2 w-2 rounded-sm" style={{ backgroundColor: '#1baf7a' }} /> cache read</span>
+            <span className="inline-flex items-center gap-1"><span className="h-2 w-2 rounded-sm" style={{ backgroundColor: '#eb6834' }} /> cache write</span>
+            <span className="inline-flex items-center gap-1"><span className="h-2 w-2 rounded-sm" style={{ backgroundColor: '#2a78d6' }} /> fresh</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 const TrafficView = () => {
@@ -214,14 +288,16 @@ const TrafficView = () => {
         </div>
       </div>
 
+      <CachePanel tasks={visibleTasks} />
+
       <div className="surface overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="w-full text-sm">
+          <table className="w-full table-fixed text-sm">
             <thead className="bg-white/[0.04] text-slate-500 uppercase text-xs">
               <tr>
-                <th className="text-left px-3 py-2.5 font-semibold">Call</th>
-                <th className="text-left px-3 py-2.5 font-semibold">Status</th>
-                <th className="text-right px-3 py-2.5 font-semibold">Cost</th>
+                <th className="w-[56%] text-left px-3 py-2.5 font-semibold">Call</th>
+                <th className="w-[19%] text-left px-3 py-2.5 font-semibold">Status</th>
+                <th className="w-[25%] text-right px-3 py-2.5 font-semibold">Cost</th>
               </tr>
             </thead>
             <tbody>
@@ -234,25 +310,25 @@ const TrafficView = () => {
                   }`}
                 >
                   <td className="px-3 py-2.5 min-w-0">
-                    <span className="flex items-center gap-1.5 text-slate-300">
+                    <span className="flex items-center gap-1.5 min-w-0 text-slate-300">
                       {task.agent_question_text && (
                         <span title={`Agent asked: ${task.agent_question_text}`} className="shrink-0 text-amber-400">
                           <MessageCircleQuestion size={14} />
                         </span>
                       )}
-                      <span className="truncate" title={task.task_description || ''}>
+                      <span className="min-w-0 flex-1 truncate" title={task.task_description || ''}>
                         {task.task_description || <span className="text-slate-600">–</span>}
                       </span>
                     </span>
-                    <span className="mt-0.5 flex items-center gap-1.5 text-xs text-slate-500">
-                      <span className="font-medium text-slate-400">{task.agent_name}</span>
+                    <span className="mt-0.5 flex items-center gap-1.5 min-w-0 text-xs text-slate-500">
+                      <span className="shrink-0 font-medium text-slate-400">{task.agent_name}</span>
                       <span aria-hidden>·</span>
-                      <span className="truncate font-mono text-xs" title={task.session_id ?? ''}>
+                      <span className="min-w-0 flex-1 truncate font-mono text-xs" title={task.session_id ?? ''}>
                         {task.session_id || <span className="text-slate-600">–</span>}
                       </span>
                     </span>
-                    <span className="mt-0.5 flex items-center gap-1.5 text-[11px] text-slate-600">
-                      <span className="truncate" title={`${task.provider || 'unknown'} · ${task.model_name || 'unknown model'}`}>
+                    <span className="mt-0.5 flex items-center gap-1.5 min-w-0 text-[11px] text-slate-600">
+                      <span className="min-w-0 flex-1 truncate" title={`${task.provider || 'unknown'} · ${task.model_name || 'unknown model'}`}>
                         {task.provider || 'unknown'} · {task.model_name || 'unknown model'}
                       </span>
                       <span aria-hidden>·</span>
