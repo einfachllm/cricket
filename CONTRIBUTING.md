@@ -133,7 +133,8 @@ the rules a coding agent working here has to follow — is in
 - **Commit messages**: a subject under 72 characters in the imperative mood,
   and a body that explains *why* rather than restating the diff. Please leave
   out generated attribution trailers (`Co-Authored-By:` lines for tools,
-  session ids, tool-generated branch names as subjects) — CI rejects them.
+  session ids, tool-generated branch names as subjects). Nothing checks this
+  automatically, so it is on you — a reviewer will ask.
 - **Pull requests**: fill in the template, describe what you changed and how
   you verified it, and end the title with the issue reference `(#NN)` when
   there is one. Keep the PR focused; unrelated fixes belong in their own PR.

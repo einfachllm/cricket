@@ -89,13 +89,13 @@ Desktop (run from `desktop`):
 
 - One branch per task off the latest `origin/main`: `feature/<kebab>` or
   `bugfix/<kebab>`.
-- Full checks before opening a PR: `cargo test`, `cargo clippy --lib
-  --bins`, and in `desktop`: `npm test`, `npm run typecheck`. End the PR
-  title with the issue ref `(#NN)`. Keep addressing review comments until
-  the PR is merged.
+- Full checks before opening a PR: `cargo test --locked`, `python3
+  scripts/clippy_baseline.py`, and in `desktop`: `npm run typecheck`, `npm
+  test`. These are what CI runs on the PR. End the PR title with the issue
+  ref `(#NN)`. Keep addressing review comments until the PR is merged.
 - Commit messages: subject under 72 chars, body explains the why. No agent
   attribution lines (`Co-Authored-By`, session ids, generated branch names
-  as subjects) — CI rejects them.
+  as subjects). Nothing enforces this — it is on you to leave them out.
 
 ## Project learnings
 
