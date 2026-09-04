@@ -209,7 +209,7 @@ describe('AgentStatusView', () => {
     // The refetched run reports dismissed: the chip goes muted, the alarm
     // button disappears, and the "Need you" tile no longer counts it.
     const chip = await screen.findByText('Waiting for you')
-    expect(chip.closest('span')).toHaveClass('bg-gray-100')
+    expect(chip.closest('span')).toHaveClass('bg-white/[0.06]')
     expect(screen.queryByRole('button', { name: /dismiss attention/i })).not.toBeInTheDocument()
     await waitFor(() => {
       const needYou = screen.getByText('Need you').closest('div')!

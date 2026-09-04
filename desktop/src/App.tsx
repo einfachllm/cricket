@@ -39,21 +39,21 @@ function BackendPill() {
   const unreachable = error !== null
   if (unreachable) {
     return (
-      <div className="hidden items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-500 shadow-sm sm:flex">
+      <div className="hidden items-center gap-2 rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-slate-400 sm:flex">
         <span className="h-1.5 w-1.5 rounded-full bg-red-500" /> Backend unreachable
       </div>
     )
   }
   if (loaded) {
     return (
-      <div className="hidden items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-500 shadow-sm sm:flex">
+      <div className="hidden items-center gap-2 rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-slate-400 sm:flex">
         <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> Backend ready
       </div>
     )
   }
   return (
-    <div className="hidden items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-500 shadow-sm sm:flex">
-      <span className="h-1.5 w-1.5 rounded-full bg-slate-400" /> Backend…
+    <div className="hidden items-center gap-2 rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-slate-400 sm:flex">
+      <span className="h-1.5 w-1.5 rounded-full bg-slate-500" /> Backend…
     </div>
   )
 }
@@ -64,7 +64,7 @@ function Layout({ children }: { children: React.ReactNode }) {
   const page = PAGE_META[location.pathname] ?? PAGE_META["/"]
 
   return (
-    <div className="app-shell min-h-screen bg-[#0b0e14] text-slate-950">
+    <div className="app-shell min-h-screen bg-[#0b0e14] text-slate-200">
       <aside className="fixed inset-y-0 left-0 z-20 hidden w-[248px] flex-col border-r border-white/5 bg-[#11131a] px-4 py-5 text-white md:flex">
         <div className="px-2"><Brand /></div>
 
@@ -100,7 +100,7 @@ function Layout({ children }: { children: React.ReactNode }) {
       </aside>
 
       <div className="md:pl-[248px]">
-        <header className="sticky top-0 z-10 flex h-[72px] items-center justify-between border-b border-slate-200/70 bg-[#0b0e14]/90 px-5 backdrop-blur-xl sm:px-8 lg:px-10">
+        <header className="sticky top-0 z-10 flex h-[72px] items-center justify-between border-b border-white/[0.07] bg-[#0b0e14]/90 px-5 backdrop-blur-xl sm:px-8 lg:px-10">
           <div>
             <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-400">{page.eyebrow}</p>
             <h1 className="mt-0.5 text-lg font-semibold tracking-tight text-slate-100">{page.title}</h1>

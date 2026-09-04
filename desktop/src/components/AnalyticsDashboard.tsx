@@ -98,14 +98,14 @@ const AnalyticsDashboard = () => {
     <div className="page-wrap">
       <div className="flex justify-between items-center">
         <h2 className="text-3xl font-bold text-slate-100">Experiment Analytics</h2>
-        <div className="flex gap-4">
-            <div className="bg-blue-100 text-blue-800 px-4 py-2 rounded-lg flex items-center gap-2">
-                <Activity size={20} />
-                <span className="font-semibold">Tasks: {filtered.length}</span>
+        <div className="flex gap-3">
+            <div className="bg-blue-500/10 border border-blue-500/30 text-blue-300 px-4 py-2 rounded-full flex items-center gap-2">
+                <Activity size={16} />
+                <span className="font-semibold text-sm">Tasks: {filtered.length}</span>
             </div>
-            <div className="bg-green-100 text-green-800 px-4 py-2 rounded-lg flex items-center gap-2">
-                <TrendingUp size="20" />
-                <span className="font-semibold">Avg Latency: {Math.round(summary.avgLatency)}ms</span>
+            <div className="bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 px-4 py-2 rounded-full flex items-center gap-2">
+                <TrendingUp size="16" />
+                <span className="font-semibold text-sm">Avg Latency: {Math.round(summary.avgLatency)}ms</span>
             </div>
         </div>
       </div>
@@ -115,7 +115,7 @@ const AnalyticsDashboard = () => {
           <select
             value={filters.agent}
             onChange={(e) => setFilters({ ...filters, agent: e.target.value })}
-            className="ml-2 rounded bg-slate-800 px-2 py-1 text-sm text-slate-200"
+            className="ml-2 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-sm text-slate-200"
           >
             <option value="all">All</option>
             {distinctValues(metrics, "agent_name").map((v) => (
@@ -127,7 +127,7 @@ const AnalyticsDashboard = () => {
           <select
             value={filters.model}
             onChange={(e) => setFilters({ ...filters, model: e.target.value })}
-            className="ml-2 rounded bg-slate-800 px-2 py-1 text-sm text-slate-200"
+            className="ml-2 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-sm text-slate-200"
           >
             <option value="all">All</option>
             {distinctValues(metrics, "model_name").map((v) => (
@@ -139,7 +139,7 @@ const AnalyticsDashboard = () => {
           <select
             value={filters.provider}
             onChange={(e) => setFilters({ ...filters, provider: e.target.value })}
-            className="ml-2 rounded bg-slate-800 px-2 py-1 text-sm text-slate-200"
+            className="ml-2 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-sm text-slate-200"
           >
             <option value="all">All</option>
             {distinctValues(metrics, "provider").map((v) => (
@@ -152,7 +152,7 @@ const AnalyticsDashboard = () => {
             type="date"
             value={filters.from}
             onChange={(e) => setFilters({ ...filters, from: e.target.value })}
-            className="ml-2 rounded bg-slate-800 px-2 py-1 text-sm text-slate-200"
+            className="ml-2 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-sm text-slate-200"
           />
         </label>
         <label className="text-sm text-slate-400">To
@@ -160,12 +160,12 @@ const AnalyticsDashboard = () => {
             type="date"
             value={filters.to}
             onChange={(e) => setFilters({ ...filters, to: e.target.value })}
-            className="ml-2 rounded bg-slate-800 px-2 py-1 text-sm text-slate-200"
+            className="ml-2 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-sm text-slate-200"
           />
         </label>
         <button
           onClick={() => setFilters(EMPTY_FILTERS)}
-          className="rounded bg-slate-800 px-3 py-1 text-sm text-slate-200 hover:bg-slate-700"
+          className="rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-sm text-slate-300 hover:bg-white/[0.08]"
         >
           Clear
         </button>
@@ -173,43 +173,43 @@ const AnalyticsDashboard = () => {
 
       <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
         <Card>
-          <p className="text-sm text-gray-500 uppercase font-semibold">Total Prompt Tokens</p>
-          <p className="text-2xl font-bold text-slate-100">{summary.totalPrompt.toLocaleString()}</p>
+          <p className="text-[10px] text-slate-500 uppercase tracking-[0.14em] font-semibold">Total Prompt Tokens</p>
+          <p className="mt-1 text-2xl font-bold text-slate-100 tabular-nums">{summary.totalPrompt.toLocaleString()}</p>
         </Card>
         <Card>
-          <p className="text-sm text-gray-500 uppercase font-semibold">Total Completion Tokens</p>
-          <p className="text-2xl font-bold text-slate-100">{summary.totalCompletion.toLocaleString()}</p>
+          <p className="text-[10px] text-slate-500 uppercase tracking-[0.14em] font-semibold">Total Completion Tokens</p>
+          <p className="mt-1 text-2xl font-bold text-slate-100 tabular-nums">{summary.totalCompletion.toLocaleString()}</p>
         </Card>
         <Card>
-          <p className="text-sm text-gray-500 uppercase font-semibold flex items-center gap-1">
+          <p className="text-[10px] text-slate-500 uppercase tracking-[0.14em] font-semibold flex items-center gap-1">
             <DollarSign size={14} /> Total Cost
           </p>
-          <p className="text-2xl font-bold text-slate-100">
+          <p className="mt-1 text-2xl font-bold text-slate-100 tabular-nums">
             {formatCost(summary.totalCost)}
           </p>
           {summary.pricedCount < filtered.length && (
-            <p className="text-xs text-gray-400 mt-1">
+            <p className="text-xs text-slate-500 mt-1">
               {filtered.length - summary.pricedCount} task(s) on an unpriced model, excluded
             </p>
           )}
         </Card>
         <Card>
-          <p className="text-sm text-gray-500 uppercase font-semibold">Total Requests</p>
-          <p className="text-2xl font-bold text-slate-100">{filtered.length}</p>
+          <p className="text-[10px] text-slate-500 uppercase tracking-[0.14em] font-semibold">Total Requests</p>
+          <p className="mt-1 text-2xl font-bold text-slate-100 tabular-nums">{filtered.length}</p>
         </Card>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
         <Card className="lg:col-span-1 p-4">
-          <h3 className="text-lg font-semibold mb-4 text-gray-700">Experiments</h3>
+          <h3 className="text-lg font-semibold mb-4 text-slate-200">Experiments</h3>
           <div className="space-y-2">
             {experiments.map((exp) => (
               <div
                 key={exp.id}
                 className={`flex items-center rounded-lg transition-colors ${
                   selectedExperiment === exp.id.toString()
-                    ? 'bg-blue-600 text-white shadow-md'
-                    : 'bg-gray-50 text-slate-500 hover:bg-gray-100'
+                    ? 'bg-indigo-500 text-white shadow-md'
+                    : 'bg-white/[0.04] text-slate-300 hover:bg-white/[0.08]'
                 }`}
               >
                 <button
@@ -223,13 +223,13 @@ const AnalyticsDashboard = () => {
                   onClick={() => removeExperiment(exp)}
                   title="Delete this experiment (its calls stay, ungrouped)"
                   aria-label={`Delete experiment ${exp.name}`}
-                  className="mr-2 p-1.5 rounded-full text-gray-400 hover:text-red-600 hover:bg-white/60 transition-colors"
+                  className="mr-2 p-1.5 rounded-full text-slate-500 hover:text-red-300 hover:bg-white/10 transition-colors"
                 >
                   <Trash2 size={14} />
                 </button>
               </div>
             ))}
-            {experiments.length === 0 && <p className="text-gray-400 text-sm">No experiments found.</p>}
+            {experiments.length === 0 && <p className="text-slate-500 text-sm">No experiments found.</p>}
           </div>
         </Card>
 
@@ -248,21 +248,29 @@ const AnalyticsDashboard = () => {
             <Skeleton className="h-64" />
           ) : metrics.length > 0 ? (
             <div className="h-96 w-full">
-              <h3 className="text-lg font-semibold mb-4 text-gray-700">Token Usage Over Time</h3>
+              <h3 className="text-lg font-semibold mb-4 text-slate-200">Token Usage Over Time</h3>
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={filtered}>
-                  <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(255,255,255,0.07)" />
                   <XAxis
                     dataKey="timestamp"
                     tickFormatter={(tick) => new Date(tick).toLocaleTimeString()}
                     minTickGap={30}
+                    tick={{ fill: '#64748b', fontSize: 11 }}
+                    tickLine={false}
+                    axisLine={{ stroke: 'rgba(255,255,255,0.1)' }}
                   />
-                  <YAxis />
-                  <Tooltip formatter={(value) => Number(value).toLocaleString()} />
-                  <Legend />
-                  <Area type="monotone" dataKey="prompt_tokens" stroke="#3b82f6" fill="#3b82f6" fillOpacity={0.3} strokeWidth={2} dot={false} />
-                  <Area type="monotone" dataKey="completion_tokens" stroke="#10b981" fill="#10b981" fillOpacity={0.3} strokeWidth={2} dot={false} />
-                  <Area type="monotone" dataKey="cache_read_tokens" stroke="#a855f7" fill="#a855f7" fillOpacity={0.3} strokeWidth={2} dot={false} />
+                  <YAxis tick={{ fill: '#64748b', fontSize: 11 }} tickLine={false} axisLine={false} />
+                  <Tooltip
+                    formatter={(value) => Number(value).toLocaleString()}
+                    contentStyle={{ backgroundColor: '#151a23', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 8, color: '#e2e8f0', fontSize: 12 }}
+                    labelStyle={{ color: '#94a3b8' }}
+                    cursor={{ stroke: 'rgba(255,255,255,0.15)' }}
+                  />
+                  <Legend wrapperStyle={{ fontSize: 12 }} />
+                  <Area type="monotone" dataKey="prompt_tokens" stroke="#3b82f6" fill="#3b82f6" fillOpacity={0.25} strokeWidth={2} dot={false} />
+                  <Area type="monotone" dataKey="completion_tokens" stroke="#10b981" fill="#10b981" fillOpacity={0.25} strokeWidth={2} dot={false} />
+                  <Area type="monotone" dataKey="cache_read_tokens" stroke="#a855f7" fill="#a855f7" fillOpacity={0.25} strokeWidth={2} dot={false} />
                 </AreaChart>
               </ResponsiveContainer>
             </div>
@@ -273,15 +281,20 @@ const AnalyticsDashboard = () => {
           {!loading && metrics.length > 0 && (
             <Card>
               <div className="h-96 w-full">
-                <h3 className="text-lg font-semibold mb-4 text-gray-700">Tokens by Model</h3>
+                <h3 className="text-lg font-semibold mb-4 text-slate-200">Tokens by Model</h3>
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={tokensByModel(filtered)} layout="vertical">
-                    <CartesianGrid strokeDasharray="3 3" horizontal={false} />
-                    <XAxis type="number" />
-                    <YAxis type="category" dataKey="model" width={120} />
-                    <Tooltip formatter={(value) => Number(value).toLocaleString()} />
-                    <Legend />
-                    <Bar dataKey="tokens" fill="#3b82f6" />
+                    <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="rgba(255,255,255,0.07)" />
+                    <XAxis type="number" tick={{ fill: '#64748b', fontSize: 11 }} tickLine={false} axisLine={{ stroke: 'rgba(255,255,255,0.1)' }} />
+                    <YAxis type="category" dataKey="model" width={120} tick={{ fill: '#94a3b8', fontSize: 11 }} tickLine={false} axisLine={false} />
+                    <Tooltip
+                      formatter={(value) => Number(value).toLocaleString()}
+                      contentStyle={{ backgroundColor: '#151a23', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 8, color: '#e2e8f0', fontSize: 12 }}
+                      labelStyle={{ color: '#94a3b8' }}
+                      cursor={{ fill: 'rgba(255,255,255,0.05)' }}
+                    />
+                    <Legend wrapperStyle={{ fontSize: 12 }} />
+                    <Bar dataKey="tokens" fill="#3b82f6" radius={[0, 4, 4, 0]} />
                   </BarChart>
                 </ResponsiveContainer>
               </div>

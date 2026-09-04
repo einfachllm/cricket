@@ -47,17 +47,17 @@ interface TaskTraffic {
 /// Per-call outcome, colored so a screen of traffic reads at a glance: red
 /// is a call that failed, amber is one that stopped to ask you something.
 const STATUS_STYLES: Record<string, { color: string; label: string }> = {
-  ok: { color: 'bg-emerald-100 text-emerald-800', label: 'ok' },
-  in_flight: { color: 'bg-blue-100 text-blue-800', label: 'running' },
-  rate_limited: { color: 'bg-red-100 text-red-800', label: 'rate limited' },
-  overloaded: { color: 'bg-orange-100 text-orange-800', label: 'overloaded' },
-  error: { color: 'bg-red-100 text-red-800', label: 'error' },
-  interrupted: { color: 'bg-slate-100 text-slate-700', label: 'cut off' },
+  ok: { color: 'bg-emerald-500/15 text-emerald-300', label: 'ok' },
+  in_flight: { color: 'bg-blue-500/15 text-blue-300', label: 'running' },
+  rate_limited: { color: 'bg-red-500/15 text-red-300', label: 'rate limited' },
+  overloaded: { color: 'bg-orange-400/15 text-orange-300', label: 'overloaded' },
+  error: { color: 'bg-red-500/15 text-red-300', label: 'error' },
+  interrupted: { color: 'bg-slate-400/10 text-slate-300', label: 'cut off' },
 };
 
 function StatusBadge({ task }: { task: TaskSummary }) {
-  if (!task.status) return <span className="text-gray-300">–</span>;
-  const style = STATUS_STYLES[task.status] ?? { color: 'bg-gray-100 text-gray-600', label: task.status };
+  if (!task.status) return <span className="text-slate-600">–</span>;
+  const style = STATUS_STYLES[task.status] ?? { color: 'bg-white/[0.06] text-slate-300', label: task.status };
   // The provider's own message is the fastest way to understand a failure,
   // so it rides along as the tooltip rather than needing a click-through.
   const title = [task.error_type, task.error_message, task.http_status ? `HTTP ${task.http_status}` : null]
@@ -103,10 +103,10 @@ export function filterTasks(
 
 function ProviderBadge({ provider }: { provider: string | null }) {
   const color = provider === 'anthropic'
-    ? 'bg-orange-100 text-orange-800'
+    ? 'bg-orange-400/15 text-orange-300'
     : provider === 'openai'
-      ? 'bg-emerald-100 text-emerald-800'
-      : 'bg-gray-100 text-gray-600';
+      ? 'bg-emerald-500/15 text-emerald-300'
+      : 'bg-white/[0.06] text-slate-400';
   return (
     <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${color}`}>
       {provider || 'unknown'}
@@ -183,8 +183,8 @@ const TrafficView = () => {
   return (
     <div className="page-wrap">
       <div className="flex justify-between items-center">
-        <h2 className="text-3xl font-bold text-gray-800 flex items-center gap-2">
-          <Radio size={28} className="text-blue-600" />
+        <h2 className="text-3xl font-bold text-slate-100 flex items-center gap-2">
+          <Radio size={28} className="text-indigo-400" />
           Traffic
         </h2>
         <div className="flex items-center gap-3">
@@ -192,30 +192,30 @@ const TrafficView = () => {
             value={query}
             onChange={(e) => { setQuery(e.target.value); setPage(0); }}
             placeholder="Search agent or task..."
-            className="border border-gray-200 rounded-lg px-3 py-2 text-sm bg-white"
+            className="border border-white/10 rounded-lg px-3 py-2 text-sm bg-white/[0.04] text-slate-200 placeholder-slate-500"
           />
           <select
             value={agentFilter}
             onChange={(e) => { setAgentFilter(e.target.value); setPage(0); }}
-            className="border border-gray-200 rounded-lg px-3 py-2 text-sm bg-white"
+            className="border border-white/10 rounded-lg px-3 py-2 text-sm bg-white/[0.04] text-slate-200"
           >
             <option value="all">All agents</option>
             {agents.map((a) => (
               <option key={a} value={a}>{a}</option>
             ))}
           </select>
-          <label className="flex items-center gap-2 text-sm text-gray-600 select-none cursor-pointer">
+          <label className="flex items-center gap-2 text-sm text-slate-400 select-none cursor-pointer">
             <input
               type="checkbox"
               checked={questionsOnly}
               onChange={(e) => { setQuestionsOnly(e.target.checked); setPage(0); }}
-              className="rounded border-gray-300"
+              className="rounded border-white/20 bg-white/[0.04]"
             />
             Questions only
           </label>
           <button
             onClick={fetchTasks}
-            className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm bg-white border border-gray-200 hover:bg-gray-50 text-gray-700"
+            className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] text-slate-300"
           >
             <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
             Refresh
@@ -226,7 +226,7 @@ const TrafficView = () => {
       <div className="surface overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
-            <thead className="bg-gray-50 text-gray-500 uppercase text-xs">
+            <thead className="bg-white/[0.04] text-slate-500 uppercase text-xs">
               <tr>
                 <th className="text-left px-4 py-3 font-semibold">Time</th>
                 <th className="text-left px-4 py-3 font-semibold">Agent</th>
@@ -248,63 +248,63 @@ const TrafficView = () => {
                 <tr
                   key={task.task_id}
                   onClick={() => setSelectedId(task.task_id)}
-                  className={`border-t border-gray-100 cursor-pointer hover:bg-blue-50 transition-colors ${
-                    selectedId === task.task_id ? 'bg-blue-50' : ''
+                  className={`border-t border-white/5 cursor-pointer hover:bg-white/[0.03] transition-colors ${
+                    selectedId === task.task_id ? 'bg-indigo-500/10' : ''
                   }`}
                 >
-                  <td className="px-4 py-3 text-gray-500 whitespace-nowrap">
+                  <td className="px-4 py-3 text-slate-500 whitespace-nowrap">
                     {formatTimestampUtc(task.timestamp)}
                   </td>
-                  <td className="px-4 py-3 font-medium text-gray-800">{task.agent_name}</td>
+                  <td className="px-4 py-3 font-medium text-slate-200">{task.agent_name}</td>
                   <td
-                    className="px-4 py-3 text-gray-500 font-mono text-xs max-w-[10rem] truncate"
+                    className="px-4 py-3 text-slate-500 font-mono text-xs max-w-[10rem] truncate"
                     title={task.session_id ?? ''}
                   >
-                    {task.session_id || <span className="text-gray-300">–</span>}
+                    {task.session_id || <span className="text-slate-600">–</span>}
                   </td>
-                  <td className="px-4 py-3 text-gray-600 max-w-xs truncate" title={task.task_description || ''}>
+                  <td className="px-4 py-3 text-slate-400 max-w-xs truncate" title={task.task_description || ''}>
                     <span className="inline-flex items-center gap-1.5 max-w-full">
                       {task.agent_question_text && (
-                        <span title={`Agent asked: ${task.agent_question_text}`} className="shrink-0 text-amber-500">
+                        <span title={`Agent asked: ${task.agent_question_text}`} className="shrink-0 text-amber-400">
                           <MessageCircleQuestion size={14} />
                         </span>
                       )}
                       <span className="truncate">
-                        {task.task_description || <span className="text-gray-300">–</span>}
+                        {task.task_description || <span className="text-slate-600">–</span>}
                       </span>
                     </span>
                   </td>
                   <td className="px-4 py-3"><StatusBadge task={task} /></td>
-                  <td className="px-4 py-3 text-gray-600 font-mono text-xs">{task.model_name || '–'}</td>
+                  <td className="px-4 py-3 text-slate-400 font-mono text-xs">{task.model_name || '–'}</td>
                   <td className="px-4 py-3"><ProviderBadge provider={task.provider} /></td>
-                  <td className="px-4 py-3 text-right text-gray-700">{(task.prompt_tokens ?? 0).toLocaleString()}</td>
-                  <td className="px-4 py-3 text-right text-gray-500">
+                  <td className="px-4 py-3 text-right text-slate-300 tabular-nums">{(task.prompt_tokens ?? 0).toLocaleString()}</td>
+                  <td className="px-4 py-3 text-right text-slate-500 tabular-nums">
                     {(task.cache_read_tokens ?? 0).toLocaleString()}/{(task.cache_creation_tokens ?? 0).toLocaleString()}
                   </td>
-                  <td className="px-4 py-3 text-right text-gray-700">{(task.completion_tokens ?? 0).toLocaleString()}</td>
-                  <td className="px-4 py-3 text-right text-gray-700">{task.tool_calls_count ?? 0}</td>
+                  <td className="px-4 py-3 text-right text-slate-300 tabular-nums">{(task.completion_tokens ?? 0).toLocaleString()}</td>
+                  <td className="px-4 py-3 text-right text-slate-300 tabular-nums">{task.tool_calls_count ?? 0}</td>
                   <td
-                    className="px-4 py-3 text-right text-gray-500"
+                    className="px-4 py-3 text-right text-slate-500"
                     title={task.ttfb_ms !== null ? `${task.ttfb_ms}ms to first byte` : undefined}
                   >
                     {formatDuration(task)}
                   </td>
-                  <td className="px-4 py-3 text-right font-semibold text-gray-800">{formatCost(task.cost_estimate)}</td>
+                  <td className="px-4 py-3 text-right font-semibold text-slate-100 tabular-nums">{formatCost(task.cost_estimate)}</td>
                 </tr>
               ))}
             </tbody>
           </table>
           {visibleTasks.length === 0 && (
-            <p className="text-center text-gray-400 py-10 text-sm">
+            <p className="text-center text-slate-500 py-10 text-sm">
               {loading ? 'Loading...' : 'No traffic captured yet. Point an agent at this proxy and run a task.'}
             </p>
           )}
           {visibleTasks.length > 0 && (
-            <div className="flex items-center justify-between px-4 py-3 border-t border-gray-100 text-sm text-gray-600">
+            <div className="flex items-center justify-between px-4 py-3 border-t border-white/5 text-sm text-slate-400">
               <button
                 onClick={() => setPage((p) => Math.max(0, p - 1))}
                 disabled={safePage === 0}
-                className="px-3 py-1 rounded-lg border border-gray-200 disabled:opacity-50"
+                className="px-3 py-1 rounded-lg border border-white/10 hover:bg-white/[0.05] disabled:opacity-50 disabled:hover:bg-transparent"
               >
                 Prev
               </button>
@@ -312,7 +312,7 @@ const TrafficView = () => {
               <button
                 onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
                 disabled={safePage >= pageCount - 1}
-                className="px-3 py-1 rounded-lg border border-gray-200 disabled:opacity-50"
+                className="px-3 py-1 rounded-lg border border-white/10 hover:bg-white/[0.05] disabled:opacity-50 disabled:hover:bg-transparent"
               >
                 Next
               </button>
@@ -325,43 +325,43 @@ const TrafficView = () => {
         <div className="surface p-6 space-y-4">
           <div className="flex justify-between items-start gap-4">
             <div>
-              <h3 className="text-lg font-semibold text-gray-700">
+              <h3 className="text-lg font-semibold text-slate-200">
                 Task #{selectedId} raw traffic
               </h3>
               {traffic?.task_description && (
-                <p className="text-sm text-gray-500 mt-1">{traffic.task_description}</p>
+                <p className="text-sm text-slate-500 mt-1">{traffic.task_description}</p>
               )}
             </div>
-            <button onClick={() => setSelectedId(null)} className="text-gray-400 hover:text-gray-600 shrink-0">
+            <button onClick={() => setSelectedId(null)} className="text-slate-500 hover:text-slate-300 shrink-0">
               <X size={20} />
             </button>
           </div>
           {traffic?.agent_question_text && (
-            <div className="flex items-start gap-2 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2">
-              <MessageCircleQuestion size={16} className="text-amber-500 shrink-0 mt-0.5" />
+            <div className="flex items-start gap-2 rounded-lg bg-amber-400/10 border border-amber-400/20 px-3 py-2">
+              <MessageCircleQuestion size={16} className="text-amber-400 shrink-0 mt-0.5" />
               <div>
-                <p className="text-xs font-semibold text-amber-700 uppercase">
+                <p className="text-xs font-semibold text-amber-300 uppercase">
                   Agent asked{traffic.agent_question_tool ? ` (${traffic.agent_question_tool})` : ''}
                 </p>
-                <p className="text-sm text-amber-900">{traffic.agent_question_text}</p>
+                <p className="text-sm text-amber-200">{traffic.agent_question_text}</p>
               </div>
             </div>
           )}
           {trafficLoading ? (
             <div className="h-32 flex items-center justify-center">
-              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-400"></div>
             </div>
           ) : (
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <div>
-                <p className="text-xs uppercase font-semibold text-gray-400 mb-2">Request</p>
-                <div className="bg-gray-900 text-gray-100 text-xs rounded-lg p-4 overflow-auto max-h-96 whitespace-pre-wrap break-words">
+                <p className="text-xs uppercase font-semibold text-slate-500 mb-2">Request</p>
+                <div className="bg-black/40 border border-white/10 text-slate-200 text-xs rounded-lg p-4 overflow-auto max-h-96 whitespace-pre-wrap break-words">
                   <CollapsibleJson raw={traffic?.request_body ?? null} />
                 </div>
               </div>
               <div>
-                <p className="text-xs uppercase font-semibold text-gray-400 mb-2">Response</p>
-                <div className="bg-gray-900 text-gray-100 text-xs rounded-lg p-4 overflow-auto max-h-96 whitespace-pre-wrap break-words">
+                <p className="text-xs uppercase font-semibold text-slate-500 mb-2">Response</p>
+                <div className="bg-black/40 border border-white/10 text-slate-200 text-xs rounded-lg p-4 overflow-auto max-h-96 whitespace-pre-wrap break-words">
                   <CollapsibleJson raw={traffic?.response_body ?? null} />
                 </div>
               </div>

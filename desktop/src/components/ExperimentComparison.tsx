@@ -162,8 +162,8 @@ export function fragmentedAgents(runs: RunComparison[]): { agent_name: string; r
 }
 
 const VERDICT_STYLES: Record<Verdict, { chip: string; label: string; icon: typeof Check }> = {
-  solved: { chip: 'bg-emerald-100 text-emerald-800 border-emerald-200', label: 'Solved', icon: Check },
-  failed: { chip: 'bg-red-100 text-red-800 border-red-200', label: 'Failed', icon: X },
+  solved: { chip: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30', label: 'Solved', icon: Check },
+  failed: { chip: 'bg-red-500/15 text-red-300 border-red-500/30', label: 'Failed', icon: X },
 };
 
 /// Three-state control: solved, failed, or not judged yet. Clicking the
@@ -178,7 +178,7 @@ function VerdictToggle({
   const options: Verdict[] = ['solved', 'failed'];
 
   return (
-    <div className="inline-flex rounded-lg border border-gray-200 overflow-hidden">
+    <div className="inline-flex rounded-lg border border-white/10 overflow-hidden">
       {options.map((option) => {
         const active = run.verdict === option;
         const { chip, label, icon: Icon } = VERDICT_STYLES[option];
@@ -190,7 +190,7 @@ function VerdictToggle({
             title={active ? `Clear the "${label}" verdict` : `Mark this run ${label.toLowerCase()}`}
             onClick={() => onChange(run, active ? null : option)}
             className={`flex items-center gap-1 px-2.5 py-1 text-xs font-semibold transition-colors ${
-              active ? chip : 'bg-white text-gray-400 hover:bg-gray-50'
+              active ? chip : 'bg-white/[0.04] text-slate-400 hover:bg-white/[0.08]'
             }`}
           >
             <Icon size={12} />
@@ -218,7 +218,7 @@ function GroupingToggle({
   ];
 
   return (
-    <div className="inline-flex rounded-lg border border-gray-200 overflow-hidden shrink-0">
+    <div className="inline-flex rounded-lg border border-white/10 overflow-hidden shrink-0">
       {options.map((option) => (
         <button
           key={option.value}
@@ -227,7 +227,7 @@ function GroupingToggle({
           title={option.hint}
           onClick={() => onChange(option.value)}
           className={`px-3 py-1 text-xs font-semibold transition-colors ${
-            grouping === option.value ? 'bg-blue-600 text-white' : 'bg-white text-gray-500 hover:bg-gray-50'
+            grouping === option.value ? 'bg-indigo-500 text-white' : 'bg-white/[0.04] text-slate-400 hover:bg-white/[0.08]'
           }`}
         >
           {option.label}
@@ -242,10 +242,10 @@ function Headline({ ranking, runCount }: { ranking: Ranking; runCount: number })
 
   if (runCount === 0) {
     return (
-      <p className="text-sm text-gray-500">
+      <p className="text-sm text-slate-500">
         No calls recorded under this experiment yet. Point each agent at the proxy with the same{' '}
-        <code className="font-mono text-xs bg-gray-100 px-1 rounded">X-Experiment-ID</code> and a
-        different <code className="font-mono text-xs bg-gray-100 px-1 rounded">X-Agent-ID</code>.
+        <code className="font-mono text-xs bg-white/[0.06] text-slate-300 px-1 rounded">X-Experiment-ID</code> and a
+        different <code className="font-mono text-xs bg-white/[0.06] text-slate-300 px-1 rounded">X-Agent-ID</code>.
       </p>
     );
   }
@@ -253,9 +253,9 @@ function Headline({ ranking, runCount }: { ranking: Ranking; runCount: number })
   if (solved === 0) {
     return (
       <div className="flex items-start gap-3 text-sm">
-        <HelpCircle size={18} className="text-amber-500 shrink-0 mt-0.5" />
-        <p className="text-gray-600">
-          <span className="font-semibold text-gray-800">Nothing is marked solved yet.</span> The
+        <HelpCircle size={18} className="text-amber-400 shrink-0 mt-0.5" />
+        <p className="text-slate-400">
+          <span className="font-semibold text-slate-200">Nothing is marked solved yet.</span> The
           proxy can see what each run spent, but not whether its work was any good — mark that
           below. Ranking on cost alone would crown whichever agent gave up first.
         </p>
@@ -266,8 +266,8 @@ function Headline({ ranking, runCount }: { ranking: Ranking; runCount: number })
   if (!winner) {
     return (
       <div className="flex items-start gap-3 text-sm">
-        <AlertTriangle size={18} className="text-amber-500 shrink-0 mt-0.5" />
-        <p className="text-gray-600">
+        <AlertTriangle size={18} className="text-amber-400 shrink-0 mt-0.5" />
+        <p className="text-slate-400">
           {solved} run{solved === 1 ? '' : 's'} solved it, but{' '}
           {solved === 1 ? 'its total is' : 'their totals are'} not final —{' '}
           {solved === 1 ? 'it is' : 'they are'} still running, or still spending on a model with no
@@ -280,25 +280,25 @@ function Headline({ ranking, runCount }: { ranking: Ranking; runCount: number })
   return (
     <div className="space-y-2">
       <div className="flex items-baseline gap-2 flex-wrap">
-        <Trophy size={18} className="text-amber-500 shrink-0 self-center" />
-        <span className="text-lg font-bold text-gray-800">{winner.agent_name}</span>
-        <span className="text-gray-600">solved it for</span>
-        <span className="text-lg font-bold text-emerald-700">{formatCost(winner.total_cost)}</span>
+        <Trophy size={18} className="text-amber-400 shrink-0 self-center" />
+        <span className="text-lg font-bold text-slate-100">{winner.agent_name}</span>
+        <span className="text-slate-400">solved it for</span>
+        <span className="text-lg font-bold text-emerald-300">{formatCost(winner.total_cost)}</span>
         {runnerUp && (
-          <span className="text-gray-600">
-            {ratio !== null && <span className="font-semibold text-gray-800">{ratio.toFixed(1)}× cheaper </span>}
+          <span className="text-slate-400">
+            {ratio !== null && <span className="font-semibold text-slate-200">{ratio.toFixed(1)}× cheaper </span>}
             than {runnerUp.agent_name} at {formatCost(runnerUp.total_cost)}
           </span>
         )}
       </div>
       {!runnerUp && (
-        <p className="text-sm text-gray-500">
+        <p className="text-sm text-slate-500">
           Only one run solved it — nothing to compare against yet. Run the same task under another
           agent with the same experiment id.
         </p>
       )}
       {solvedButUnrankable > 0 && (
-        <p className="text-sm text-amber-700">
+        <p className="text-sm text-amber-300">
           {solvedButUnrankable} solved run{solvedButUnrankable === 1 ? ' is' : 's are'} left out of
           the ranking: still running, or still spending on a model with no entry in{' '}
           <code className="font-mono text-xs">pricing.yaml</code>.
@@ -317,17 +317,17 @@ function AgentRollupTable({ rollups }: { rollups: AgentRollup[] }) {
   const singleAttempts = rollups.every((rollup) => rollup.runs <= 1);
 
   return (
-    <div className="px-6 py-5 space-y-2 border-t border-gray-100 bg-gray-50/40">
+    <div className="px-6 py-5 space-y-2 border-t border-white/5 bg-white/[0.02]">
       <div className="flex items-baseline justify-between gap-3 flex-wrap">
-        <h4 className="text-sm font-semibold text-gray-700">Per agent</h4>
+        <h4 className="text-sm font-semibold text-slate-300">Per agent</h4>
         {singleAttempts && (
-          <p className="text-xs text-gray-400">
+          <p className="text-xs text-slate-500">
             One attempt each — a single run says little about how often an agent gets there.
           </p>
         )}
       </div>
       <table className="w-full text-sm" aria-label="Per agent">
-        <thead className="text-xs uppercase text-gray-400">
+        <thead className="text-xs uppercase text-slate-500">
           <tr>
             <th className="py-1 text-left font-semibold">Agent</th>
             <th className="py-1 text-right font-semibold">Solved</th>
@@ -345,30 +345,30 @@ function AgentRollupTable({ rollups }: { rollups: AgentRollup[] }) {
             </th>
           </tr>
         </thead>
-        <tbody className="divide-y divide-gray-100">
+        <tbody className="divide-y divide-white/5">
           {rollups.map((rollup) => (
             <tr key={rollup.agent_name}>
-              <td className="py-2 font-medium text-gray-800">{rollup.agent_name}</td>
-              <td className="py-2 text-right text-gray-600">
+              <td className="py-2 font-medium text-slate-200">{rollup.agent_name}</td>
+              <td className="py-2 text-right text-slate-400">
                 {rollup.solved}/{rollup.runs}
                 {rollup.unjudged > 0 && (
-                  <span className="text-amber-600 text-xs" title={`${rollup.unjudged} run(s) not judged yet`}>
+                  <span className="text-amber-300 text-xs" title={`${rollup.unjudged} run(s) not judged yet`}>
                     {' '}
                     (+{rollup.unjudged}?)
                   </span>
                 )}
               </td>
-              <td className="py-2 text-right text-gray-600">{formatCost(rollup.totalCost)}</td>
-              <td className="py-2 text-right font-semibold text-gray-800">
+              <td className="py-2 text-right text-slate-400">{formatCost(rollup.totalCost)}</td>
+              <td className="py-2 text-right font-semibold text-slate-100">
                 {rollup.costPerSolve === null ? (
-                  <span className="text-gray-300" title="Never solved it here, or some of its spend is unpriced">
+                  <span className="text-slate-600" title="Never solved it here, or some of its spend is unpriced">
                     –
                   </span>
                 ) : (
                   formatCost(rollup.costPerSolve)
                 )}
               </td>
-              <td className="py-2 text-right text-gray-500 text-xs">
+              <td className="py-2 text-right text-slate-500 text-xs">
                 {rollup.medianSolvedCost === null
                   ? '–'
                   : rollup.cheapestSolvedCost === rollup.dearestSolvedCost
@@ -399,79 +399,79 @@ function RunRow({
   const issues = run.error_calls + run.rate_limited_calls;
 
   return (
-    <tr className={isWinner ? 'bg-emerald-50/60' : undefined}>
+    <tr className={isWinner ? 'bg-emerald-500/10' : undefined}>
       <td className="px-4 py-3">
         <div className="flex items-center gap-2">
           {isWinner ? (
-            <Trophy size={14} className="text-amber-500 shrink-0" />
+            <Trophy size={14} className="text-amber-400 shrink-0" />
           ) : (
-            <CircleDot size={14} className="text-gray-300 shrink-0" />
+            <CircleDot size={14} className="text-slate-600 shrink-0" />
           )}
           <button
             type="button"
             onClick={() => onSelect(run)}
             aria-expanded={selected}
-            className="flex items-center gap-1 font-semibold text-gray-800 hover:text-gray-600"
+            className="flex items-center gap-1 font-semibold text-slate-200 hover:text-slate-400"
           >
             {selected ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
             {run.agent_name}
           </button>
         </div>
-        <p className="text-xs text-gray-400 font-mono truncate max-w-[16rem]" title={run.session_id ?? ''}>
+        <p className="text-xs text-slate-500 font-mono truncate max-w-[16rem]" title={run.session_id ?? ''}>
           {run.sessions > 1 ? `${run.sessions} sessions merged` : (run.session_id ?? 'no session id')}
         </p>
-        <p className="text-xs text-gray-400 truncate max-w-[16rem]" title={run.models ?? ''}>
+        <p className="text-xs text-slate-500 truncate max-w-[16rem]" title={run.models ?? ''}>
           {run.models ?? 'unknown model'}
         </p>
       </td>
       <td className="px-4 py-3">
         <VerdictToggle run={run} onChange={onVerdict} />
-        {run.verdict_note && <p className="text-xs text-gray-500 mt-1">{run.verdict_note}</p>}
+        {run.verdict_note && <p className="text-xs text-slate-500 mt-1">{run.verdict_note}</p>}
       </td>
       <td className="px-4 py-3 text-right">
         {!runIsFinal(run) ? (
           <span
-            className="text-blue-600 text-xs"
+            className="text-blue-300 text-xs"
             title={`${run.in_flight_calls} call(s) still open — this run is still spending`}
           >
             {formatCost(run.total_cost)} so far
           </span>
         ) : costIsKnown(run) ? (
-          <span className="font-semibold text-gray-800">{formatCost(run.total_cost)}</span>
+          <span className="font-semibold text-slate-100">{formatCost(run.total_cost)}</span>
         ) : (
           <span
-            className="text-amber-600 text-xs"
+            className="text-amber-300 text-xs"
             title={`${run.unpriced_calls} of ${run.call_count} calls used a model with no price in pricing.yaml`}
           >
             ≥ {formatCost(run.total_cost)}
           </span>
         )}
       </td>
-      <td className="px-4 py-3 text-right text-gray-600 whitespace-nowrap">
-        {formatTokens(run.input_tokens)} <span className="text-gray-400">in</span>
+      <td className="px-4 py-3 text-right text-slate-400 whitespace-nowrap">
+        {formatTokens(run.input_tokens)} <span className="text-slate-500">in</span>
         <br />
-        {formatTokens(run.output_tokens)} <span className="text-gray-400">out</span>
+        {formatTokens(run.output_tokens)} <span className="text-slate-500">out</span>
       </td>
-      <td className="px-4 py-3 text-right text-gray-600" title="Input tokens served from the prompt cache">
+      <td className="px-4 py-3 text-right text-slate-400" title="Input tokens served from the prompt cache">
         {formatTokens(run.cache_read_tokens)}
       </td>
-      <td className="px-4 py-3 text-right text-gray-600">{run.call_count}</td>
-      <td className="px-4 py-3 text-right text-gray-600">{run.tool_calls}</td>
-      <td className="px-4 py-3 text-right text-gray-600 whitespace-nowrap">
+      <td className="px-4 py-3 text-right text-slate-400">{run.call_count}</td>
+      <td className="px-4 py-3 text-right text-slate-400">{run.tool_calls}</td>
+      <td className="px-4 py-3 text-right text-slate-400 whitespace-nowrap">
         <span className="inline-flex items-center gap-1">
-          <Clock size={12} className="text-gray-400" />
+          <Clock size={12} className="text-slate-500" />
           {humanizeSecs(run.wall_clock_seconds)}
         </span>
       </td>
       <td className="px-4 py-3 text-right">
         {issues > 0 ? (
-          <span className="text-red-600 text-xs">
+          <span className="text-red-300 text-xs">
             {run.error_calls > 0 && `${run.error_calls} failed`}
             {run.error_calls > 0 && run.rate_limited_calls > 0 && ', '}
             {run.rate_limited_calls > 0 && `${run.rate_limited_calls} limited`}
           </span>
         ) : (
-          <span className="text-gray-300">–</span>
+          <span className="text-slate-600">–</span>
         )}
       </td>
     </tr>
@@ -559,27 +559,27 @@ const ExperimentComparison = ({
   const fragmented = fragmentedAgents(runs);
 
   return (
-    <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+    <div className="bg-[#151a23] rounded-2xl border border-white/10 overflow-hidden">
       <div className="p-6 pb-4 space-y-3">
         <div className="flex items-start justify-between gap-4 flex-wrap">
-          <h3 className="text-lg font-semibold text-gray-700">Which run solved it cheaper?</h3>
+          <h3 className="text-lg font-semibold text-slate-200">Which run solved it cheaper?</h3>
           <GroupingToggle grouping={grouping} onChange={onGroupingChange} />
         </div>
         {error ? (
-          <p className="text-sm text-red-700">Couldn't load the comparison: {error}</p>
+          <p className="text-sm text-red-300">Couldn't load the comparison: {error}</p>
         ) : loaded ? (
           <>
             <Headline ranking={ranking} runCount={runs.length} />
             {grouping === 'session' && fragmented.length > 0 && (
-              <div className="flex items-start gap-2 text-xs text-gray-600 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2">
-                <Split size={13} className="text-amber-500 shrink-0 mt-0.5" />
+              <div className="flex items-start gap-2 text-xs text-slate-400 bg-amber-400/10 border border-amber-400/20 rounded-lg px-3 py-2">
+                <Split size={13} className="text-amber-400 shrink-0 mt-0.5" />
                 <p>
                   {fragmented.map((a) => `${a.agent_name} has ${a.runs} runs`).join(', ')} here. If those
                   are repeats of the task, this is the view you want. If the agent split one attempt
                   across several session ids, switch to{' '}
                   <button
                     type="button"
-                    className="font-semibold text-amber-800 underline underline-offset-2"
+                    className="font-semibold text-amber-300 underline underline-offset-2"
                     onClick={() => onGroupingChange('agent')}
                   >
                     one run per agent
@@ -590,14 +590,14 @@ const ExperimentComparison = ({
             )}
           </>
         ) : (
-          <p className="text-sm text-gray-400">Loading runs…</p>
+          <p className="text-sm text-slate-500">Loading runs…</p>
         )}
       </div>
 
       {ordered.length > 0 && (
         <div className="overflow-x-auto">
           <table className="w-full text-sm" aria-label="Runs">
-            <thead className="bg-gray-50 text-xs uppercase text-gray-500">
+            <thead className="bg-white/[0.04] text-xs uppercase text-slate-500">
               <tr>
                 {COLUMNS.map((column) => (
                   <th key={column.label} className={`px-4 py-2 font-semibold ${column.align}`}>
@@ -606,7 +606,7 @@ const ExperimentComparison = ({
                 ))}
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-100">
+            <tbody className="divide-y divide-white/5">
               {ordered.map((run) => (
                 <React.Fragment key={`${run.agent_name}:${run.session_key}`}>
                   <RunRow

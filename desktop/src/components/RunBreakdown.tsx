@@ -15,7 +15,7 @@ const SERIES = [
   { key: 'output', label: 'Output', color: '#1baf7a' },
 ] as const;
 
-const SURFACE = '#ffffff';
+const SURFACE = '#151a23';
 /// Surface-coloured gap between stacked segments — the separator is the gap,
 /// never a stroke drawn around the mark.
 const SEGMENT_GAP = 2;
@@ -144,7 +144,7 @@ function PhaseColumns({ stacks }: { stacks: StackedPhase[] }) {
                 y1={BASELINE}
                 x2={x + BAR_WIDTH}
                 y2={BASELINE}
-                stroke="#e5e7eb"
+                stroke="rgba(255,255,255,0.15)"
                 strokeWidth={1}
               />
             )}
@@ -153,14 +153,14 @@ function PhaseColumns({ stacks }: { stacks: StackedPhase[] }) {
               y={114}
               textAnchor="middle"
               fontSize={9}
-              fill="#9ca3af"
+              fill="#94a3b8"
             >
               {label}
             </text>
           </g>
         );
       })}
-      <line x1={0} y1={BASELINE} x2={BAND_WIDTH * PHASE_LABELS.length} y2={BASELINE} stroke="#e5e7eb" strokeWidth={1} />
+      <line x1={0} y1={BASELINE} x2={BAND_WIDTH * PHASE_LABELS.length} y2={BASELINE} stroke="rgba(255,255,255,0.15)" strokeWidth={1} />
     </svg>
   );
 }
@@ -168,7 +168,7 @@ function PhaseColumns({ stacks }: { stacks: StackedPhase[] }) {
 function ToolBars({ tools }: { tools: ToolUsage[] }) {
   if (tools.length === 0) {
     return (
-      <p className="text-xs text-gray-400">
+      <p className="text-xs text-slate-500">
         No tool calls recorded. Older calls captured before tool names were tracked show nothing here.
       </p>
     );
@@ -188,21 +188,21 @@ function ToolBars({ tools }: { tools: ToolUsage[] }) {
         const share = tool.input_tokens / attributed;
         return (
           <div key={tool.tool_name} className="flex items-center gap-2 text-xs">
-            <span className="w-28 shrink-0 truncate font-mono text-gray-600" title={tool.tool_name}>
+            <span className="w-28 shrink-0 truncate font-mono text-slate-400" title={tool.tool_name}>
               {tool.tool_name}
             </span>
             <div
-              className="flex-1 h-2 bg-gray-100 rounded-sm overflow-hidden"
+              className="flex-1 h-2 bg-white/[0.06] rounded-sm overflow-hidden"
               title={`${tool.tool_name}: ${formatTokens(tool.input_tokens)} tokens across ${tool.call_count} call${tool.call_count === 1 ? "" : "s"}`}
             >
               {/* One hue for every bar: length carries the magnitude, so
                   shading by size would spend the colour channel twice. */}
               <div className="h-full rounded-sm" style={{ width: `${share * 100}%`, backgroundColor: SERIES[0].color }} />
             </div>
-            <span className="w-14 shrink-0 text-right tabular-nums text-gray-700">
+            <span className="w-14 shrink-0 text-right tabular-nums text-slate-300">
               {Math.round(share * 100)}%
             </span>
-            <span className="w-16 shrink-0 text-right tabular-nums text-gray-400">
+            <span className="w-16 shrink-0 text-right tabular-nums text-slate-500">
               {tool.call_count} call{tool.call_count === 1 ? '' : 's'}
             </span>
           </div>
@@ -231,15 +231,15 @@ function RunPanel({
   return (
     <div className="space-y-3">
       <div className="flex items-baseline justify-between gap-2">
-        <span className="font-semibold text-gray-800 text-sm">{run.agent_name}</span>
-        <span className="text-xs text-gray-400 font-mono truncate max-w-[10rem]" title={run.session_key}>
+        <span className="font-semibold text-slate-200 text-sm">{run.agent_name}</span>
+        <span className="text-xs text-slate-500 font-mono truncate max-w-[10rem]" title={run.session_key}>
           {run.session_key || (grouping === 'agent' ? 'all sessions' : 'no session id')}
         </span>
       </div>
 
       <PhaseColumns stacks={stacks} />
 
-      <p className="text-xs text-gray-500">
+      <p className="text-xs text-slate-500">
         Peak phase {formatTokens(peak)} tokens
         {shift && (
           <>
@@ -249,7 +249,7 @@ function RunPanel({
       </p>
 
       <div className="pt-1 space-y-2">
-        <p className="text-xs font-semibold text-gray-500 flex items-center gap-1">
+        <p className="text-xs font-semibold text-slate-500 flex items-center gap-1">
           <Wrench size={11} /> Spend by tool
         </p>
         <ToolBars tools={runTools} />
@@ -260,7 +260,7 @@ function RunPanel({
 
 function Legend() {
   return (
-    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-600">
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-400">
       {SERIES.map((series) => (
         <span key={series.key} className="inline-flex items-center gap-1.5">
           <span className="w-2.5 h-2.5 rounded-sm" style={{ backgroundColor: series.color }} />
@@ -310,8 +310,8 @@ const RunBreakdown = ({
 
   if (error) {
     return (
-      <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
-        <p className="text-sm text-red-700">Couldn't load the breakdown: {error}</p>
+      <div className="bg-[#151a23] rounded-2xl border border-white/10 p-6">
+        <p className="text-sm text-red-300">Couldn't load the breakdown: {error}</p>
       </div>
     );
   }
@@ -319,11 +319,11 @@ const RunBreakdown = ({
   if (loaded && runs.length === 0) return null;
 
   return (
-    <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6 space-y-5">
+    <div className="bg-[#151a23] rounded-2xl border border-white/10 p-6 space-y-5">
       <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
-          <h3 className="text-lg font-semibold text-gray-700">Where the money went</h3>
-          <p className="text-sm text-gray-500 mt-1 max-w-2xl">
+          <h3 className="text-lg font-semibold text-slate-200">Where the money went</h3>
+          <p className="text-sm text-slate-400 mt-1 max-w-2xl">
             Each run's calls cut into five slices of equal length. Early slices are the agent reading
             its way in; later ones are generation. Panels are scaled to their own peak, so compare the
             shape here and the totals above.
@@ -345,10 +345,10 @@ const RunBreakdown = ({
           ))}
         </div>
       ) : (
-        <p className="text-sm text-gray-400">Loading breakdown…</p>
+        <p className="text-sm text-slate-500">Loading breakdown…</p>
       )}
 
-      <p className="text-xs text-gray-400 flex items-start gap-1.5 pt-1 border-t border-gray-50">
+      <p className="text-xs text-slate-500 flex items-start gap-1.5 pt-1 border-t border-white/5">
         <AlertCircle size={12} className="shrink-0 mt-0.5" />
         A turn's tokens are split across the tools it called, so shares sum to the spend of turns that
         used a tool. The true price of a tool's result is paid by the following turn, which carries it

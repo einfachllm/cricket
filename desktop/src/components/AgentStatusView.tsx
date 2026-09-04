@@ -33,16 +33,16 @@ const STATE_STYLES: Record<AgentStateKind, {
   icon: React.ComponentType<{ size?: number | string; className?: string }>;
   spin?: boolean;
 }> = {
-  waiting_for_you: { rank: 0, chip: 'bg-amber-100 text-amber-800 border-amber-200', accent: 'border-l-amber-400', icon: MessageCircleQuestion },
-  rate_limited: { rank: 1, chip: 'bg-red-100 text-red-800 border-red-200', accent: 'border-l-red-500', icon: Ban },
-  stalled: { rank: 2, chip: 'bg-red-100 text-red-800 border-red-200', accent: 'border-l-red-500', icon: AlertTriangle },
-  error: { rank: 3, chip: 'bg-red-100 text-red-800 border-red-200', accent: 'border-l-red-500', icon: AlertTriangle },
-  truncated: { rank: 4, chip: 'bg-purple-100 text-purple-800 border-purple-200', accent: 'border-l-purple-400', icon: Scissors },
-  working: { rank: 5, chip: 'bg-blue-100 text-blue-800 border-blue-200', accent: 'border-l-blue-500', icon: Loader2, spin: true },
-  overloaded: { rank: 6, chip: 'bg-orange-100 text-orange-800 border-orange-200', accent: 'border-l-orange-400', icon: CloudOff },
-  interrupted: { rank: 7, chip: 'bg-slate-100 text-slate-700 border-slate-200', accent: 'border-l-slate-400', icon: CircleSlash },
-  idle: { rank: 8, chip: 'bg-gray-100 text-gray-600 border-gray-200', accent: 'border-l-gray-300', icon: Moon },
-  unknown: { rank: 9, chip: 'bg-gray-100 text-gray-500 border-gray-200', accent: 'border-l-gray-200', icon: HelpCircle },
+  waiting_for_you: { rank: 0, chip: 'bg-amber-400/10 text-amber-300 border-amber-400/30', accent: 'border-l-amber-400', icon: MessageCircleQuestion },
+  rate_limited: { rank: 1, chip: 'bg-red-500/10 text-red-300 border-red-500/30', accent: 'border-l-red-500', icon: Ban },
+  stalled: { rank: 2, chip: 'bg-red-500/10 text-red-300 border-red-500/30', accent: 'border-l-red-500', icon: AlertTriangle },
+  error: { rank: 3, chip: 'bg-red-500/10 text-red-300 border-red-500/30', accent: 'border-l-red-500', icon: AlertTriangle },
+  truncated: { rank: 4, chip: 'bg-purple-400/10 text-purple-300 border-purple-400/30', accent: 'border-l-purple-400', icon: Scissors },
+  working: { rank: 5, chip: 'bg-blue-500/10 text-blue-300 border-blue-500/30', accent: 'border-l-blue-500', icon: Loader2, spin: true },
+  overloaded: { rank: 6, chip: 'bg-orange-400/10 text-orange-300 border-orange-400/30', accent: 'border-l-orange-400', icon: CloudOff },
+  interrupted: { rank: 7, chip: 'bg-slate-400/10 text-slate-300 border-slate-400/20', accent: 'border-l-slate-400', icon: CircleSlash },
+  idle: { rank: 8, chip: 'bg-white/[0.06] text-slate-400 border-white/10', accent: 'border-l-slate-600', icon: Moon },
+  unknown: { rank: 9, chip: 'bg-white/[0.06] text-slate-500 border-white/10', accent: 'border-l-slate-700', icon: HelpCircle },
 };
 
 function styleFor(state: AgentStateKind) {
@@ -64,7 +64,7 @@ function StateChip({ session }: { session: SessionSummary }) {
   const { chip, icon: Icon, spin } = styleFor(session.state);
   // A dismissed state keeps its truthful label but loses the alarm colors:
   // someone has seen it, and the run's next call re-arms the badge.
-  const palette = session.dismissed ? 'bg-gray-100 text-gray-500 border-gray-200' : chip;
+  const palette = session.dismissed ? 'bg-white/[0.06] text-slate-500 border-white/10' : chip;
   return (
     <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold border ${palette}`}>
       <Icon size={13} className={spin && !session.dismissed ? 'animate-spin' : ''} />
@@ -99,18 +99,18 @@ function ProviderLimitsCard({ limits }: { limits: ProviderLimits[] }) {
 
   return (
     <div className="surface p-5">
-      <h3 className="text-sm font-semibold text-gray-700 mb-4">Provider quota</h3>
+      <h3 className="text-sm font-semibold text-slate-200 mb-4">Provider quota</h3>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
         {reporting.map((limit) => (
           <div key={limit.provider ?? 'unknown'} className="space-y-3">
             <div className="flex items-baseline justify-between">
-              <span className="font-medium text-gray-800 capitalize">{limit.provider ?? 'unknown'}</span>
-              <span className="text-xs text-gray-400">read {humanizeSecs(limit.observed_seconds_ago)} ago</span>
+              <span className="font-medium text-slate-200 capitalize">{limit.provider ?? 'unknown'}</span>
+              <span className="text-xs text-slate-500">read {humanizeSecs(limit.observed_seconds_ago)} ago</span>
             </div>
             <QuotaBar label="Requests" remaining={limit.requests_remaining} limit={limit.requests_limit} />
             <QuotaBar label="Tokens" remaining={limit.tokens_remaining} limit={limit.tokens_limit} />
             {limit.retry_after_remaining_s !== null && (
-              <p className="text-xs text-red-600 font-medium">
+              <p className="text-xs text-red-300 font-medium">
                 Blocked — retry in {humanizeSecs(limit.retry_after_remaining_s)}
               </p>
             )}
@@ -123,7 +123,7 @@ function ProviderLimitsCard({ limits }: { limits: ProviderLimits[] }) {
 
 function SessionCard({ session }: { session: SessionSummary }) {
   const { accent } = styleFor(session.state);
-  const attentionRing = session.needs_attention ? 'ring-1 ring-amber-200' : '';
+  const attentionRing = session.needs_attention ? 'ring-1 ring-amber-400/40' : '';
   const { refresh } = useSessions();
   const [dismissing, setDismissing] = useState(false);
   const [dismissError, setDismissError] = useState<string | null>(null);
@@ -166,7 +166,7 @@ function SessionCard({ session }: { session: SessionSummary }) {
             <Bot size={16} className="text-slate-400 shrink-0" />
             <span className="font-semibold text-slate-100 truncate">{session.agent_name}</span>
             {session.experiment_name && (
-              <span className="px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 text-xs shrink-0">
+              <span className="px-2 py-0.5 rounded-full bg-indigo-500/15 text-indigo-300 text-xs shrink-0">
                 {session.experiment_name}
               </span>
             )}
@@ -184,7 +184,7 @@ function SessionCard({ session }: { session: SessionSummary }) {
               disabled={dismissing}
               title="Dismiss — I've seen this. Re-arms on the run's next call."
               aria-label={`Dismiss attention on ${session.agent_name} ${session.session_id ?? ''}`.trimEnd()}
-              className="text-gray-400 hover:text-gray-700 disabled:opacity-50 p-1 rounded-full hover:bg-gray-100 transition-colors"
+              className="text-slate-500 hover:text-slate-200 disabled:opacity-50 p-1 rounded-full hover:bg-white/10 transition-colors"
             >
               <BellOff size={14} />
             </button>
@@ -195,7 +195,7 @@ function SessionCard({ session }: { session: SessionSummary }) {
             disabled={deleting}
             title="Delete this agent and all its recorded calls"
             aria-label={`Delete agent ${session.agent_name}`}
-            className="text-gray-400 hover:text-red-600 disabled:opacity-50 p-1 rounded-full hover:bg-gray-100 transition-colors"
+            className="text-slate-500 hover:text-red-300 disabled:opacity-50 p-1 rounded-full hover:bg-white/10 transition-colors"
           >
             <Trash2 size={14} />
           </button>
@@ -203,7 +203,7 @@ function SessionCard({ session }: { session: SessionSummary }) {
       </div>
 
       {dismissError && (
-        <p role="alert" className="text-xs text-red-600">
+        <p role="alert" className="text-xs text-red-300">
           Could not dismiss: {dismissError}
         </p>
       )}
@@ -234,9 +234,9 @@ function SessionCard({ session }: { session: SessionSummary }) {
           {humanizeSecs(session.idle_seconds)} ago
         </span>
         {session.rate_limited_calls > 0 && (
-          <span className="text-red-600">{session.rate_limited_calls} rate-limited</span>
+          <span className="text-red-300">{session.rate_limited_calls} rate-limited</span>
         )}
-        {session.error_calls > 0 && <span className="text-red-600">{session.error_calls} failed</span>}
+        {session.error_calls > 0 && <span className="text-red-300">{session.error_calls} failed</span>}
       </div>
     </div>
   );
@@ -251,14 +251,14 @@ function SummaryStrip({ sessions }: { sessions: SessionSummary[] }) {
   const cost = sessions.reduce((sum, s) => sum + (s.total_cost ?? 0), 0);
 
   const tiles = [
-    { label: 'Need you', value: counts.attention, tone: counts.attention > 0 ? 'text-amber-600' : 'text-gray-800' },
-    { label: 'Working', value: counts.working, tone: 'text-blue-600' },
-    { label: 'Idle', value: counts.idle, tone: 'text-gray-400' },
-    { label: 'Spend', value: formatCost(cost), tone: 'text-gray-800' },
+    { label: 'Need you', value: counts.attention, tone: counts.attention > 0 ? 'text-amber-300' : 'text-slate-100' },
+    { label: 'Working', value: counts.working, tone: 'text-blue-300' },
+    { label: 'Idle', value: counts.idle, tone: 'text-slate-500' },
+    { label: 'Spend', value: formatCost(cost), tone: 'text-slate-100' },
   ];
 
   return (
-    <div className="surface grid grid-cols-2 divide-x divide-y divide-slate-100 overflow-hidden lg:grid-cols-4 lg:divide-y-0">
+    <div className="surface grid grid-cols-2 divide-x divide-y divide-white/5 overflow-hidden lg:grid-cols-4 lg:divide-y-0">
       {tiles.map((tile) => (
         <div key={tile.label} className="px-5 py-4 sm:px-6">
           <p className="text-[10px] uppercase tracking-[0.14em] font-semibold text-slate-400">{tile.label}</p>
@@ -277,11 +277,11 @@ const AgentStatusView = () => {
     <div className="page-wrap">
       <div className="flex justify-between items-center">
         <div>
-          <h2 className="text-xl font-semibold tracking-tight text-slate-900">Live agents</h2>
-          <p className="mt-1 text-sm text-slate-500">See what is running, blocked, and costing you—without opening every agent.</p>
+          <h2 className="text-xl font-semibold tracking-tight text-slate-100">Live agents</h2>
+          <p className="mt-1 text-sm text-slate-400">See what is running, blocked, and costing you—without opening every agent.</p>
         </div>
         <span
-          className="flex items-center gap-2 text-xs text-gray-500"
+          className="flex items-center gap-2 text-xs text-slate-500"
           title={live ? 'Streaming updates from the proxy' : 'Falling back to polling every few seconds'}
         >
           {live ? <Wifi size={14} className="text-emerald-500" /> : <WifiOff size={14} className="text-gray-400" />}
@@ -290,9 +290,9 @@ const AgentStatusView = () => {
       </div>
 
       {error && (
-        <div className="rounded-xl border border-red-200 bg-red-50 px-5 py-4 text-sm text-red-800">
+        <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-5 py-4 text-sm text-red-200">
           <p className="font-semibold">Can't reach the Harnesswurm backend.</p>
-          <p className="mt-1 text-red-700">{error}</p>
+          <p className="mt-1 text-red-300/80">{error}</p>
         </div>
       )}
 
@@ -308,8 +308,8 @@ const AgentStatusView = () => {
       ) : (
         !error && (
           <div className="surface py-16 text-center">
-            <Bot size={40} className="mx-auto text-gray-200 mb-3" />
-            <p className="text-gray-400 text-sm">
+            <Bot size={40} className="mx-auto text-slate-700 mb-3" />
+            <p className="text-slate-500 text-sm">
               {loaded
                 ? 'No agent sessions yet. Point an agent at this proxy and send it a task.'
                 : 'Loading agent sessions…'}
