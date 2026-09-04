@@ -260,6 +260,20 @@ impl Database {
             );"
         ).execute(&pool).await?;
 
+        // Attention states a human has acknowledged. The marker is the last
+        // task id the dismissal covers, so any newer call re-arms the badge
+        // without this table ever being touched again.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS session_dismissals (
+                agent_id INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                dismissed_up_to_task_id INTEGER NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (agent_id, session_id),
+                FOREIGN KEY(agent_id) REFERENCES agents(id)
+            );"
+        ).execute(&pool).await?;
+
         // Older on-disk databases predate these columns; add them in place so
         // existing installs upgrade without losing history.
         Self::add_column_if_missing(&pool, "tasks", "provider", "TEXT").await?;
@@ -1002,6 +1016,57 @@ impl Database {
         Ok(true)
     }
 
+    /// Acknowledges whatever attention state a run is currently in. The
+    /// marker is the run's most recent task id, so the badge stays quiet
+    /// until the run makes its next call — there is no un-dismiss; fresh
+    /// activity is what brings it back.
+    /// Returns false when the agent or the session has no recorded calls.
+    pub async fn dismiss_session(
+        &self,
+        agent_name: &str,
+        session_id: Option<&str>,
+    ) -> Result<bool> {
+        let agent_id: Option<i64> = sqlx::query("SELECT id FROM agents WHERE name = ?")
+            .bind(agent_name)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| row.get(0));
+
+        let agent_id = match agent_id {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let session_key = session_id.unwrap_or("");
+
+        let last_task_id: Option<i64> =
+            sqlx::query("SELECT MAX(id) FROM tasks WHERE agent_id = ? AND session_id = ?")
+                .bind(agent_id)
+                .bind(session_key)
+                .fetch_one(&self.pool)
+                .await?
+                .get(0);
+
+        let last_task_id = match last_task_id {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+
+        sqlx::query(
+            "INSERT INTO session_dismissals (agent_id, session_id, dismissed_up_to_task_id)
+             VALUES (?, ?, ?)
+             ON CONFLICT(agent_id, session_id) DO UPDATE SET
+                dismissed_up_to_task_id = excluded.dismissed_up_to_task_id,
+                updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(agent_id)
+        .bind(session_key)
+        .bind(last_task_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(true)
+    }
+
     /// One row per task, aggregated across its metric rows (a streaming task
     /// logs a single final row today, but MAX() keeps this correct even for
     /// older multi-row history from before that change).
@@ -1168,11 +1233,14 @@ impl Database {
                 c.tokens_limit AS tokens_limit,
                 c.age_seconds AS age_seconds,
                 c.idle_seconds AS idle_seconds,
+                sd.dismissed_up_to_task_id AS dismissed_up_to_task_id,
                 e.name AS experiment_name
              FROM agg
              JOIN agents a ON a.id = agg.agent_id
              JOIN call c ON c.id = agg.last_task_id
              LEFT JOIN experiments e ON e.id = c.experiment_id
+             LEFT JOIN session_dismissals sd
+                ON sd.agent_id = agg.agent_id AND sd.session_id = agg.session_id
              ORDER BY agg.last_seen DESC, agg.last_task_id DESC
              LIMIT ?"
         )
@@ -1194,13 +1262,20 @@ impl Database {
             };
             let state = session_state::derive_state(&last_call);
 
+            // A dismissal covers everything up to its marker; a newer call
+            // (higher id) re-arms the attention state on its own.
+            let dismissed = row
+                .get::<Option<i64>, _>("dismissed_up_to_task_id")
+                .is_some_and(|marker| marker >= row.get::<i64, _>("last_task_id"));
+
             json!({
                 "agent_name": row.get::<String, _>("agent_name"),
                 "session_id": row.get::<Option<String>, _>("session_id"),
                 "state": state.state,
                 "state_label": state.label,
                 "state_detail": state.detail,
-                "needs_attention": state.needs_attention,
+                "needs_attention": state.needs_attention && !dismissed,
+                "dismissed": dismissed,
                 "call_count": row.get::<i64, _>("call_count"),
                 "first_seen": row.get::<Option<String>, _>("first_seen"),
                 "last_seen": row.get::<Option<String>, _>("last_seen"),
@@ -1666,6 +1741,50 @@ mod tests {
         assert_eq!(s1["state"], "interrupted");
         let s2 = sessions.iter().find(|s| s["session_id"] == "s2").unwrap();
         assert_eq!(s2["state"], "waiting_for_you");
+
+        Ok(())
+    }
+
+    /// Dismissing quiets the attention badge for the calls that exist today;
+    /// the run's next call re-arms it, with no second write needed.
+    #[tokio::test]
+    async fn dismissing_quiets_attention_until_the_next_call() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let agent_id = db.get_or_create_agent("kilo").await?;
+        let task_id = db.create_task(agent_id, None, None, Some("s1".to_string()), None, None).await?;
+        db.finish_task(task_id, &ok_outcome("end_turn", true)).await?;
+
+        let sessions = db.get_sessions(10).await?;
+        assert_eq!(sessions[0]["needs_attention"], true);
+        assert_eq!(sessions[0]["dismissed"], false);
+
+        assert!(db.dismiss_session("kilo", Some("s1")).await?);
+
+        let sessions = db.get_sessions(10).await?;
+        assert_eq!(sessions[0]["needs_attention"], false, "dismissed badge is quiet");
+        assert_eq!(sessions[0]["dismissed"], true);
+        assert_eq!(sessions[0]["state"], "waiting_for_you", "the state text stays truthful");
+
+        let next = db.create_task(agent_id, None, None, Some("s1".to_string()), None, None).await?;
+        db.finish_task(next, &ok_outcome("end_turn", true)).await?;
+
+        let sessions = db.get_sessions(10).await?;
+        assert_eq!(sessions[0]["needs_attention"], true, "a newer call re-arms the badge");
+        assert_eq!(sessions[0]["dismissed"], false);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dismissing_an_unknown_agent_or_empty_session_is_refused() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        assert!(!db.dismiss_session("nobody", Some("s1")).await?, "no such agent");
+
+        let agent_id = db.get_or_create_agent("kilo").await?;
+        assert!(
+            !db.dismiss_session("kilo", Some("no-such-session")).await?,
+            "agent exists, but the session has no calls to dismiss"
+        );
 
         Ok(())
     }

@@ -387,6 +387,11 @@ Two caveats worth knowing:
   Harnesswurm doesn't front, or using a subscription rather than API keys,
   contributes nothing.
 
+States that want a human keep flagging until the run's *next call* — the
+Agents view's bell button acknowledges one without deleting it, so a run you
+have already dealt with stops lighting up the dashboard while its history
+stays intact.
+
 Calls left open by a killed process are closed out as *Interrupted* on the
 next startup, so nothing shows as permanently "Thinking".
 
@@ -526,6 +531,11 @@ calls are proxied, so traffic captured before this existed shows no tools.
 - `GET /v1/analytics/tasks` — most recent calls across all agents (model, provider, tokens, cache tokens, tool calls, latency, cost, call status, and a short preview of what was asked).
 - `GET /v1/analytics/tasks/:id/traffic` — the full raw request/response body for one call.
 - `GET /v1/analytics/sessions` — one row per agent+session: derived state, totals, spend, and the last question asked.
+- `PUT /v1/analytics/sessions/dismiss` — acknowledge a run's attention state:
+  `{"agent_name": "kilo", "session_id": "issue-1284-kilo"}`. The row keeps its
+  truthful state text but reports `needs_attention: false` and
+  `dismissed: true` until the run's next call, which re-arms the badge on its
+  own — there is no un-dismiss.
 - `GET /v1/analytics/limits` — current quota per provider, folded from the most recent reading of each header.
 - `GET /v1/providers` — the configured providers and the URL each one forwards
   to, plus `env_override` when a variable is supplying the base URL in effect.
