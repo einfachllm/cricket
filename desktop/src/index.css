@@ -11,7 +11,7 @@ button, input, select { font: inherit; }
 code, .font-mono { font-family: 'JetBrains Mono', ui-monospace, monospace !important; }
 
 @layer components {
-  .page-wrap { @apply space-y-6 px-5 py-6 sm:px-8 sm:py-8 lg:px-10; }
+  .page-wrap { @apply space-y-4 px-3 py-4; }
   .surface { @apply rounded-2xl border border-white/10 bg-[#151a23] shadow-[0_1px_2px_rgba(0,0,0,0.35)]; }
   .empty-panel { @apply surface flex min-h-[280px] flex-col items-center justify-center gap-2 text-slate-500; }
   .empty-panel h2 { @apply mt-2 text-base font-semibold text-slate-200; }
@@ -19,7 +19,7 @@ code, .font-mono { font-family: 'JetBrains Mono', ui-monospace, monospace !impor
 }
 
 ::selection { background: #4338ca; color: #e0e7ff; }
-::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #2a3140; border: 3px solid transparent; border-radius: 99px; background-clip: padding-box; }
 ::-webkit-scrollbar-thumb:hover { background: #3a4356; border: 3px solid transparent; background-clip: padding-box; }

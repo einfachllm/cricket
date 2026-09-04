@@ -1,6 +1,14 @@
 {
   "identifier": "default",
-  "description": "Baseline window/core permissions for the main window. The app talks to its embedded backend over plain HTTP fetch from the webview, not Tauri commands, so nothing beyond core defaults is granted here yet — add plugin permissions here if/when the frontend starts calling into Rust directly.",
+  "description": "Baseline window/core permissions for the main window. The app talks to its embedded backend over plain HTTP fetch from the webview, so no plugins are granted — but the window is frameless (decorations: false), so the custom header needs the core window permissions for dragging, the min/max/close buttons, and the always-on-top pin toggle.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-internal-toggle-maximize",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-always-on-top"
+  ]
 }

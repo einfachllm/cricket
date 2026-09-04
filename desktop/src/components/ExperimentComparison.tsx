@@ -317,7 +317,7 @@ function AgentRollupTable({ rollups }: { rollups: AgentRollup[] }) {
   const singleAttempts = rollups.every((rollup) => rollup.runs <= 1);
 
   return (
-    <div className="px-6 py-5 space-y-2 border-t border-white/5 bg-white/[0.02]">
+    <div className="px-4 py-4 space-y-2 border-t border-white/5 bg-white/[0.02]">
       <div className="flex items-baseline justify-between gap-3 flex-wrap">
         <h4 className="text-sm font-semibold text-slate-300">Per agent</h4>
         {singleAttempts && (
@@ -326,7 +326,7 @@ function AgentRollupTable({ rollups }: { rollups: AgentRollup[] }) {
           </p>
         )}
       </div>
-      <table className="w-full text-sm" aria-label="Per agent">
+      <table className="w-full text-xs" aria-label="Per agent">
         <thead className="text-xs uppercase text-slate-500">
           <tr>
             <th className="py-1 text-left font-semibold">Agent</th>
@@ -397,10 +397,27 @@ function RunRow({
   onSelect: (run: RunComparison) => void;
 }) {
   const issues = run.error_calls + run.rate_limited_calls;
+  const costLine = !runIsFinal(run) ? (
+    <span
+      className="text-blue-300"
+      title={`${run.in_flight_calls} call(s) still open — this run is still spending`}
+    >
+      {formatCost(run.total_cost)} so far
+    </span>
+  ) : costIsKnown(run) ? (
+    <span className="font-semibold text-slate-100">{formatCost(run.total_cost)}</span>
+  ) : (
+    <span
+      className="text-amber-300"
+      title={`${run.unpriced_calls} of ${run.call_count} calls used a model with no price in pricing.yaml`}
+    >
+      ≥ {formatCost(run.total_cost)}
+    </span>
+  );
 
   return (
     <tr className={isWinner ? 'bg-emerald-500/10' : undefined}>
-      <td className="px-4 py-3">
+      <td className="px-3 py-3">
         <div className="flex items-center gap-2">
           {isWinner ? (
             <Trophy size={14} className="text-amber-400 shrink-0" />
@@ -417,61 +434,40 @@ function RunRow({
             {run.agent_name}
           </button>
         </div>
-        <p className="text-xs text-slate-500 font-mono truncate max-w-[16rem]" title={run.session_id ?? ''}>
+        <p className="text-xs text-slate-500 font-mono truncate max-w-[10rem]" title={run.session_id ?? ''}>
           {run.sessions > 1 ? `${run.sessions} sessions merged` : (run.session_id ?? 'no session id')}
         </p>
-        <p className="text-xs text-slate-500 truncate max-w-[16rem]" title={run.models ?? ''}>
+        <p className="text-xs text-slate-500 truncate max-w-[10rem]" title={run.models ?? ''}>
           {run.models ?? 'unknown model'}
         </p>
+        <div className="mt-2">
+          <VerdictToggle run={run} onChange={onVerdict} />
+          {run.verdict_note && <p className="text-xs text-slate-500 mt-1">{run.verdict_note}</p>}
+        </div>
       </td>
-      <td className="px-4 py-3">
-        <VerdictToggle run={run} onChange={onVerdict} />
-        {run.verdict_note && <p className="text-xs text-slate-500 mt-1">{run.verdict_note}</p>}
-      </td>
-      <td className="px-4 py-3 text-right">
-        {!runIsFinal(run) ? (
-          <span
-            className="text-blue-300 text-xs"
-            title={`${run.in_flight_calls} call(s) still open — this run is still spending`}
-          >
-            {formatCost(run.total_cost)} so far
-          </span>
-        ) : costIsKnown(run) ? (
-          <span className="font-semibold text-slate-100">{formatCost(run.total_cost)}</span>
-        ) : (
-          <span
-            className="text-amber-300 text-xs"
-            title={`${run.unpriced_calls} of ${run.call_count} calls used a model with no price in pricing.yaml`}
-          >
-            ≥ {formatCost(run.total_cost)}
-          </span>
-        )}
-      </td>
-      <td className="px-4 py-3 text-right text-slate-400 whitespace-nowrap">
-        {formatTokens(run.input_tokens)} <span className="text-slate-500">in</span>
-        <br />
-        {formatTokens(run.output_tokens)} <span className="text-slate-500">out</span>
-      </td>
-      <td className="px-4 py-3 text-right text-slate-400" title="Input tokens served from the prompt cache">
-        {formatTokens(run.cache_read_tokens)}
-      </td>
-      <td className="px-4 py-3 text-right text-slate-400">{run.call_count}</td>
-      <td className="px-4 py-3 text-right text-slate-400">{run.tool_calls}</td>
-      <td className="px-4 py-3 text-right text-slate-400 whitespace-nowrap">
+      <td className="px-3 py-3 text-right text-xs text-slate-400">
+        <span className="block whitespace-nowrap text-sm">{costLine}</span>
+        <span className="block">
+          {formatTokens(run.input_tokens)} <span className="text-slate-500">in</span> / {formatTokens(run.output_tokens)} <span className="text-slate-500">out</span>
+        </span>
+        <span className="block" title="Input tokens served from the prompt cache">
+          {formatTokens(run.cache_read_tokens)} <span className="text-slate-500">cached</span>
+        </span>
+        <span className="block">
+          {run.call_count} call{run.call_count === 1 ? '' : 's'}, {run.tool_calls} tool{run.tool_calls === 1 ? '' : 's'}
+        </span>
         <span className="inline-flex items-center gap-1">
-          <Clock size={12} className="text-slate-500" />
+          <Clock size={11} className="text-slate-500" />
           {humanizeSecs(run.wall_clock_seconds)}
         </span>
-      </td>
-      <td className="px-4 py-3 text-right">
         {issues > 0 ? (
-          <span className="text-red-300 text-xs">
+          <span className="block text-red-300">
             {run.error_calls > 0 && `${run.error_calls} failed`}
             {run.error_calls > 0 && run.rate_limited_calls > 0 && ', '}
             {run.rate_limited_calls > 0 && `${run.rate_limited_calls} limited`}
           </span>
         ) : (
-          <span className="text-slate-600">–</span>
+          <span className="block text-slate-600">–</span>
         )}
       </td>
     </tr>
@@ -480,14 +476,7 @@ function RunRow({
 
 const COLUMNS = [
   { label: 'Run', align: 'text-left' },
-  { label: 'Solved it?', align: 'text-left' },
-  { label: 'Cost', align: 'text-right' },
-  { label: 'Tokens', align: 'text-right' },
-  { label: 'Cached', align: 'text-right' },
-  { label: 'Calls', align: 'text-right' },
-  { label: 'Tools', align: 'text-right' },
-  { label: 'Wall clock', align: 'text-right' },
-  { label: 'Issues', align: 'text-right' },
+  { label: 'Cost & load', align: 'text-right' },
 ] as const;
 
 /// Side-by-side of every run in one experiment. The Analytics time series
@@ -560,9 +549,9 @@ const ExperimentComparison = ({
 
   return (
     <div className="bg-[#151a23] rounded-2xl border border-white/10 overflow-hidden">
-      <div className="p-6 pb-4 space-y-3">
+      <div className="p-4 pb-3 space-y-3">
         <div className="flex items-start justify-between gap-4 flex-wrap">
-          <h3 className="text-lg font-semibold text-slate-200">Which run solved it cheaper?</h3>
+          <h3 className="text-base font-semibold text-slate-200">Which run solved it cheaper?</h3>
           <GroupingToggle grouping={grouping} onChange={onGroupingChange} />
         </div>
         {error ? (

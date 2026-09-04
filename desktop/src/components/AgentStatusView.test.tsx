@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
-import AgentStatusView, { sortSessions } from './AgentStatusView'
+import AgentStatusView, { groupSessions, sortSessions } from './AgentStatusView'
 import { SessionsProvider } from '../hooks/useSessions'
 import type { SessionSummary } from '../lib/api'
 
@@ -103,6 +103,43 @@ describe('sortSessions', () => {
     const input = [session({ session_id: 'a', state: 'idle' }), session({ session_id: 'b', state: 'working' })]
     sortSessions(input)
     expect(input.map((s) => s.session_id)).toEqual(['a', 'b'])
+  })
+})
+
+describe('groupSessions', () => {
+  test('everything live or blocked counts as running, at-rest states as finished', () => {
+    const grouped = groupSessions([
+      session({ session_id: 'idle', state: 'idle' }),
+      session({ session_id: 'working', state: 'working' }),
+      session({ session_id: 'asking', state: 'waiting_for_you', needs_attention: true }),
+      session({ session_id: 'limited', state: 'rate_limited', needs_attention: true }),
+      session({ session_id: 'cut', state: 'interrupted' }),
+      session({ session_id: 'broken', state: 'error' }),
+    ])
+
+    expect(grouped.running.map((s) => s.session_id)).toEqual(['working', 'asking', 'limited', 'broken'])
+    expect(grouped.finished.map((s) => s.session_id)).toEqual(['idle', 'cut'])
+  })
+
+  test('a dismissed run is finished whatever its state says', () => {
+    const grouped = groupSessions([
+      session({ session_id: 'seen', state: 'waiting_for_you', dismissed: true }),
+      session({ session_id: 'busy', state: 'working' }),
+    ])
+
+    expect(grouped.running.map((s) => s.session_id)).toEqual(['busy'])
+    expect(grouped.finished.map((s) => s.session_id)).toEqual(['seen'])
+  })
+
+  test('keeps the order it was given within each group', () => {
+    const input = [
+      session({ session_id: 'fresh', state: 'idle', idle_seconds: 10 }),
+      session({ session_id: 'stale', state: 'idle', idle_seconds: 900 }),
+    ]
+    const grouped = groupSessions(input)
+
+    expect(grouped.finished.map((s) => s.session_id)).toEqual(['fresh', 'stale'])
+    expect(input.map((s) => s.session_id)).toEqual(['fresh', 'stale'])
   })
 })
 

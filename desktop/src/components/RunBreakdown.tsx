@@ -310,7 +310,7 @@ const RunBreakdown = ({
 
   if (error) {
     return (
-      <div className="bg-[#151a23] rounded-2xl border border-white/10 p-6">
+      <div className="bg-[#151a23] rounded-2xl border border-white/10 p-4">
         <p className="text-sm text-red-300">Couldn't load the breakdown: {error}</p>
       </div>
     );
@@ -319,10 +319,10 @@ const RunBreakdown = ({
   if (loaded && runs.length === 0) return null;
 
   return (
-    <div className="bg-[#151a23] rounded-2xl border border-white/10 p-6 space-y-5">
+    <div className="bg-[#151a23] rounded-2xl border border-white/10 p-4 space-y-4">
       <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
-          <h3 className="text-lg font-semibold text-slate-200">Where the money went</h3>
+          <h3 className="text-base font-semibold text-slate-200">Where the money went</h3>
           <p className="text-sm text-slate-400 mt-1 max-w-2xl">
             Each run's calls cut into five slices of equal length. Early slices are the agent reading
             its way in; later ones are generation. Panels are scaled to their own peak, so compare the
@@ -333,7 +333,7 @@ const RunBreakdown = ({
       </div>
 
       {loaded ? (
-        <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-x-8 gap-y-7">
+        <div className="grid grid-cols-1 gap-x-8 gap-y-7">
           {runs.map((run) => (
             <RunPanel
               key={`${run.agent_name}:${run.session_key}`}

@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Radio, RefreshCw, X, MessageCircleQuestion } from 'lucide-react';
-import { fetchJson, formatCost, formatTimestampUtc } from '../lib/api';
+import { fetchJson, formatCost, formatTimestampUtc, formatTokens } from '../lib/api';
 import { CollapsibleJson } from './CollapsibleJson';
 
 interface TaskSummary {
@@ -101,19 +101,6 @@ export function filterTasks(
     );
 }
 
-function ProviderBadge({ provider }: { provider: string | null }) {
-  const color = provider === 'anthropic'
-    ? 'bg-orange-400/15 text-orange-300'
-    : provider === 'openai'
-      ? 'bg-emerald-500/15 text-emerald-300'
-      : 'bg-white/[0.06] text-slate-400';
-  return (
-    <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${color}`}>
-      {provider || 'unknown'}
-    </span>
-  );
-}
-
 const TrafficView = () => {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [agentFilter, setAgentFilter] = useState<string>('all');
@@ -182,29 +169,40 @@ const TrafficView = () => {
 
   return (
     <div className="page-wrap">
-      <div className="flex justify-between items-center">
-        <h2 className="text-3xl font-bold text-slate-100 flex items-center gap-2">
-          <Radio size={28} className="text-indigo-400" />
+      <div className="flex items-center justify-between gap-2">
+        <h2 className="flex items-center gap-2 text-lg font-semibold tracking-tight text-slate-100">
+          <Radio size={18} className="text-indigo-400" />
           Traffic
         </h2>
-        <div className="flex items-center gap-3">
-          <input
-            value={query}
-            onChange={(e) => { setQuery(e.target.value); setPage(0); }}
-            placeholder="Search agent or task..."
-            className="border border-white/10 rounded-lg px-3 py-2 text-sm bg-white/[0.04] text-slate-200 placeholder-slate-500"
-          />
+        <button
+          onClick={fetchTasks}
+          title="Reload the captured calls"
+          className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-xs text-slate-300 hover:bg-white/[0.08]"
+        >
+          <RefreshCw size={13} className={loading ? 'animate-spin' : ''} />
+          Refresh
+        </button>
+      </div>
+
+      <div className="space-y-2">
+        <input
+          value={query}
+          onChange={(e) => { setQuery(e.target.value); setPage(0); }}
+          placeholder="Search agent or task..."
+          className="w-full border border-white/10 rounded-lg px-3 py-2 text-sm bg-white/[0.04] text-slate-200 placeholder-slate-500"
+        />
+        <div className="flex items-center gap-2">
           <select
             value={agentFilter}
             onChange={(e) => { setAgentFilter(e.target.value); setPage(0); }}
-            className="border border-white/10 rounded-lg px-3 py-2 text-sm bg-white/[0.04] text-slate-200"
+            className="min-w-0 flex-1 border border-white/10 rounded-lg px-2 py-1.5 text-sm bg-white/[0.04] text-slate-200"
           >
             <option value="all">All agents</option>
             {agents.map((a) => (
               <option key={a} value={a}>{a}</option>
             ))}
           </select>
-          <label className="flex items-center gap-2 text-sm text-slate-400 select-none cursor-pointer">
+          <label className="flex shrink-0 items-center gap-1.5 text-xs text-slate-400 select-none cursor-pointer">
             <input
               type="checkbox"
               checked={questionsOnly}
@@ -213,13 +211,6 @@ const TrafficView = () => {
             />
             Questions only
           </label>
-          <button
-            onClick={fetchTasks}
-            className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] text-slate-300"
-          >
-            <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
-            Refresh
-          </button>
         </div>
       </div>
 
@@ -228,19 +219,9 @@ const TrafficView = () => {
           <table className="w-full text-sm">
             <thead className="bg-white/[0.04] text-slate-500 uppercase text-xs">
               <tr>
-                <th className="text-left px-4 py-3 font-semibold">Time</th>
-                <th className="text-left px-4 py-3 font-semibold">Agent</th>
-                <th className="text-left px-4 py-3 font-semibold">Session</th>
-                <th className="text-left px-4 py-3 font-semibold">Task</th>
-                <th className="text-left px-4 py-3 font-semibold">Status</th>
-                <th className="text-left px-4 py-3 font-semibold">Model</th>
-                <th className="text-left px-4 py-3 font-semibold">Provider</th>
-                <th className="text-right px-4 py-3 font-semibold">Input</th>
-                <th className="text-right px-4 py-3 font-semibold">Cache R/W</th>
-                <th className="text-right px-4 py-3 font-semibold">Output</th>
-                <th className="text-right px-4 py-3 font-semibold">Tools</th>
-                <th className="text-right px-4 py-3 font-semibold">Latency</th>
-                <th className="text-right px-4 py-3 font-semibold">Cost</th>
+                <th className="text-left px-3 py-2.5 font-semibold">Call</th>
+                <th className="text-left px-3 py-2.5 font-semibold">Status</th>
+                <th className="text-right px-3 py-2.5 font-semibold">Cost</th>
               </tr>
             </thead>
             <tbody>
@@ -248,48 +229,54 @@ const TrafficView = () => {
                 <tr
                   key={task.task_id}
                   onClick={() => setSelectedId(task.task_id)}
-                  className={`border-t border-white/5 cursor-pointer hover:bg-white/[0.03] transition-colors ${
+                  className={`border-t border-white/5 cursor-pointer align-top hover:bg-white/[0.03] transition-colors ${
                     selectedId === task.task_id ? 'bg-indigo-500/10' : ''
                   }`}
                 >
-                  <td className="px-4 py-3 text-slate-500 whitespace-nowrap">
-                    {formatTimestampUtc(task.timestamp)}
-                  </td>
-                  <td className="px-4 py-3 font-medium text-slate-200">{task.agent_name}</td>
-                  <td
-                    className="px-4 py-3 text-slate-500 font-mono text-xs max-w-[10rem] truncate"
-                    title={task.session_id ?? ''}
-                  >
-                    {task.session_id || <span className="text-slate-600">–</span>}
-                  </td>
-                  <td className="px-4 py-3 text-slate-400 max-w-xs truncate" title={task.task_description || ''}>
-                    <span className="inline-flex items-center gap-1.5 max-w-full">
+                  <td className="px-3 py-2.5 min-w-0">
+                    <span className="flex items-center gap-1.5 text-slate-300">
                       {task.agent_question_text && (
                         <span title={`Agent asked: ${task.agent_question_text}`} className="shrink-0 text-amber-400">
                           <MessageCircleQuestion size={14} />
                         </span>
                       )}
-                      <span className="truncate">
+                      <span className="truncate" title={task.task_description || ''}>
                         {task.task_description || <span className="text-slate-600">–</span>}
                       </span>
                     </span>
+                    <span className="mt-0.5 flex items-center gap-1.5 text-xs text-slate-500">
+                      <span className="font-medium text-slate-400">{task.agent_name}</span>
+                      <span aria-hidden>·</span>
+                      <span className="truncate font-mono text-xs" title={task.session_id ?? ''}>
+                        {task.session_id || <span className="text-slate-600">–</span>}
+                      </span>
+                    </span>
+                    <span className="mt-0.5 flex items-center gap-1.5 text-[11px] text-slate-600">
+                      <span className="truncate" title={`${task.provider || 'unknown'} · ${task.model_name || 'unknown model'}`}>
+                        {task.provider || 'unknown'} · {task.model_name || 'unknown model'}
+                      </span>
+                      <span aria-hidden>·</span>
+                      <span className="shrink-0">{formatTimestampUtc(task.timestamp)}</span>
+                    </span>
                   </td>
-                  <td className="px-4 py-3"><StatusBadge task={task} /></td>
-                  <td className="px-4 py-3 text-slate-400 font-mono text-xs">{task.model_name || '–'}</td>
-                  <td className="px-4 py-3"><ProviderBadge provider={task.provider} /></td>
-                  <td className="px-4 py-3 text-right text-slate-300 tabular-nums">{(task.prompt_tokens ?? 0).toLocaleString()}</td>
-                  <td className="px-4 py-3 text-right text-slate-500 tabular-nums">
-                    {(task.cache_read_tokens ?? 0).toLocaleString()}/{(task.cache_creation_tokens ?? 0).toLocaleString()}
+                  <td className="px-3 py-2.5">
+                    <StatusBadge task={task} />
+                    <span
+                      className="mt-1 block text-[11px] text-slate-600"
+                      title={task.ttfb_ms !== null ? `${task.ttfb_ms}ms to first byte` : undefined}
+                    >
+                      {formatDuration(task)}
+                    </span>
                   </td>
-                  <td className="px-4 py-3 text-right text-slate-300 tabular-nums">{(task.completion_tokens ?? 0).toLocaleString()}</td>
-                  <td className="px-4 py-3 text-right text-slate-300 tabular-nums">{task.tool_calls_count ?? 0}</td>
-                  <td
-                    className="px-4 py-3 text-right text-slate-500"
-                    title={task.ttfb_ms !== null ? `${task.ttfb_ms}ms to first byte` : undefined}
-                  >
-                    {formatDuration(task)}
+                  <td className="px-3 py-2.5 text-right">
+                    <span className="block font-semibold text-slate-100 tabular-nums">{formatCost(task.cost_estimate)}</span>
+                    <span className="mt-0.5 block text-[11px] text-slate-500 tabular-nums" title="Input / output tokens">
+                      {formatTokens(task.prompt_tokens)} / {formatTokens(task.completion_tokens)}
+                    </span>
+                    <span className="mt-0.5 block text-[11px] text-slate-600 tabular-nums" title="Tool calls">
+                      {task.tool_calls_count ?? 0} tool{task.tool_calls_count === 1 ? '' : 's'}
+                    </span>
                   </td>
-                  <td className="px-4 py-3 text-right font-semibold text-slate-100 tabular-nums">{formatCost(task.cost_estimate)}</td>
                 </tr>
               ))}
             </tbody>
@@ -300,7 +287,7 @@ const TrafficView = () => {
             </p>
           )}
           {visibleTasks.length > 0 && (
-            <div className="flex items-center justify-between px-4 py-3 border-t border-white/5 text-sm text-slate-400">
+            <div className="flex items-center justify-between px-3 py-2.5 border-t border-white/5 text-sm text-slate-400">
               <button
                 onClick={() => setPage((p) => Math.max(0, p - 1))}
                 disabled={safePage === 0}
@@ -321,52 +308,57 @@ const TrafficView = () => {
         </div>
       </div>
 
+      {/* In a window this narrow the raw traffic cannot sit below a long
+          table — it would land off-screen. It covers the view as a sheet
+          instead, and closing returns to the list exactly as it was. */}
       {selectedId !== null && (
-        <div className="surface p-6 space-y-4">
-          <div className="flex justify-between items-start gap-4">
-            <div>
-              <h3 className="text-lg font-semibold text-slate-200">
-                Task #{selectedId} raw traffic
-              </h3>
-              {traffic?.task_description && (
-                <p className="text-sm text-slate-500 mt-1">{traffic.task_description}</p>
-              )}
+        <div className="fixed inset-0 z-40 overflow-y-auto bg-[#0b0e14]/[0.97] p-3 backdrop-blur-sm">
+          <div className="surface space-y-4 p-4">
+            <div className="flex justify-between items-start gap-4">
+              <div>
+                <h3 className="text-base font-semibold text-slate-200">
+                  Task #{selectedId} raw traffic
+                </h3>
+                {traffic?.task_description && (
+                  <p className="text-sm text-slate-500 mt-1">{traffic.task_description}</p>
+                )}
+              </div>
+              <button onClick={() => setSelectedId(null)} aria-label="Close task detail" className="text-slate-500 hover:text-slate-300 shrink-0">
+                <X size={18} />
+              </button>
             </div>
-            <button onClick={() => setSelectedId(null)} className="text-slate-500 hover:text-slate-300 shrink-0">
-              <X size={20} />
-            </button>
+            {traffic?.agent_question_text && (
+              <div className="flex items-start gap-2 rounded-lg bg-amber-400/10 border border-amber-400/20 px-3 py-2">
+                <MessageCircleQuestion size={16} className="text-amber-400 shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-xs font-semibold text-amber-300 uppercase">
+                    Agent asked{traffic.agent_question_tool ? ` (${traffic.agent_question_tool})` : ''}
+                  </p>
+                  <p className="text-sm text-amber-200">{traffic.agent_question_text}</p>
+                </div>
+              </div>
+            )}
+            {trafficLoading ? (
+              <div className="h-32 flex items-center justify-center">
+                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-400"></div>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div>
+                  <p className="text-xs uppercase font-semibold text-slate-500 mb-2">Request</p>
+                  <div className="bg-black/40 border border-white/10 text-slate-200 text-xs rounded-lg p-3 overflow-auto max-h-96 whitespace-pre-wrap break-words">
+                    <CollapsibleJson raw={traffic?.request_body ?? null} />
+                  </div>
+                </div>
+                <div>
+                  <p className="text-xs uppercase font-semibold text-slate-500 mb-2">Response</p>
+                  <div className="bg-black/40 border border-white/10 text-slate-200 text-xs rounded-lg p-3 overflow-auto max-h-96 whitespace-pre-wrap break-words">
+                    <CollapsibleJson raw={traffic?.response_body ?? null} />
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
-          {traffic?.agent_question_text && (
-            <div className="flex items-start gap-2 rounded-lg bg-amber-400/10 border border-amber-400/20 px-3 py-2">
-              <MessageCircleQuestion size={16} className="text-amber-400 shrink-0 mt-0.5" />
-              <div>
-                <p className="text-xs font-semibold text-amber-300 uppercase">
-                  Agent asked{traffic.agent_question_tool ? ` (${traffic.agent_question_tool})` : ''}
-                </p>
-                <p className="text-sm text-amber-200">{traffic.agent_question_text}</p>
-              </div>
-            </div>
-          )}
-          {trafficLoading ? (
-            <div className="h-32 flex items-center justify-center">
-              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-400"></div>
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              <div>
-                <p className="text-xs uppercase font-semibold text-slate-500 mb-2">Request</p>
-                <div className="bg-black/40 border border-white/10 text-slate-200 text-xs rounded-lg p-4 overflow-auto max-h-96 whitespace-pre-wrap break-words">
-                  <CollapsibleJson raw={traffic?.request_body ?? null} />
-                </div>
-              </div>
-              <div>
-                <p className="text-xs uppercase font-semibold text-slate-500 mb-2">Response</p>
-                <div className="bg-black/40 border border-white/10 text-slate-200 text-xs rounded-lg p-4 overflow-auto max-h-96 whitespace-pre-wrap break-words">
-                  <CollapsibleJson raw={traffic?.response_body ?? null} />
-                </div>
-              </div>
-            </div>
-          )}
         </div>
       )}
     </div>

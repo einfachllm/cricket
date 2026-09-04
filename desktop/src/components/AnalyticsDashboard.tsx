@@ -96,16 +96,16 @@ const AnalyticsDashboard = () => {
 
   return (
     <div className="page-wrap">
-      <div className="flex justify-between items-center">
-        <h2 className="text-3xl font-bold text-slate-100">Experiment Analytics</h2>
-        <div className="flex gap-3">
-            <div className="bg-blue-500/10 border border-blue-500/30 text-blue-300 px-4 py-2 rounded-full flex items-center gap-2">
-                <Activity size={16} />
-                <span className="font-semibold text-sm">Tasks: {filtered.length}</span>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-lg font-semibold tracking-tight text-slate-100">Experiment Analytics</h2>
+        <div className="flex flex-wrap gap-2">
+            <div className="bg-blue-500/10 border border-blue-500/30 text-blue-300 px-2.5 py-1 rounded-full flex items-center gap-1.5">
+                <Activity size={13} />
+                <span className="font-semibold text-xs">Tasks: {filtered.length}</span>
             </div>
-            <div className="bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 px-4 py-2 rounded-full flex items-center gap-2">
-                <TrendingUp size="16" />
-                <span className="font-semibold text-sm">Avg Latency: {Math.round(summary.avgLatency)}ms</span>
+            <div className="bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 px-2.5 py-1 rounded-full flex items-center gap-1.5">
+                <TrendingUp size="13" />
+                <span className="font-semibold text-xs">Avg Latency: {Math.round(summary.avgLatency)}ms</span>
             </div>
         </div>
       </div>
@@ -171,20 +171,20 @@ const AnalyticsDashboard = () => {
         </button>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+      <div className="grid grid-cols-2 gap-3">
         <Card>
           <p className="text-[10px] text-slate-500 uppercase tracking-[0.14em] font-semibold">Total Prompt Tokens</p>
-          <p className="mt-1 text-2xl font-bold text-slate-100 tabular-nums">{summary.totalPrompt.toLocaleString()}</p>
+          <p className="mt-1 text-lg font-bold text-slate-100 tabular-nums">{summary.totalPrompt.toLocaleString()}</p>
         </Card>
         <Card>
           <p className="text-[10px] text-slate-500 uppercase tracking-[0.14em] font-semibold">Total Completion Tokens</p>
-          <p className="mt-1 text-2xl font-bold text-slate-100 tabular-nums">{summary.totalCompletion.toLocaleString()}</p>
+          <p className="mt-1 text-lg font-bold text-slate-100 tabular-nums">{summary.totalCompletion.toLocaleString()}</p>
         </Card>
         <Card>
           <p className="text-[10px] text-slate-500 uppercase tracking-[0.14em] font-semibold flex items-center gap-1">
             <DollarSign size={14} /> Total Cost
           </p>
-          <p className="mt-1 text-2xl font-bold text-slate-100 tabular-nums">
+          <p className="mt-1 text-lg font-bold text-slate-100 tabular-nums">
             {formatCost(summary.totalCost)}
           </p>
           {summary.pricedCount < filtered.length && (
@@ -195,13 +195,13 @@ const AnalyticsDashboard = () => {
         </Card>
         <Card>
           <p className="text-[10px] text-slate-500 uppercase tracking-[0.14em] font-semibold">Total Requests</p>
-          <p className="mt-1 text-2xl font-bold text-slate-100 tabular-nums">{filtered.length}</p>
+          <p className="mt-1 text-lg font-bold text-slate-100 tabular-nums">{filtered.length}</p>
         </Card>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-        <Card className="lg:col-span-1 p-4">
-          <h3 className="text-lg font-semibold mb-4 text-slate-200">Experiments</h3>
+      <div className="grid grid-cols-1 gap-4">
+        <Card>
+          <h3 className="text-base font-semibold mb-3 text-slate-200">Experiments</h3>
           <div className="space-y-2">
             {experiments.map((exp) => (
               <div
@@ -214,7 +214,7 @@ const AnalyticsDashboard = () => {
               >
                 <button
                   onClick={() => setSelectedExperiment(exp.id.toString())}
-                  className="flex-1 min-w-0 text-left px-4 py-3"
+                  className="flex-1 min-w-0 text-left px-3 py-2.5"
                 >
                   <p className="font-medium truncate">{exp.name}</p>
                   <p className="text-xs opacity-70 truncate">{exp.description || 'No description'}</p>
@@ -233,7 +233,7 @@ const AnalyticsDashboard = () => {
           </div>
         </Card>
 
-        <div className="lg:col-span-3 space-y-6">
+        <div className="space-y-4">
           {selectedExperiment && (
             <ExperimentComparison
               experimentId={selectedExperiment}
@@ -248,7 +248,7 @@ const AnalyticsDashboard = () => {
             <Skeleton className="h-64" />
           ) : metrics.length > 0 ? (
             <div className="h-96 w-full">
-              <h3 className="text-lg font-semibold mb-4 text-slate-200">Token Usage Over Time</h3>
+              <h3 className="text-base font-semibold mb-4 text-slate-200">Token Usage Over Time</h3>
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={filtered}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(255,255,255,0.07)" />
@@ -281,7 +281,7 @@ const AnalyticsDashboard = () => {
           {!loading && metrics.length > 0 && (
             <Card>
               <div className="h-96 w-full">
-                <h3 className="text-lg font-semibold mb-4 text-slate-200">Tokens by Model</h3>
+                <h3 className="text-base font-semibold mb-4 text-slate-200">Tokens by Model</h3>
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={tokensByModel(filtered)} layout="vertical">
                     <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="rgba(255,255,255,0.07)" />
