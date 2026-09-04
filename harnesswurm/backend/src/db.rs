@@ -1067,6 +1067,77 @@ impl Database {
         Ok(true)
     }
 
+    /// Removes an agent and everything ever recorded about it: its calls,
+    /// metrics, captured traffic bodies, rate-limit readings, tool tallies,
+    /// verdicts and dismissals. Returns false when the agent is unknown.
+    pub async fn delete_agent(&self, agent_name: &str) -> Result<bool> {
+        let agent_id: Option<i64> = sqlx::query("SELECT id FROM agents WHERE name = ?")
+            .bind(agent_name)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| row.get(0));
+
+        let Some(agent_id) = agent_id else {
+            return Ok(false);
+        };
+
+        // Children of tasks first, then the tasks, then the agent. Foreign
+        // keys are declared but SQLite does not enforce them by default, so
+        // the cascade has to be explicit to leave no orphans behind.
+        for table in ["traffic", "metrics", "rate_limits", "task_tools"] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE task_id IN (SELECT id FROM tasks WHERE agent_id = ?)"
+            ))
+            .bind(agent_id)
+            .execute(&self.pool)
+            .await?;
+        }
+        sqlx::query("DELETE FROM session_verdicts WHERE agent_id = ?")
+            .bind(agent_id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM session_dismissals WHERE agent_id = ?")
+            .bind(agent_id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM tasks WHERE agent_id = ?")
+            .bind(agent_id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM agents WHERE id = ?")
+            .bind(agent_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(true)
+    }
+
+    /// Removes an experiment, ungrouping its calls rather than deleting
+    /// them: the calls belong to their agents, the experiment is only the
+    /// label. Returns false when the experiment is unknown.
+    pub async fn delete_experiment(&self, experiment_id: i64) -> Result<bool> {
+        let exists: Option<i64> = sqlx::query("SELECT id FROM experiments WHERE id = ?")
+            .bind(experiment_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| row.get(0));
+
+        if exists.is_none() {
+            return Ok(false);
+        }
+
+        sqlx::query("UPDATE tasks SET experiment_id = NULL WHERE experiment_id = ?")
+            .bind(experiment_id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM experiments WHERE id = ?")
+            .bind(experiment_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(true)
+    }
+
     /// One row per task, aggregated across its metric rows (a streaming task
     /// logs a single final row today, but MAX() keeps this correct even for
     /// older multi-row history from before that change).
@@ -1780,11 +1851,80 @@ mod tests {
         let db = Database::new("sqlite::memory:").await?;
         assert!(!db.dismiss_session("nobody", Some("s1")).await?, "no such agent");
 
-        let agent_id = db.get_or_create_agent("kilo").await?;
+        db.get_or_create_agent("kilo").await?;
         assert!(
             !db.dismiss_session("kilo", Some("no-such-session")).await?,
             "agent exists, but the session has no calls to dismiss"
         );
+
+        Ok(())
+    }
+
+    /// Deleting an agent must leave nothing behind: captured bodies, metric
+    /// rows, verdicts and the agent itself all go, while other agents'
+    /// history survives untouched.
+    #[tokio::test]
+    async fn deleting_an_agent_removes_its_entire_history() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let doomed = db.get_or_create_agent("doomed").await?;
+        let survivor = db.get_or_create_agent("survivor").await?;
+
+        let task_id = db.create_task(doomed, None, None, Some("s1".to_string()), None, None).await?;
+        db.log_metric(task_id, 100, 20, 0, 0, 0, 500, Some(0.01)).await?;
+        db.finish_task(task_id, &ok_outcome("end_turn", true)).await?;
+        db.dismiss_session("doomed", Some("s1")).await?;
+        sqlx::query("INSERT INTO traffic (task_id, request_body, response_body) VALUES (?, '{}', '{}')")
+            .bind(task_id)
+            .execute(&db.pool)
+            .await?;
+
+        let keep = db.create_task(survivor, None, None, Some("s1".to_string()), None, None).await?;
+        db.finish_task(keep, &ok_outcome("end_turn", true)).await?;
+
+        assert!(db.delete_agent("doomed").await?);
+        assert!(!db.delete_agent("doomed").await?, "a second delete finds nothing");
+
+        let sessions = db.get_sessions(10).await?;
+        assert_eq!(sessions.len(), 1, "only the survivor remains");
+        assert_eq!(sessions[0]["agent_name"], "survivor");
+        for table in ["traffic", "metrics", "rate_limits", "task_tools"] {
+            let orphan: i64 = sqlx::query(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE task_id IN (SELECT id FROM tasks WHERE agent_id = ?)"
+            ))
+            .bind(doomed)
+            .fetch_one(&db.pool)
+            .await?
+            .get(0);
+            assert_eq!(orphan, 0, "no orphaned rows in {table}");
+        }
+        for table in ["session_verdicts", "session_dismissals"] {
+            let orphan: i64 = sqlx::query(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE agent_id = ?"
+            ))
+            .bind(doomed)
+            .fetch_one(&db.pool)
+            .await?
+            .get(0);
+            assert_eq!(orphan, 0, "no orphaned rows in {table}");
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_an_experiment_ungroups_its_calls_instead_of_deleting_them() -> Result<()> {
+        let db = Database::new("sqlite::memory:").await?;
+        let agent_id = db.get_or_create_agent("kilo").await?;
+        let experiment = db.get_or_create_experiment("issue-1284", None).await?;
+        let task_id = db.create_task(agent_id, Some(experiment), None, Some("s1".to_string()), None, None).await?;
+        db.finish_task(task_id, &ok_outcome("end_turn", true)).await?;
+
+        assert!(db.delete_experiment(experiment).await?);
+        assert!(!db.delete_experiment(experiment).await?, "a second delete finds nothing");
+
+        let sessions = db.get_sessions(10).await?;
+        assert_eq!(sessions.len(), 1, "the call itself survives");
+        assert!(sessions[0]["experiment_name"].is_null(), "but it is no longer grouped");
 
         Ok(())
     }

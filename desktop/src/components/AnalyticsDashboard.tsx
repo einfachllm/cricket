@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, BarChart, Bar } from 'recharts';
-import { Activity, TrendingUp, AlertCircle, DollarSign } from 'lucide-react';
+import { Activity, TrendingUp, AlertCircle, DollarSign, Trash2 } from 'lucide-react';
 import ExperimentComparison from './ExperimentComparison';
 import RunBreakdown from './RunBreakdown';
+import { deleteExperiment } from '../lib/api';
 import type { RunGrouping } from '../lib/api';
 
 interface MetricData {
@@ -67,6 +68,22 @@ const AnalyticsDashboard = () => {
     }
   };
 
+  const removeExperiment = async (exp: Experiment) => {
+    if (!window.confirm(`Delete experiment "${exp.name}"? Its calls stay but become ungrouped. This cannot be undone.`)) {
+      return;
+    }
+    try {
+      await deleteExperiment(exp.id);
+      if (selectedExperiment === exp.id.toString()) {
+        setSelectedExperiment(null);
+        setMetrics([]);
+      }
+      await fetchExperiments();
+    } catch (error) {
+      console.error('Error deleting experiment:', error);
+    }
+  };
+
   const getSummary = () => {
     if (metrics.length === 0) return { totalPrompt: 0, totalCompletion: 0, avgLatency: 0, totalCost: 0, pricedCount: 0 };
     const totalPrompt = metrics.reduce((sum, m) => sum + m.prompt_tokens + m.cache_creation_tokens + m.cache_read_tokens, 0);
@@ -128,18 +145,30 @@ const AnalyticsDashboard = () => {
           <h3 className="text-lg font-semibold mb-4 text-gray-700">Experiments</h3>
           <div className="space-y-2">
             {experiments.map((exp) => (
-              <button
+              <div
                 key={exp.id}
-                onClick={() => setSelectedExperiment(exp.id.toString())}
-                className={`w-full text-left px-4 py-3 rounded-lg transition-colors ${
+                className={`flex items-center rounded-lg transition-colors ${
                   selectedExperiment === exp.id.toString()
                     ? 'bg-blue-600 text-white shadow-md'
                     : 'bg-gray-50 text-gray/70 hover:bg-gray-100'
                 }`}
               >
-                <p className="font-medium truncate">{exp.name}</p>
-                <p className="text-xs opacity-70 truncate">{exp.description || 'No description'}</p>
-              </button>
+                <button
+                  onClick={() => setSelectedExperiment(exp.id.toString())}
+                  className="flex-1 min-w-0 text-left px-4 py-3"
+                >
+                  <p className="font-medium truncate">{exp.name}</p>
+                  <p className="text-xs opacity-70 truncate">{exp.description || 'No description'}</p>
+                </button>
+                <button
+                  onClick={() => removeExperiment(exp)}
+                  title="Delete this experiment (its calls stay, ungrouped)"
+                  aria-label={`Delete experiment ${exp.name}`}
+                  className="mr-2 p-1.5 rounded-full text-gray-400 hover:text-red-600 hover:bg-white/60 transition-colors"
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
             ))}
             {experiments.length === 0 && <p className="text-gray-400 text-sm">No experiments found.</p>}
           </div>
