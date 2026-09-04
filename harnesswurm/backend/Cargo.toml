@@ -2,6 +2,9 @@
 name = "harnesswurm-backend"
 version = "0.1.0"
 edition = "2021"
+description = "Local proxy that records coding-agent LLM traffic — tokens, cache, tool calls, cost and live status"
+license = "Apache-2.0"
+repository = "https://github.com/einfachllm/harnesswurm"
 
 [dependencies]
 axum = "0.7"

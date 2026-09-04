@@ -1,5 +1,9 @@
 # Harnesswurm Backend
 
+> This is the reference documentation for the proxy. If you are just getting
+> started, read the [project README](../README.md) first — it covers install,
+> a quickstart and troubleshooting.
+
 A lightweight proxy server for monitoring coding-agent telemetry (tokens, cache
 usage, tool calls, latency, cost) in real-time, across OpenAI- and
 Anthropic-compatible agents.
@@ -570,3 +574,8 @@ Manual smoke test against a real provider (after adding your API key):
 python3 test_client.py             # OpenAI-style
 python3 test_client_anthropic.py   # Anthropic-style
 ```
+
+## License
+
+Apache License 2.0 — see [LICENSE](../LICENSE) at the repository root.
+Contributions are welcome; see [CONTRIBUTING.md](../CONTRIBUTING.md).
