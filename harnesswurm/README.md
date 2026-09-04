@@ -1,5 +1,9 @@
 # Harnesswurm Backend
 
+> This is the reference documentation for the proxy. If you are just getting
+> started, read the [project README](../README.md) first — it covers install,
+> a quickstart and troubleshooting.
+
 A lightweight proxy server for monitoring coding-agent telemetry (tokens, cache
 usage, tool calls, latency, cost) in real-time, across OpenAI- and
 Anthropic-compatible agents.
@@ -387,6 +391,11 @@ Two caveats worth knowing:
   Harnesswurm doesn't front, or using a subscription rather than API keys,
   contributes nothing.
 
+States that want a human keep flagging until the run's *next call* — the
+Agents view's bell button acknowledges one without deleting it, so a run you
+have already dealt with stops lighting up the dashboard while its history
+stays intact.
+
 Calls left open by a killed process are closed out as *Interrupted* on the
 next startup, so nothing shows as permanently "Thinking".
 
@@ -536,6 +545,12 @@ calls are proxied, so traffic captured before this existed shows no tools.
 
 ### Analytics API
 - `GET /v1/analytics/experiments` — list experiments.
+- `DELETE /v1/analytics/experiments/:id` — delete an experiment. Its calls
+  survive, ungrouped: the calls belong to their agents, the experiment is
+  only the label. Cannot be undone.
+- `DELETE /v1/analytics/agents/:name` — delete an agent **and** every call
+  recorded for it: metrics, captured traffic bodies, rate-limit readings,
+  tool tallies, verdicts and dismissals. Cannot be undone.
 - `GET /v1/analytics/experiments/:id/metrics` — metrics for one experiment, over time.
 - `GET /v1/analytics/experiments/:id/comparison[?group=session|agent]` — one
   row per run in the experiment: totals for cost, tokens, cache reads, tool
@@ -552,6 +567,11 @@ calls are proxied, so traffic captured before this existed shows no tools.
 - `GET /v1/analytics/tasks` — most recent calls across all agents (model, provider, tokens, cache tokens, tool calls, latency, cost, call status, and a short preview of what was asked).
 - `GET /v1/analytics/tasks/:id/traffic` — the full raw request/response body for one call.
 - `GET /v1/analytics/sessions` — one row per agent+session: derived state, totals, spend, and the last question asked.
+- `PUT /v1/analytics/sessions/dismiss` — acknowledge a run's attention state:
+  `{"agent_name": "kilo", "session_id": "issue-1284-kilo"}`. The row keeps its
+  truthful state text but reports `needs_attention: false` and
+  `dismissed: true` until the run's next call, which re-arms the badge on its
+  own — there is no un-dismiss.
 - `GET /v1/analytics/limits` — current quota per provider, folded from the most recent reading of each header.
 - `GET /v1/providers` — the configured providers and the URL each one forwards
   to, plus `env_override` when a variable is supplying the base URL in effect.
@@ -580,3 +600,8 @@ Manual smoke test against a real provider (after adding your API key):
 python3 test_client.py             # OpenAI-style
 python3 test_client_anthropic.py   # Anthropic-style
 ```
+
+## License
+
+Apache License 2.0 — see [LICENSE](../LICENSE) at the repository root.
+Contributions are welcome; see [CONTRIBUTING.md](../CONTRIBUTING.md).

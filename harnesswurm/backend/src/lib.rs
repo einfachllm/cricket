@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, Query, State, Request},
     http::{HeaderMap, Method, StatusCode},
     response::{sse::{Event, Sse}, IntoResponse, Response},
-    routing::{get, put},
+    routing::{delete, get, put},
     Router,
 };
 use anyhow::Result;
@@ -499,10 +499,13 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         // a new prefix shape can't drift out of sync with the routing.
         .route("/v1/providers", get(get_providers).put(put_providers))
         .route("/v1/analytics/experiments", get(get_experiments))
+        .route("/v1/analytics/experiments/:id", delete(delete_experiment))
+        .route("/v1/analytics/agents/:name", delete(delete_agent))
         .route("/v1/analytics/experiments/:id/metrics", get(get_experiment_metrics))
         .route("/v1/analytics/experiments/:id/comparison", get(get_experiment_comparison))
         .route("/v1/analytics/experiments/:id/breakdown", get(get_experiment_breakdown))
         .route("/v1/analytics/sessions/verdict", put(put_session_verdict))
+        .route("/v1/analytics/sessions/dismiss", put(put_dismiss_session))
         .route("/v1/analytics/tasks", get(get_recent_tasks))
         .route("/v1/analytics/tasks/:id/traffic", get(get_task_traffic))
         .route("/v1/analytics/sessions", get(get_sessions))
@@ -652,6 +655,61 @@ async fn put_session_verdict(
             request.note.as_deref(),
         ).await,
     }.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !updated {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(axum::Json(json!({ "ok": true })))
+}
+
+/// Deletes an agent and every call ever recorded for it.
+async fn delete_agent(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let deleted = state.db.delete_agent(&name).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !deleted {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(axum::Json(json!({ "ok": true })))
+}
+
+/// Deletes an experiment; its calls stay, ungrouped.
+async fn delete_experiment(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let deleted = state.db.delete_experiment(id).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !deleted {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(axum::Json(json!({ "ok": true })))
+}
+
+#[derive(serde::Deserialize)]
+struct DismissRequest {
+    agent_name: String,
+    session_id: Option<String>,
+}
+
+/// Acknowledges a run's current attention state (waiting, error, rate
+/// limited, …). The badge stays quiet until the run's next call re-arms it.
+async fn put_dismiss_session(
+    State(state): State<Arc<AppState>>,
+    axum::Json(request): axum::Json<DismissRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let updated = state
+        .db
+        .dismiss_session(&request.agent_name, request.session_id.as_deref())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if !updated {
         return Err(StatusCode::NOT_FOUND);

@@ -1,7 +1,8 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   AlertTriangle,
   Ban,
+  BellOff,
   Bot,
   CircleSlash,
   Clock,
@@ -11,10 +12,11 @@ import {
   MessageCircleQuestion,
   Moon,
   Scissors,
+  Trash2,
   Wifi,
   WifiOff,
 } from 'lucide-react';
-import { AgentStateKind, ProviderLimits, SessionSummary, formatCost, formatTokens, humanizeSecs } from '../lib/api';
+import { AgentStateKind, deleteAgent, dismissSession, ProviderLimits, SessionSummary, formatCost, formatTokens, humanizeSecs } from '../lib/api';
 import { useSessions } from '../hooks/useSessions';
 
 /// Per-state presentation. Kept as one table rather than scattered
@@ -48,8 +50,11 @@ function styleFor(state: AgentStateKind) {
 }
 
 export function sortSessions(sessions: SessionSummary[]): SessionSummary[] {
+  // A dismissed run sits at rest even if its underlying state still wants a
+  // human — it only stops being sorted up front, never re-sorts itself.
+  const rank = (s: SessionSummary) => (s.dismissed ? STATE_STYLES.idle.rank : styleFor(s.state).rank);
   return [...sessions].sort((a, b) => {
-    const byState = styleFor(a.state).rank - styleFor(b.state).rank;
+    const byState = rank(a) - rank(b);
     if (byState !== 0) return byState;
     return (a.idle_seconds ?? 0) - (b.idle_seconds ?? 0);
   });
@@ -57,9 +62,12 @@ export function sortSessions(sessions: SessionSummary[]): SessionSummary[] {
 
 function StateChip({ session }: { session: SessionSummary }) {
   const { chip, icon: Icon, spin } = styleFor(session.state);
+  // A dismissed state keeps its truthful label but loses the alarm colors:
+  // someone has seen it, and the run's next call re-arms the badge.
+  const palette = session.dismissed ? 'bg-gray-100 text-gray-500 border-gray-200' : chip;
   return (
-    <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold border ${chip}`}>
-      <Icon size={13} className={spin ? 'animate-spin' : ''} />
+    <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold border ${palette}`}>
+      <Icon size={13} className={spin && !session.dismissed ? 'animate-spin' : ''} />
       {session.state_label}
     </span>
   );
@@ -116,6 +124,39 @@ function ProviderLimitsCard({ limits }: { limits: ProviderLimits[] }) {
 function SessionCard({ session }: { session: SessionSummary }) {
   const { accent } = styleFor(session.state);
   const attentionRing = session.needs_attention ? 'ring-1 ring-amber-200' : '';
+  const { refresh } = useSessions();
+  const [dismissing, setDismissing] = useState(false);
+  const [dismissError, setDismissError] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+
+  const dismiss = async () => {
+    setDismissing(true);
+    setDismissError(null);
+    try {
+      await dismissSession(session);
+      await refresh();
+    } catch (err) {
+      setDismissError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDismissing(false);
+    }
+  };
+
+  const removeAgent = async () => {
+    if (!window.confirm(`Delete agent "${session.agent_name}" and all its recorded calls? This cannot be undone.`)) {
+      return;
+    }
+    setDeleting(true);
+    setDismissError(null);
+    try {
+      await deleteAgent(session.agent_name);
+      await refresh();
+    } catch (err) {
+      setDismissError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   return (
     <div className={`rounded-2xl bg-[#151a23] border border-white/10 border-l-[3px] ${accent} ${attentionRing} p-5 space-y-3 shadow-[0_1px_2px_rgba(15,23,42,0.03)] transition-all hover:-translate-y-0.5 hover:shadow-[0_10px_30px_rgba(15,23,42,0.07)]`}>
@@ -134,8 +175,38 @@ function SessionCard({ session }: { session: SessionSummary }) {
             {session.session_id ?? 'no session id'}
           </p>
         </div>
-        <StateChip session={session} />
+        <div className="flex items-center gap-1.5 shrink-0">
+          <StateChip session={session} />
+          {session.needs_attention && (
+            <button
+              type="button"
+              onClick={dismiss}
+              disabled={dismissing}
+              title="Dismiss — I've seen this. Re-arms on the run's next call."
+              aria-label={`Dismiss attention on ${session.agent_name} ${session.session_id ?? ''}`.trimEnd()}
+              className="text-gray-400 hover:text-gray-700 disabled:opacity-50 p-1 rounded-full hover:bg-gray-100 transition-colors"
+            >
+              <BellOff size={14} />
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={removeAgent}
+            disabled={deleting}
+            title="Delete this agent and all its recorded calls"
+            aria-label={`Delete agent ${session.agent_name}`}
+            className="text-gray-400 hover:text-red-600 disabled:opacity-50 p-1 rounded-full hover:bg-gray-100 transition-colors"
+          >
+            <Trash2 size={14} />
+          </button>
+        </div>
       </div>
+
+      {dismissError && (
+        <p role="alert" className="text-xs text-red-600">
+          Could not dismiss: {dismissError}
+        </p>
+      )}
 
       {session.state_detail && (
         <p className={`text-sm ${session.needs_attention ? 'text-slate-100' : 'text-slate-400'}`}>

@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import AgentStatusView, { sortSessions } from './AgentStatusView'
 import { SessionsProvider } from '../hooks/useSessions'
@@ -12,6 +12,7 @@ function session(overrides: Partial<SessionSummary>): SessionSummary {
     state_label: 'Idle',
     state_detail: null,
     needs_attention: false,
+    dismissed: false,
     call_count: 1,
     first_seen: '2026-08-31 12:00:00',
     last_seen: '2026-08-31 12:00:00',
@@ -89,6 +90,15 @@ describe('sortSessions', () => {
     expect(ordered.map((s) => s.session_id)).toEqual(['fresh', 'stale'])
   })
 
+  test('a dismissed run sorts at rest even while its state wants a human', () => {
+    const ordered = sortSessions([
+      session({ session_id: 'seen', state: 'waiting_for_you', needs_attention: false, dismissed: true }),
+      session({ session_id: 'busy', state: 'working' }),
+    ])
+
+    expect(ordered.map((s) => s.session_id)).toEqual(['busy', 'seen'])
+  })
+
   test('does not mutate the array it was given', () => {
     const input = [session({ session_id: 'a', state: 'idle' }), session({ session_id: 'b', state: 'working' })]
     sortSessions(input)
@@ -163,6 +173,88 @@ describe('AgentStatusView', () => {
     renderView()
 
     await waitFor(() => expect(screen.getByText('Polling')).toBeInTheDocument())
+    expect(await screen.findByText(/No agent sessions yet/i)).toBeInTheDocument()
+  })
+
+  test('dismissing a run quiets its badge and refetches', async () => {
+    const attention = session({
+      agent_name: 'opencode',
+      state: 'waiting_for_you',
+      state_label: 'Waiting for you',
+      needs_attention: true,
+    })
+    const dismissed = { ...attention, needs_attention: false, dismissed: true }
+    const getPayloads = [[attention], [dismissed]]
+    const calls: { url: string; init?: RequestInit }[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url: String(url), init })
+      if (String(url).includes('/dismiss')) {
+        return { ok: true, status: 200, json: async () => ({ ok: true }) }
+      }
+      if (String(url).includes('/limits')) return { ok: true, status: 200, json: async () => [] }
+      return { ok: true, status: 200, json: async () => getPayloads.shift() ?? [] }
+    }))
+
+    renderView()
+
+    fireEvent.click(await screen.findByRole('button', { name: /dismiss attention on opencode/i }))
+
+    await waitFor(() => {
+      const put = calls.find((c) => c.url.includes('/dismiss'))
+      expect(put).toBeDefined()
+      expect(put!.init?.method).toBe('PUT')
+      expect(JSON.parse(String(put!.init?.body))).toEqual({ agent_name: 'opencode', session_id: 'sess-1' })
+    })
+
+    // The refetched run reports dismissed: the chip goes muted, the alarm
+    // button disappears, and the "Need you" tile no longer counts it.
+    const chip = await screen.findByText('Waiting for you')
+    expect(chip.closest('span')).toHaveClass('bg-gray-100')
+    expect(screen.queryByRole('button', { name: /dismiss attention/i })).not.toBeInTheDocument()
+    await waitFor(() => {
+      const needYou = screen.getByText('Need you').closest('div')!
+      expect(within(needYou).getByText('0')).toBeInTheDocument()
+    })
+  })
+
+  test('a dismissed run shows no dismiss button', async () => {
+    mockBackend([session({ state: 'waiting_for_you', state_label: 'Waiting for you', needs_attention: false, dismissed: true })])
+
+    renderView()
+
+    expect(await screen.findByText('Waiting for you')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /dismiss attention/i })).not.toBeInTheDocument()
+  })
+
+  test('deleting an agent asks for confirmation, then removes it with its history', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    const attention = session({ agent_name: 'opencode', state: 'waiting_for_you', needs_attention: true })
+    const calls: { url: string; init?: RequestInit }[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url: String(url), init })
+      if (String(url).includes('/dismiss')) return { ok: true, status: 200, json: async () => ({ ok: true }) }
+      if (String(url).includes('/limits')) return { ok: true, status: 200, json: async () => [] }
+      // After the (declined, then accepted) delete the agent is gone.
+      return { ok: true, status: 200, json: async () => (calls.filter((c) => c.url.includes('/sessions')).length > 1 ? [] : [attention]) }
+    }))
+
+    renderView()
+
+    const deleteButton = await screen.findByRole('button', { name: 'Delete agent opencode' })
+
+    // Declining the confirmation must not fire a request.
+    fireEvent.click(deleteButton)
+    expect(confirm).toHaveBeenCalledOnce()
+    expect(calls.some((c) => c.init?.method === 'DELETE')).toBe(false)
+
+    confirm.mockReturnValue(true)
+    fireEvent.click(deleteButton)
+
+    await waitFor(() => {
+      const del = calls.find((c) => c.init?.method === 'DELETE')
+      expect(del).toBeDefined()
+      expect(del!.url).toContain('/v1/analytics/agents/opencode')
+    })
     expect(await screen.findByText(/No agent sessions yet/i)).toBeInTheDocument()
   })
 })

@@ -24,7 +24,7 @@
   "bundle": {
     "active": true,
     "category": "DeveloperTool",
-    "copyright": "",
+    "copyright": "Copyright 2025 The Harnesswurm Authors. Licensed under the Apache License, Version 2.0.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

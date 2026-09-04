@@ -3,6 +3,8 @@ name = "harnesswurm-desktop"
 version = "0.1.0"
 description = "Tauri desktop app for Harnesswurm telemetry"
 edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/einfachllm/harnesswurm"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

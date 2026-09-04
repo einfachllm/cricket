@@ -63,6 +63,10 @@ export interface SessionSummary {
   state_label: string;
   state_detail: string | null;
   needs_attention: boolean;
+  /// True while a dismissal covers the run's latest call: the attention
+  /// state is still real, but a human has seen it. Re-arms on the run's
+  /// next call. See `dismiss_session` in the backend.
+  dismissed: boolean;
   call_count: number;
   first_seen: string | null;
   last_seen: string | null;
@@ -225,6 +229,26 @@ export async function setVerdict(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ agent_name: run.agent_name, ...target, verdict }),
   });
+}
+
+/// Acknowledges a run's current attention state (waiting, error, …). The
+/// badge stays quiet until the run's next call re-arms it.
+export async function dismissSession(run: Pick<SessionSummary, 'agent_name' | 'session_id'>): Promise<void> {
+  await fetchJson<{ ok: boolean }>('/v1/analytics/sessions/dismiss', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agent_name: run.agent_name, session_id: run.session_id }),
+  });
+}
+
+/// Deletes an agent together with every call ever recorded for it.
+export async function deleteAgent(agentName: string): Promise<void> {
+  await fetchJson<{ ok: boolean }>(`/v1/analytics/agents/${encodeURIComponent(agentName)}`, { method: 'DELETE' });
+}
+
+/// Deletes an experiment. Its calls survive, ungrouped.
+export async function deleteExperiment(experimentId: number): Promise<void> {
+  await fetchJson<{ ok: boolean }>(`/v1/analytics/experiments/${experimentId}`, { method: 'DELETE' });
 }
 
 /// Coarse, glanceable durations — the frontend twin of the backend's
