@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.svg" alt="Harnesswurm — see what your coding agents actually cost" width="720">
+</p>
+
 # Harnesswurm
 
 [![CI](https://github.com/einfachllm/harnesswurm/actions/workflows/ci.yml/badge.svg)](https://github.com/einfachllm/harnesswurm/actions/workflows/ci.yml)

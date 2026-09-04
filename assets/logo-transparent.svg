@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-labelledby="title">
+  <title id="title">Harnesswurm logo</title>
+  <defs>
+    <linearGradient id="worm" gradientUnits="userSpaceOnUse" x1="0" y1="96" x2="0" y2="430">
+      <stop offset="0%" stop-color="#FFD37A"/>
+      <stop offset="45%" stop-color="#F59E0B"/>
+      <stop offset="100%" stop-color="#D1440E"/>
+    </linearGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="7" stdDeviation="9" flood-color="#000000" flood-opacity="0.25"/>
+    </filter>
+    <filter id="glow" x="-120%" y="-120%" width="340%" height="340%">
+      <feGaussianBlur stdDeviation="7" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <!-- Segment gaps: thin radial cuts across the body annulus, plus a
+         wedge that opens the loop at the top right. -->
+    <mask id="seg" maskUnits="userSpaceOnUse" x="0" y="0" width="512" height="512">
+      <rect x="0" y="0" width="512" height="512" fill="white"/>
+      <path d="M 256 256 L 282.1 57.7 A 200 200 0 0 1 454.3 229.9 Z" fill="black"/>
+      <g stroke="black" stroke-width="7">
+        <line x1="256" y1="106" x2="256" y2="170" transform="rotate(28.12 256 256)"/>
+        <line x1="256" y1="106" x2="256" y2="170" transform="rotate(63.75 256 256)"/>
+        <line x1="256" y1="106" x2="256" y2="170" transform="rotate(99.38 256 256)"/>
+        <line x1="256" y1="106" x2="256" y2="170" transform="rotate(135 256 256)"/>
+        <line x1="256" y1="106" x2="256" y2="170" transform="rotate(170.62 256 256)"/>
+        <line x1="256" y1="106" x2="256" y2="170" transform="rotate(206.25 256 256)"/>
+        <line x1="256" y1="106" x2="256" y2="170" transform="rotate(241.88 256 256)"/>
+      </g>
+    </mask>
+  </defs>
+
+  <!-- faint instrument ring for depth -->
+  <circle cx="256" cy="256" r="196" fill="none" stroke="#64748B" stroke-opacity="0.45"
+          stroke-width="2" stroke-dasharray="2 12" stroke-linecap="round"/>
+
+  <g transform="translate(3 4) rotate(-8 256 256)">
+    <!-- the packet passing through the gap -->
+    <g filter="url(#glow)">
+      <circle cx="345" cy="178.6" r="30" fill="#F59E0B" opacity="0.2"/>
+      <circle cx="345" cy="178.6" r="16" fill="#FBBC4A" opacity="0.4"/>
+      <circle cx="345" cy="178.6" r="8.5" fill="#F6A723"/>
+      <circle cx="345" cy="178.6" r="3.5" fill="#FFF3DC"/>
+    </g>
+
+    <g filter="url(#soft)">
+      <circle cx="256" cy="256" r="118" fill="none" stroke="url(#worm)" stroke-width="46" mask="url(#seg)"/>
+    </g>
+
+    <!-- rounded tail cap -->
+    <circle cx="373" cy="240.6" r="23" fill="url(#worm)"/>
+
+    <!-- head bulge, facing the gap -->
+    <circle cx="277.4" cy="139.8" r="31" fill="url(#worm)"/>
+    <g fill="#10203A">
+      <circle cx="288.8" cy="130.2" r="5.4"/>
+      <circle cx="285.9" cy="152.0" r="5.4"/>
+    </g>
+    <g fill="#FFE9C0">
+      <circle cx="287.2" cy="128.5" r="1.8"/>
+      <circle cx="284.3" cy="150.3" r="1.8"/>
+    </g>
+  </g>
+</svg>
