@@ -1,0 +1,5 @@
+{
+  "clippy::io_other_error": 1,
+  "clippy::manual_contains": 1,
+  "clippy::useless_conversion": 1
+}

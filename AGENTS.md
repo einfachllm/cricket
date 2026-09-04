@@ -34,9 +34,12 @@ server to deploy.
 Backend (Rust — run from `harnesswurm/backend`, or repo root via `npm run <script>`):
 - Build: `cargo build`
 - Test: `cargo test`
-- All suites at once (repo root): `npm run checks` (desktop typecheck + vitest, backend cargo test + clippy)
-- Lint: `cargo clippy --lib --bins` (three warnings are pre-existing on
-  main; fix only warnings you introduced)
+- All suites at once (repo root): `npm run checks` (desktop typecheck +
+  vitest, backend cargo test + clippy against its baseline)
+- Lint: `python3 scripts/clippy_baseline.py` from the repo root — runs
+  `cargo clippy --lib --bins` and fails only on warnings not in
+  `scripts/clippy_baseline.json` (three are pre-existing on main). This is
+  what CI runs.
 - Standalone server: `BIND_ADDR=127.0.0.1:8091 cargo run` (state lives in
   the current directory)
 - Agent wrapper: `cargo run --bin harnesswurm -- run --agent <name>

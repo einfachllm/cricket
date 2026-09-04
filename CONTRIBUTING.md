@@ -72,21 +72,34 @@ binary. It is local state — never commit it.
 
 ## Running the checks
 
-Run all four before opening a pull request. They are what a reviewer will run.
+Run all four before opening a pull request. They are exactly what CI runs on
+your PR, so a green run here means a green run there.
 
 ```bash
 cd harnesswurm/backend
-cargo test
-cargo clippy --lib --bins     # three warnings are pre-existing on main
+cargo test --locked
 
-cd ../../desktop
-npm test
+cd ../..
+python3 scripts/clippy_baseline.py   # clippy, compared against the baseline
+
+cd desktop
+npm ci
 npm run typecheck
+npm test
 ```
 
-Fix only the clippy warnings you introduced. Do not run bare `cargo fmt`: this
-repository is not rustfmt-clean globally, and a blanket reformat buries the
-actual change. Format only files you created.
+**About clippy.** The repository is not clippy-clean — a few warnings predate
+the lint being enabled, and fixing them is a separate change from yours.
+`-D warnings` would therefore be red on every PR and get ignored, so instead
+each known warning is recorded per lint in `scripts/clippy_baseline.json`, and
+the check fails only on warnings your change *adds*. If you fix one, the script
+says so; lower the baseline in the same PR with
+`python3 scripts/clippy_baseline.py --update`. Raising the baseline is allowed
+but should be a deliberate, explained diff.
+
+**Don't run bare `cargo fmt`**: this repository is not rustfmt-clean globally,
+and a blanket reformat buries the actual change. Format only files you
+created.
 
 ## Conventions
 

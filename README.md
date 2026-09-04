@@ -1,5 +1,6 @@
 # Harnesswurm
 
+[![CI](https://github.com/einfachllm/harnesswurm/actions/workflows/ci.yml/badge.svg)](https://github.com/einfachllm/harnesswurm/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#project-status)
 
