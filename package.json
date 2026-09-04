@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "checks": "npm run typecheck --prefix desktop && npm test --prefix desktop && cargo test --manifest-path harnesswurm/backend/Cargo.toml && cargo clippy --manifest-path harnesswurm/backend/Cargo.toml --lib --bins",
+    "checks": "npm run typecheck --prefix desktop && npm test --prefix desktop && cargo test --manifest-path harnesswurm/backend/Cargo.toml && python3 scripts/clippy_baseline.py",
     "test": "npm test --prefix desktop && cargo test --manifest-path harnesswurm/backend/Cargo.toml",
     "typecheck": "npm run typecheck --prefix desktop",
     "dev:desktop": "npm run tauri dev --prefix desktop",

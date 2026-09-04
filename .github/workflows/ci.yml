@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to a PR makes the previous run's answer irrelevant.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend — cargo test + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: harnesswurm/backend
+
+      # --locked: build the versions in Cargo.lock, and fail if the lockfile
+      # would have to change. A dependency bump has to be a visible diff.
+      - name: Test
+        run: cargo test --locked
+        working-directory: harnesswurm/backend
+
+      # Not `-D warnings`: the repo has known pre-existing warnings, so this
+      # compares against scripts/clippy_baseline.json and fails only on new
+      # ones. See that script's docstring.
+      - name: Clippy (against the recorded baseline)
+        run: python3 scripts/clippy_baseline.py
+
+  desktop:
+    name: Desktop — vitest + tsc
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test

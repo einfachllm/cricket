@@ -34,9 +34,12 @@ server to deploy.
 Backend (Rust — run from `harnesswurm/backend`, or repo root via `npm run <script>`):
 - Build: `cargo build`
 - Test: `cargo test`
-- All suites at once (repo root): `npm run checks` (desktop typecheck + vitest, backend cargo test + clippy)
-- Lint: `cargo clippy --lib --bins` (three warnings are pre-existing on
-  main; fix only warnings you introduced)
+- All suites at once (repo root): `npm run checks` (desktop typecheck +
+  vitest, backend cargo test + clippy against its baseline)
+- Lint: `python3 scripts/clippy_baseline.py` from the repo root — runs
+  `cargo clippy --lib --bins` and fails only on warnings not in
+  `scripts/clippy_baseline.json` (three are pre-existing on main). This is
+  what CI runs.
 - Standalone server: `BIND_ADDR=127.0.0.1:8091 cargo run` (state lives in
   the current directory)
 - Agent wrapper: `cargo run --bin harnesswurm -- run --agent <name>
@@ -86,13 +89,13 @@ Desktop (run from `desktop`):
 
 - One branch per task off the latest `origin/main`: `feature/<kebab>` or
   `bugfix/<kebab>`.
-- Full checks before opening a PR: `cargo test`, `cargo clippy --lib
-  --bins`, and in `desktop`: `npm test`, `npm run typecheck`. End the PR
-  title with the issue ref `(#NN)`. Keep addressing review comments until
-  the PR is merged.
+- Full checks before opening a PR: `cargo test --locked`, `python3
+  scripts/clippy_baseline.py`, and in `desktop`: `npm run typecheck`, `npm
+  test`. These are what CI runs on the PR. End the PR title with the issue
+  ref `(#NN)`. Keep addressing review comments until the PR is merged.
 - Commit messages: subject under 72 chars, body explains the why. No agent
   attribution lines (`Co-Authored-By`, session ids, generated branch names
-  as subjects) — CI rejects them.
+  as subjects). Nothing enforces this — it is on you to leave them out.
 
 ## Project learnings
 

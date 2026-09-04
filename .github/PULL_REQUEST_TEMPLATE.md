@@ -10,10 +10,10 @@
 
 <!-- Say what you actually ran, not what should pass. -->
 
-- [ ] `cargo test` (in `harnesswurm/backend`)
-- [ ] `cargo clippy --lib --bins` — no new warnings
-- [ ] `npm test` (in `desktop`)
+- [ ] `cargo test --locked` (in `harnesswurm/backend`)
+- [ ] `python3 scripts/clippy_baseline.py` — no new clippy warnings
 - [ ] `npm run typecheck` (in `desktop`)
+- [ ] `npm test` (in `desktop`)
 - [ ] Checked by hand in the app:
 
 <!-- Describe the manual check, or say why none was needed. -->
