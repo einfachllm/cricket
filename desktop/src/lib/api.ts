@@ -188,6 +188,16 @@ export async function dismissSession(run: Pick<SessionSummary, 'agent_name' | 's
   });
 }
 
+/// Deletes an agent together with every call ever recorded for it.
+export async function deleteAgent(agentName: string): Promise<void> {
+  await fetchJson<{ ok: boolean }>(`/v1/analytics/agents/${encodeURIComponent(agentName)}`, { method: 'DELETE' });
+}
+
+/// Deletes an experiment. Its calls survive, ungrouped.
+export async function deleteExperiment(experimentId: number): Promise<void> {
+  await fetchJson<{ ok: boolean }>(`/v1/analytics/experiments/${experimentId}`, { method: 'DELETE' });
+}
+
 /// Coarse, glanceable durations — the frontend twin of the backend's
 /// `humanize_secs`, used for numbers the backend hasn't already formatted
 /// into a `state_detail` string.

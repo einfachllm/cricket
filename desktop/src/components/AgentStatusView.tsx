@@ -12,10 +12,11 @@ import {
   MessageCircleQuestion,
   Moon,
   Scissors,
+  Trash2,
   Wifi,
   WifiOff,
 } from 'lucide-react';
-import { AgentStateKind, dismissSession, ProviderLimits, SessionSummary, formatCost, formatTokens, humanizeSecs } from '../lib/api';
+import { AgentStateKind, deleteAgent, dismissSession, ProviderLimits, SessionSummary, formatCost, formatTokens, humanizeSecs } from '../lib/api';
 import { useSessions } from '../hooks/useSessions';
 
 /// Per-state presentation. Kept as one table rather than scattered
@@ -126,6 +127,7 @@ function SessionCard({ session }: { session: SessionSummary }) {
   const { refresh } = useSessions();
   const [dismissing, setDismissing] = useState(false);
   const [dismissError, setDismissError] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const dismiss = async () => {
     setDismissing(true);
@@ -137,6 +139,22 @@ function SessionCard({ session }: { session: SessionSummary }) {
       setDismissError(err instanceof Error ? err.message : String(err));
     } finally {
       setDismissing(false);
+    }
+  };
+
+  const removeAgent = async () => {
+    if (!window.confirm(`Delete agent "${session.agent_name}" and all its recorded calls? This cannot be undone.`)) {
+      return;
+    }
+    setDeleting(true);
+    setDismissError(null);
+    try {
+      await deleteAgent(session.agent_name);
+      await refresh();
+    } catch (err) {
+      setDismissError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -171,6 +189,16 @@ function SessionCard({ session }: { session: SessionSummary }) {
               <BellOff size={14} />
             </button>
           )}
+          <button
+            type="button"
+            onClick={removeAgent}
+            disabled={deleting}
+            title="Delete this agent and all its recorded calls"
+            aria-label={`Delete agent ${session.agent_name}`}
+            className="text-gray-400 hover:text-red-600 disabled:opacity-50 p-1 rounded-full hover:bg-gray-100 transition-colors"
+          >
+            <Trash2 size={14} />
+          </button>
         </div>
       </div>
 

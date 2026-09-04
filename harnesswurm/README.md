@@ -515,6 +515,12 @@ calls are proxied, so traffic captured before this existed shows no tools.
 
 ### Analytics API
 - `GET /v1/analytics/experiments` — list experiments.
+- `DELETE /v1/analytics/experiments/:id` — delete an experiment. Its calls
+  survive, ungrouped: the calls belong to their agents, the experiment is
+  only the label. Cannot be undone.
+- `DELETE /v1/analytics/agents/:name` — delete an agent **and** every call
+  recorded for it: metrics, captured traffic bodies, rate-limit readings,
+  tool tallies, verdicts and dismissals. Cannot be undone.
 - `GET /v1/analytics/experiments/:id/metrics` — metrics for one experiment, over time.
 - `GET /v1/analytics/experiments/:id/comparison[?group=session|agent]` — one
   row per run in the experiment: totals for cost, tokens, cache reads, tool

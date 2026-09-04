@@ -225,4 +225,36 @@ describe('AgentStatusView', () => {
     expect(await screen.findByText('Waiting for you')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /dismiss attention/i })).not.toBeInTheDocument()
   })
+
+  test('deleting an agent asks for confirmation, then removes it with its history', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    const attention = session({ agent_name: 'opencode', state: 'waiting_for_you', needs_attention: true })
+    const calls: { url: string; init?: RequestInit }[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url: String(url), init })
+      if (String(url).includes('/dismiss')) return { ok: true, status: 200, json: async () => ({ ok: true }) }
+      if (String(url).includes('/limits')) return { ok: true, status: 200, json: async () => [] }
+      // After the (declined, then accepted) delete the agent is gone.
+      return { ok: true, status: 200, json: async () => (calls.filter((c) => c.url.includes('/sessions')).length > 1 ? [] : [attention]) }
+    }))
+
+    renderView()
+
+    const deleteButton = await screen.findByRole('button', { name: 'Delete agent opencode' })
+
+    // Declining the confirmation must not fire a request.
+    fireEvent.click(deleteButton)
+    expect(confirm).toHaveBeenCalledOnce()
+    expect(calls.some((c) => c.init?.method === 'DELETE')).toBe(false)
+
+    confirm.mockReturnValue(true)
+    fireEvent.click(deleteButton)
+
+    await waitFor(() => {
+      const del = calls.find((c) => c.init?.method === 'DELETE')
+      expect(del).toBeDefined()
+      expect(del!.url).toContain('/v1/analytics/agents/opencode')
+    })
+    expect(await screen.findByText(/No agent sessions yet/i)).toBeInTheDocument()
+  })
 })

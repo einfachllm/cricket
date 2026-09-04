@@ -206,6 +206,7 @@ const TrafficView = () => {
               <tr>
                 <th className="text-left px-4 py-3 font-semibold">Time</th>
                 <th className="text-left px-4 py-3 font-semibold">Agent</th>
+                <th className="text-left px-4 py-3 font-semibold">Session</th>
                 <th className="text-left px-4 py-3 font-semibold">Task</th>
                 <th className="text-left px-4 py-3 font-semibold">Status</th>
                 <th className="text-left px-4 py-3 font-semibold">Model</th>
@@ -231,6 +232,12 @@ const TrafficView = () => {
                     {new Date(task.timestamp + 'Z').toLocaleTimeString()}
                   </td>
                   <td className="px-4 py-3 font-medium text-gray-800">{task.agent_name}</td>
+                  <td
+                    className="px-4 py-3 text-gray-500 font-mono text-xs max-w-[10rem] truncate"
+                    title={task.session_id ?? ''}
+                  >
+                    {task.session_id || <span className="text-gray-300">–</span>}
+                  </td>
                   <td className="px-4 py-3 text-gray-600 max-w-xs truncate" title={task.task_description || ''}>
                     <span className="inline-flex items-center gap-1.5 max-w-full">
                       {task.agent_question_text && (
